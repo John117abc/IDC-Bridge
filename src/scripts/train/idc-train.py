@@ -8,6 +8,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from collections import deque
 import random
+import imageio
 import json
 
 # 导入 GPUDrive 相关
@@ -22,7 +23,7 @@ sys.path.insert(0, '/workspace/idc/src')
 from env.idc_state_builder import GPUDriveObservationBuilder
 
 # 导入 IDC 的核心模块（你需要保证这些文件在 path 里）
-from models.actor_critic import ActorNet, CriticNet
+from models.actor_critic import DiscreteActor, DiscreteCritic
 from models.bicycle import BicycleModel
 from buffer import PERBuffer
 
@@ -92,8 +93,8 @@ class DiscreteIDCAgent:
         self.batch_size = args.batch_size
 
         # 网络
-        self.actor = ActorNet(self.TOTAL_STATE_DIM, args.hidden_dim).to(device)
-        self.critic = CriticNet(self.TOTAL_STATE_DIM, args.hidden_dim).to(device)
+        self.actor = DiscreteActor(self.TOTAL_STATE_DIM, args.hidden_dim).to(device)
+        self.critic = DiscreteCritic(self.TOTAL_STATE_DIM, args.hidden_dim).to(device)
         self.dynamics = BicycleModel(dt=self.dt, L=2.9)
 
         # 优化器
@@ -205,12 +206,15 @@ class DiscreteIDCAgent:
 # 训练主循环
 # ==============================================
 def train(args):
+    import os
+    print("Data root:", args.data_dir)
+    print("Files found:", os.listdir(args.data_dir))
     # 1. 数据加载器
     data_loader = SceneDataLoader(
         root=args.data_dir,
         batch_size=args.num_worlds,
-        dataset_size=args.num_worlds,
-        sample_with_replacement=False,
+        dataset_size=args.num_worlds,  # 或者更大，比如 100
+        sample_with_replacement=True,  # 改成 True
         shuffle=True,
         seed=args.seed
     )
@@ -221,7 +225,7 @@ def train(args):
         road_map_obs=False,      # 我们用自己的 builder 提供道路
         partner_obs=False,       # 同上
         norm_obs=False,
-        reward_type="distance_to_goal",
+        reward_type="weighted_combination",
         dynamics_model="classic",
         collision_behavior="ignore",
         dist_to_goal_threshold=2.0,
@@ -229,7 +233,6 @@ def train(args):
         obs_radius=50.0,
         steer_actions=torch.linspace(-0.4, 0.4, 13),
         accel_actions=torch.linspace(-3.0, 1.5, 7),
-        action_type="discrete",
         episode_len=args.max_steps,
     )
     env = GPUDriveTorchEnv(config=env_config, data_loader=data_loader,
@@ -251,7 +254,9 @@ def train(args):
 
     # 5. 初始化 agent
     agent = DiscreteIDCAgent(env, args, args.device)
+    frames = {f"env_{i}": [] for i in range(args.num_worlds)}
 
+    print(f'开始训练')
     # 6. 训练循环
     for epoch in range(args.epochs):
         obs = env.reset()
@@ -274,6 +279,7 @@ def train(args):
 
             # 选动作
             action_phy, action_1d = agent.select_action(states_batch, deterministic=False)
+            print(f'步数：{step},形状：{action_1d.shape}')
 
             # 构造 GPUDrive 所需的动作张量 [num_worlds, max_agents]
             act_template = torch.zeros((args.num_worlds, args.max_agents), dtype=torch.int64)
@@ -293,11 +299,28 @@ def train(args):
             # 这里简化处理，实际应将 next_obs 转为 IDC 观测存入 buffer
 
             # 更新 agent（每收集一定步数后调用一次）
-            if step % args.update_freq == 0:
-                agent.update(...)   # 需要传入 ref_path 和 road_states_batch
+            # if step % args.update_freq == 0:
+                # agent.update(...)   # 需要传入 ref_path 和 road_states_batch
 
             obs = next_obs
 
+            if step % 5 == 0:
+                imgs = env.vis.plot_simulator_state(
+                    env_indices=list(range(args.num_worlds)),
+                    time_steps=[epoch] * args.num_worlds,
+                    zoom_radius=70,
+                )
+                for i in range(args.num_worlds):
+                    frames[f"env_{i}"].append(img_from_fig(imgs[i]))
+
+    # 每个环境的帧保存为单独的 GIF
+    print("开始保存")
+    save_dir = "/workspace/idc/gifs"
+    os.makedirs(save_dir, exist_ok=True)
+
+    for env_name, frame_list in frames.items():
+        path = os.path.join(save_dir, f"rollout_{env_name}.gif")
+        imageio.mimsave(path, frame_list, fps=5)
     print("Training finished.")
 
 if __name__ == "__main__":
@@ -306,8 +329,8 @@ if __name__ == "__main__":
     parser.add_argument('--data-dir', type=str, required=True)
     parser.add_argument('--num-worlds', type=int, default=20)
     parser.add_argument('--max-agents', type=int, default=64)
-    parser.add_argument('--max-steps', type=int, default=200)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--max-steps', type=int, default=128)
+    parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--dt', type=float, default=0.05)
     parser.add_argument('--horizon', type=int, default=10)

@@ -61,65 +61,44 @@ obs = env.reset()
 
 frames = {f"env_{i}": [] for i in range(NUM_WORLDS)}
 
-num_worlds = env.num_worlds
-ego_indices = []
-for w in range(num_worlds):
-    # mask 是一维 bool 数组，表示该 world 中哪些 agent 可控
-    controllable = env.cont_agent_mask[w].nonzero(as_tuple=True)[0]
-    if len(controllable) > 0:
-        ego_idx = controllable[0].item()  # 取第一个
-    else:
-        ego_idx = 0  # 回退
-    ego_indices.append(ego_idx)
-
 for t in range(env_config.episode_len):
-    for world in range(NUM_WORLDS):
-        net, road, ref_raw, ref_err, other = builder.get_idc_observation(world, ego_indices[world])
-        print(f'net:{net.shape},road:{road.shape},ref_raw:{ref_raw.shape},ref_err:{ref_err.shape},other:{other.shape}')
-        rand_action = torch.Tensor(
-            [[env.action_space.sample() for _ in range(MAX_NUM_OBJECTS * NUM_WORLDS)]]
-        ).reshape(NUM_WORLDS, MAX_NUM_OBJECTS)
-    env.step_dynamics(rand_action)
-    for world in range(NUM_WORLDS):
-        builder.increment_step(world)
 
-# for t in range(env_config.episode_len):
-#
-#     # Sample random actions
-#     rand_action = torch.Tensor(
-#         [[env.action_space.sample() for _ in range(MAX_NUM_OBJECTS * NUM_WORLDS)]]
-#     ).reshape(NUM_WORLDS, MAX_NUM_OBJECTS)
-#
-#     # Step the environment
-#     env.step_dynamics(rand_action)
-#
-#     obs = env.get_obs()
-#     reward = env.get_rewards()
-#     done = env.get_dones()
-#     world_idx = 0
-#     agent_idx = 7
-#     net_state, s_road, s_ref_raw, s_ref_error, s_other = builder.get_idc_observation(
-#         world_idx, agent_idx, perceived_distance=30.0
-#     )
-#     print(f'net_state:{net_state}')
-#     # Render the environment
-#     if t % 5 == 0:
-#         imgs = env.vis.plot_simulator_state(
-#             env_indices=list(range(NUM_WORLDS)),
-#             time_steps=[t] * NUM_WORLDS,
-#             zoom_radius=70,
-#         )
-#         for i in range(NUM_WORLDS):
-#             frames[f"env_{i}"].append(img_from_fig(imgs[i]))
-#
-#     if done.all():
-#         break
-#
-# # 每个环境的帧保存为单独的 GIF
-# print("开始保存")
-# save_dir = "/workspace/idc/gifs"
-# os.makedirs(save_dir, exist_ok=True)
-#
-# for env_name, frame_list in frames.items():
-#     path = os.path.join(save_dir, f"rollout_{env_name}.gif")
-#     imageio.mimsave(path, frame_list, fps=5)
+    # Sample random actions
+    rand_action = torch.Tensor(
+        [[env.action_space.sample() for _ in range(MAX_NUM_OBJECTS * NUM_WORLDS)]]
+    ).reshape(NUM_WORLDS, MAX_NUM_OBJECTS)
+
+    # Step the environment
+    print(f'动作形状{rand_action.shape}')
+    env.step_dynamics(rand_action)
+
+    obs = env.get_obs()
+    reward = env.get_rewards()
+    done = env.get_dones()
+    world_idx = 0
+    agent_idx = 7
+    net_state, s_road, s_ref_raw, s_ref_error, s_other = builder.get_idc_observation(
+        world_idx, agent_idx, perceived_distance=30.0
+    )
+    print(f'net_state:{net_state}')
+    # Render the environment
+    if t % 5 == 0:
+        imgs = env.vis.plot_simulator_state(
+            env_indices=list(range(NUM_WORLDS)),
+            time_steps=[t] * NUM_WORLDS,
+            zoom_radius=70,
+        )
+        for i in range(NUM_WORLDS):
+            frames[f"env_{i}"].append(img_from_fig(imgs[i]))
+
+    if done.all():
+        break
+
+# 每个环境的帧保存为单独的 GIF
+print("开始保存")
+save_dir = "/workspace/idc/gifs"
+os.makedirs(save_dir, exist_ok=True)
+
+for env_name, frame_list in frames.items():
+    path = os.path.join(save_dir, f"rollout_{env_name}.gif")
+    imageio.mimsave(path, frame_list, fps=5)

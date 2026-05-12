@@ -3,34 +3,46 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Actor网络输出层修改，避免饱和
-class ActorNet(nn.Module):
-    def __init__(self, state_dim, hidden_dim=256):
+class DrivingBackbone(nn.Module):
+    """共享的主干网络：提取场景特征"""
+    def __init__(self, obs_dim, hidden_dim=256):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),  # 加层归一化，稳定输出
-            nn.ELU(),
+        self.encoder = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, 2),
-            nn.Tanh()
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
         )
-    def forward(self, x):
-        return self.net(x)
+
+    def forward(self, obs):
+        return self.encoder(obs)  # 输出一个抽象的状态表征
 
 
-
-class CriticNet(nn.Module):
-    def __init__(self, state_dim: int, hidden_dim: int = 256, output_dim: int = 1):
+class DiscreteActor(nn.Module):
+    """GPUDrive 离散动作策略"""
+    def __init__(self, obs_dim, hidden_dim=256, steer_bins=13, accel_bins=7):
         super().__init__()
-        self.l1 = nn.Linear(state_dim, hidden_dim)
-        self.l2 = nn.Linear(hidden_dim, hidden_dim)
-        self.l3 = nn.Linear(hidden_dim, output_dim)
+        self.backbone = DrivingBackbone(obs_dim, hidden_dim)
+        self.steer_head = nn.Linear(hidden_dim, steer_bins)
+        self.accel_head = nn.Linear(hidden_dim, accel_bins)
 
-    def forward(self, x):
-        x = F.elu(self.l1(x))
-        x = F.elu(self.l2(x))
-        x = self.l3(x)
-        return x
+    def forward(self, obs):
+        features = self.backbone(obs)
+        steer_logits = self.steer_head(features)
+        accel_logits = self.accel_head(features)
+        return steer_logits, accel_logits
+
+
+class DiscreteCritic(nn.Module):
+    """Actor-Critic 中的 Critic 网络，评估状态价值 V(s)"""
+    def __init__(self, obs_dim, hidden_dim=256):
+        super().__init__()
+        self.backbone = DrivingBackbone(obs_dim, hidden_dim)   # 独立的 backbone
+        self.value_head = nn.Linear(hidden_dim, 1)             # 输出 V(s)
+
+    def forward(self, obs):
+        features = self.backbone(obs)     # [B, hidden_dim]
+        value = self.value_head(features) # [B, 1]
+        return value

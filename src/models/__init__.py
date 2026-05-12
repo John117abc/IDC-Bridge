@@ -1,3 +1,3 @@
-from .actor_critic import ActorNet,CriticNet
+from .actor_critic import DiscreteActor,DiscreteCritic
 
-__all__ = ['ActorNet','CriticNet']
+__all__ = ['DiscreteActor','DiscreteCritic']
