@@ -69,16 +69,17 @@ class PERBuffer:
 
     def _calc_initial_priority(self, experience):
         """根据经验内容估算初始优先级"""
-        _, _, reward, _, _, info = experience
-        # 安全关键样本给予极高初始优先级
-        if info.get('collision', False) or info.get('collision_reward', 0) < -0.5:
-            return 10.0
-        elif info.get('collision_reward', 0) < 0:
-            return 5.0
-        elif info.get('centering_reward', 1.0) < 0.5:  # 偏离道路
-            return 3.0
-        else:
-            return 1.0
+        # _, _, reward, _, _, info = experience
+        # # 安全关键样本给予极高初始优先级
+        # if info.get('collision', False) or info.get('collision_reward', 0) < -0.5:
+        #     return 10.0
+        # elif info.get('collision_reward', 0) < 0:
+        #     return 5.0
+        # elif info.get('centering_reward', 1.0) < 0.5:  # 偏离道路
+        #     return 3.0
+        # else:
+        #     return 1.0
+        return 1.0
 
     def handle_new_experience(self, experience):
         """自动计算初始优先级并存储"""

@@ -5,26 +5,56 @@ import mediapy
 import imageio
 import json
 import sys
+import numpy as np
 
 from gpudrive.env.config import EnvConfig
 from gpudrive.env.env_torch import GPUDriveTorchEnv
 from gpudrive.visualize.utils import img_from_fig
 from gpudrive.env.dataset import SceneDataLoader
+from gpudrive.datatypes.observation import (
+    LocalEgoState,
+    GlobalEgoState,
+    PartnerObs,
+)
 
 sys.path.insert(0, '/workspace/idc/src')
-from env.idc_state_builder import GPUDriveObservationBuilder
-MAX_NUM_OBJECTS = 64  # Maximum number of objects in the scene we control
+from env.idc_state_builder_bak import GPUDriveObservationBuilder
+MAX_NUM_OBJECTS = 1  # Maximum number of objects in the scene we control
 NUM_WORLDS = 2  # Number of parallel environments
 UNIQUE_SCENES = 2 # Number of unique scenes
 
 device = 'cuda' # for simplicity purposes in notebook we use cpu, note that the simulator is optimized for GPU so use cuda if possible
 
+
+# 方式2：多维动作 (num_worlds, max_agents, action_dim)
+def create_forward_actions_multidim(num_worlds, max_agents, action_dim=3):
+    """
+    创建三维动作张量
+    形状: (num_worlds, max_agents, action_dim)
+    """
+    # 向前走的动作：[转向=0, 加速度=0.5, 头部倾斜=0]
+    forward_action = torch.tensor([0.5, 0.0, 0.0], dtype=torch.float32)
+    
+    # 扩展到所有智能体
+    actions = forward_action.reshape(1, 1, -1).expand(num_worlds, max_agents, -1).clone()
+    return actions
+
+
 env_config = EnvConfig(
-    steer_actions = torch.round(
-        torch.linspace(-1.0, 1.0, 3), decimals=3),
-    accel_actions = torch.round(
-        torch.linspace(-3, 3, 3), decimals=3
-    )
+        ego_state=True,
+        road_map_obs=True,
+        partner_obs=True,
+        norm_obs=True,
+        reward_type="weighted_combination",
+        dynamics_model="classic",
+        max_controlled_agents=1,
+        collision_behavior="ignore",
+        dist_to_goal_threshold=2.0,
+        polyline_reduction_threshold=0.1,
+        obs_radius=50.0,
+        episode_len=100,
+        max_num_agents_in_scene=8,
+        roadgraph_top_k = 100,
 )
 
 
@@ -44,6 +74,7 @@ env = GPUDriveTorchEnv(
     data_loader=data_loader,
     max_cont_agents=MAX_NUM_OBJECTS, # Maximum number of agents to control per scenario
     device=device,
+    action_type="continuous",
 )
 
 scene_files = env.data_batch  # 根据实际获取
@@ -61,26 +92,34 @@ obs = env.reset()
 
 frames = {f"env_{i}": [] for i in range(NUM_WORLDS)}
 
+
+# 获取原始 tensor（具体方法名可能略有不同，请根据实际环境调整）
+# 常见的方法名：
+self_obs_tensor = env.sim.absolute_self_observation_tensor().to_torch()        # (num_worlds, max_agents, 8)
+partner_obs_tensor = env.sim.partner_observations_tensor().to_torch()  # (num_worlds, max_agents, max_agents-1, 9)
+map_obs_tensor = env.sim.map_observation_tensor().to_torch()          # (num_worlds, max_agents, top_k, 13)
+
+print(f"self_obs_tensor shape: {self_obs_tensor.shape}")
+
+# 缓慢向前
+action_slow_forward = (
+    np.array([0.0], dtype=np.float32),   # 转向角 = 0（直行）
+    np.array([0.5], dtype=np.float32),   # 加速度 = 0.5（缓慢向前）
+    np.array([0.0], dtype=np.float32)    # 头部倾斜 = 0
+)
+
 for t in range(env_config.episode_len):
 
-    # Sample random actions
-    rand_action = torch.Tensor(
-        [[env.action_space.sample() for _ in range(MAX_NUM_OBJECTS * NUM_WORLDS)]]
-    ).reshape(NUM_WORLDS, MAX_NUM_OBJECTS)
-
+    # 创建批量动作
+    actions = create_forward_actions_multidim(NUM_WORLDS, MAX_NUM_OBJECTS, action_dim=3)
+    
     # Step the environment
-    print(f'动作形状{rand_action.shape}')
-    env.step_dynamics(rand_action)
-
+    env.step_dynamics(actions)
     obs = env.get_obs()
     reward = env.get_rewards()
     done = env.get_dones()
     world_idx = 0
     agent_idx = 7
-    net_state, s_road, s_ref_raw, s_ref_error, s_other = builder.get_idc_observation(
-        world_idx, agent_idx, perceived_distance=30.0
-    )
-    print(f'net_state:{net_state}')
     # Render the environment
     if t % 5 == 0:
         imgs = env.vis.plot_simulator_state(
