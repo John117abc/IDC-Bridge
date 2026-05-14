@@ -1,5 +1,5 @@
+import math
 import sys
-from turtle import distance
 import numpy as np
 import torch
 import torch.nn as nn
@@ -19,11 +19,13 @@ logger = get_logger('idc-agent')
 # IDC Agent 适配类（离散动作 + Gumbel-Softmax）
 # ==============================================
 class DiscreteIDCAgent:
-    def __init__(self, env, args, device):
+    def __init__(self, env, args, device,state_builder,ego_indices):
         self.env = env
         self.device = device
         self.num_worlds = env.num_worlds
         self.max_agents = env.max_cont_agents
+        self.state_builder = state_builder  # 传入状态构建器实例
+        self.ego_indices = ego_indices  # 每个世界中自车的索引列表
 
         # IDC 维度定义
         self.DIM_EGO = 6                  # [x, y, v_lon, v_lat, phi, omega] (omega=0)
@@ -36,6 +38,7 @@ class DiscreteIDCAgent:
         self.dt = args.dt
         self.horizon = args.horizon
         self.batch_size = args.batch_size
+        self.update_freq = args.update_freq
 
         # 网络
         self.actor = ContinuousActor(self.TOTAL_STATE_DIM, args.hidden_dim).to(device)
@@ -85,7 +88,7 @@ class DiscreteIDCAgent:
         """
         with torch.no_grad():
             state_tensor = self.batch_state_to_tensor(state)        # [batch, TOTAL_STATE_DIM]
-            logger.info(f'选择动作: state_tensor shape={state_tensor.shape}')
+            logger.debug(f'选择动作: state_tensor shape={state_tensor.shape}')
             
             norm_action = self.actor(state_tensor)                  # [batch, max_agents * 2]
             batch_size = state_tensor.shape[0]
@@ -109,43 +112,44 @@ class DiscreteIDCAgent:
             return action
 
 
-    def predict_others(others_state, dt):
+    def predict_others(self,others_state):
         """
-        others_state: [batch, N, 4]  (px, py, phi, vlon)
+        others_state: [batch, N * 4]  (px, py, phi, vlon)
         返回下一时刻的 others_state
         """
-        px, py, phi, vlon = others_state.unbind(dim=-1)
-        px_next = px + vlon * torch.cos(phi) * dt
-        py_next = py + vlon * torch.sin(phi) * dt
+        logger.debug(f'预测周车下一状态: others_state shape={others_state.shape}')
+        px, py, phi, vlon = others_state.view(others_state.shape[0], int(self.DIM_OTHERS / 4), 4).unbind(dim=-1)  # [batch, N]
+        px_next = px + vlon * torch.cos(phi) * self.dt
+        py_next = py + vlon * torch.sin(phi) * self.dt
         phi_next = phi
         vlon_next = vlon
         return torch.stack([px_next, py_next, phi_next, vlon_next], dim=-1)
     
-    def compute_rollout_target(self, states):
+    def compute_rollout_target(self, states,word_indexs):
         """
         states: list of state objects  (batch)
         返回长度为 batch 的 tensor，每个元素是累计效用
         """
+        logger.debug(f'计算 rollout 目标: states batch size={len(states)}')
         batch = len(states)
         # 假设路径信息可以用连续表示（如跟踪误差已经在 utility_fn 里动态计算）
         # 为简化，我们直接在 rollout 循环中调用 utility_fn，它需要原始状态对象
-        # 因此更好的做法是保持状态为对象列表，但在计算图中走不通。
-        # 实际实现时，我们会将路径信息也编码为张量（如相对路径点）。
-        # 这里给出概念性伪代码：
-        total_utility = torch.zeros(batch)
+        total_utility = torch.zeros(batch).to(self.device)
         s = states   # 原始对象列表
+        w_i = word_indexs
         for t in range(self.horizon):
             # 从当前状态计算动作
-            u = self.actor( self.batch_state_to_tensor(s) )   # [batch, 2]
+            logger.debug(f' s 的形状: {s.shape if isinstance(s, torch.Tensor) else "list of length " + str(len(s))}')
+            u = self.actor(s)   # [batch, 2]
             # 计算即时效用（需要针对每个样本调用 utility）
-            l = torch.tensor([self.utility(s_i, u_i) for s_i, u_i in zip(s, u)])
-            total_utility += l
+            l_list = [self.utility(s_i, u_i, w_i[i]) for i, (s_i, u_i) in enumerate(zip(s, u))]
+            l = torch.stack(l_list)          # [batch]，每个元素保持梯度            total_utility += l
             # 使用预测模型 f_pred 更新状态（这里需要更新对象中的数值）
             s = self.f_pred_batch(s, u)   # 返回新的状态对象列表（或张量）
         return total_utility
 
     def batch_state_to_tensor(self, states):
-        logger.info(f'将状态对象列表转换为张量表示: batch_size={len(states)}')
+        logger.debug(f'将状态对象列表转换为张量表示: batch_size={len(states)},第一个状态={states[0] if len(states) > 0 else "N/A"}')
         # 一次性将所有状态转为张量
         states_tensors = [torch.from_numpy(s) for s in states]   # list of [TOTAL_STATE_DIM]
         
@@ -157,77 +161,96 @@ class DiscreteIDCAgent:
         state_tensor = torch.cat([ego_tensors, others_flat, ref_error_tensors], dim=-1)
         return state_tensor
     
-    def f_pred_batch(self,states, actions):
+    def f_pred_batch(self, states, actions):
         """
         states: list of state objects (batch)
         actions: tensor [batch, 2]
         返回新的状态对象列表（或张量）
         """
         # 将 states 转为张量表示
-        ego_tensors = torch.stack([s.ego_tensor for s in states])        # [batch, 6]
-        others_tensors = torch.stack([s.others_tensor for s in states])  # [batch, N, 4]
-
-        # 使用自行车模型预测下一时刻自车状态
-        ego_next = self.dynamics(ego_tensors[...,:6], actions)  # [batch, 6]
+        ego_tensors = states[:, :self.DIM_EGO]  # [batch, DIM_EGO]
+        others_tensors = states[:, self.DIM_EGO:self.DIM_EGO+self.DIM_OTHERS]  # [batch, DIM_OTHERS]
+        ref_error_tensors = states[:, self.DIM_EGO+self.DIM_OTHERS:self.DIM_EGO+self.DIM_OTHERS+self.DIM_REF_ERROR]  # [batch, DIM_REF_ERROR]
+        logger.debug(f'预测下一状态: others_tensors shape={others_tensors.shape}')
+        
+        # 使用自行车模型预测下一时刻自车状态x_next, y_next, theta_next, v_next
+        ego_next = self.dynamics(ego_tensors[...,:6], actions)
+        
+        # 自车预测状态转成[x, y, v_lon, v_lat, phi, omega]格式（假设omega=0）
+        x_next = ego_next[:, 0]
+        y_next = ego_next[:, 1]
+        theta_next = ego_next[:, 2]
+        v_next = ego_next[:, 3]
+        v_lon_next = v_next * torch.cos(theta_next)
+        v_lat_next = v_next * torch.sin(theta_next)
+        ego_next_formatted = torch.stack([x_next, y_next, v_lon_next, v_lat_next, theta_next, torch.zeros_like(theta_next)], dim=-1)  # [batch, 6]
 
         # 使用简单的运动学模型预测周车状态（假设动作对周车无影响）
-        others_next = self.predict_others(others_tensors, self.dt)  # [batch, N, 4]
-
-        # 将 ego_next 和 others_next 转回状态对象列表（需要设计 tensor_to_state 函数）
+        others_next = self.predict_others(others_tensors)  # [batch, N, 4]
+        # 将 ego_next 和 others_next 转回状态对象列表
+        logger.debug(f'预测完成，构建下一状态对象列表: ego_next shape={ego_next.shape}, others_next shape={others_next.shape}, ref_error shape={ref_error_tensors.shape}')
         next_states = []
         for i in range(len(states)):
-            next_s = self.tensor_to_state(ego_next[i], others_next[i], states[i].path_ref)
+            next_s = self.tensor_to_state_tensor(ego_next_formatted[i], others_next[i], ref_error_tensors[i])
             next_states.append(next_s)
-        return next_states
+        return torch.stack(next_states)  # [batch, TOTAL_STATE_DIM]
     
-    def tensor_to_state(self, ego_tensor, others_tensor, path_ref):
+    def tensor_to_state_tensor(self, ego_tensor, others_tensor, ref_error_tensor):
         """
-        将 ego_tensor 和 others_tensor 转回状态对象。
-        需要根据你的状态对象定义来实现。
+        将 ego_tensor 和 others_tensor ref_error_tensor 转成网络能接收的tensor格式的状态对象
+        ego_next shape=torch.Size([10, 4]), others_next shape=torch.Size([10, 8, 4]), ref_error shape=torch.Size([10, 3])
         """
-        network_state = torch.cat([ego_tensor, others_tensor.view(-1), path_ref], dim=-1)  # [TOTAL_STATE_DIM]
-        return network_state
+        return torch.cat([ego_tensor, others_tensor.view(-1), ref_error_tensor], dim=-1)  # [TOTAL_STATE_DIM]
 
-    def update_critic(self,states):
-        targets = self.compute_rollout_target(states)
-        values = self.critic(self.batch_state_to_tensor(states))
+
+    def update_critic(self,states,word_indexs):
+        logger.debug(f'更新 Critic: states batch size={len(states)}')
+        targets = self.compute_rollout_target(states,word_indexs)
+        values = self.critic(states)
         loss = F.mse_loss(values, targets)
         self.critic_optimizer.zero_grad()
         loss.backward()
         self.critic_optimizer.step()
+        return loss.detach().item()
 
-    def update_actor(self,states):
-        # 使用当前 actor 和模型展开 H 步，得到累计效用 + 惩罚项
+    def update_actor(self, states, w_i):
+        logger.debug(f'更新 Actor: states batch size={len(states)}')
         total_cost = 0.0
         s = states
         for t in range(self.horizon):
-            u = self.actor(self.batch_state_to_tensor(s)).sample()   # 重参数化动作
-            # 效用
-            l = torch.tensor([self.utility(s_i, u_i) for s_i, u_i in zip(s, u)])
-            # 惩罚项
-            p = torch.tensor([self.penalty(s_i) for s_i in s])
+            u = self.actor(s)  # 假设 u 形状 [batch, action_dim]
+            
+            # 关键修改：使用 torch.stack 代替 torch.tensor，保留梯度
+            l_list = [self.utility(s_i, u_i, w_i[i]) for i, (s_i, u_i) in enumerate(zip(s, u))]
+            l = torch.stack(l_list)          # [batch]，每个元素保持梯度
+            p_list = [self.penalty(s_i) for s_i in s]
+            p = torch.stack(p_list)          # [batch]
+            
             total_cost += (l + self.rho * p)
             s = self.f_pred_batch(s, u)
-        # 目标是最小化 total_cost，因此 actor 的 loss = total_cost.mean()
-        # 但为了利用 critic 降低方差，也可以使用 advantage，这里直接最小化 cost 本身
+        
         actor_loss = total_cost.mean()
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
+        return actor_loss.detach().item()
 
-    def utility(self, s, u):
+    def utility(self, s, u,w_i):
         """
         s: 状态对象（包含 ego, others, ref）
         u: [delta, a] 控制量
+        w_i: 世界索引
         返回标量代价 l = 跟踪误差 + 控制能量
         """
         # 从 s 中获取自车状态和参考路径
-        ego = s.ego
-        ref = s.path_ref
+        logger.debug(f'计算效用: 状态={s.shape}, 动作={u.shape}')
+        ego = s[:self.DIM_EGO]  # [6]
+        # 通过state_builder的w_i所以计算参考
+        ref = self.state_builder.get_ref_state(w_i, self.ego_indices[w_i])
         # 计算跟踪误差
-        pos_err = distance(ego[0:2], ref.closest_point(ego[0:2]))
-        heading_err = ego[4] - ref.closest_heading(ego[0:2])
-        speed_err = ego[2] - ref.desired_speed(ego[0:2])
+        pos_err = math.sqrt(ref[0]**2 + ref[1]**2)  # 位置误差
+        heading_err = ego[4] - ref[4]  # 航向误差
+        speed_err = ego[2] - ref[2]  # 速度误差
         # 控制能量
         steer_cost = u[0]**2
         acc_cost = u[1]**2
@@ -245,7 +268,7 @@ class DiscreteIDCAgent:
         包括：与周围车辆安全距离、与道路边界安全距离、红灯停止线
         返回标量惩罚值（非负）
         """
-        violation = 0.0
+        violation = torch.tensor(0.0).to(self.device)
         # ego = s.ego
         # # 与其他车辆的碰撞约束
         # for other in s.others:
@@ -263,11 +286,19 @@ class DiscreteIDCAgent:
         return violation
     
     def update(self):
-        states = self.buffer.sample_batch(self.batch_size)
+        states, _, word_indexs = zip(*self.buffer.sample_batch(self.batch_size))
         # 1. 更新 Critic
-        self.update_critic(states)
+        # 首先处理把state转成tensor，然后计算 rollout 目标，最后更新 critic 网络
+        states_tensor = self.batch_state_to_tensor(states)
+        critic_loss = self.update_critic(states_tensor,word_indexs)
         # 2. 更新 Actor（每隔几次 Critic 更新）
-        if self.global_step % self.args.update_freq == 0:
-            self.rho = min(self.init_penalty * (self.amplifier_c ** (self.gep_iteration // self.amplifier_m)), self.max_penalty)
-            self.update_actor(states)
+        actor_loss = None
+        if self.global_step % self.update_freq == 0:
+            # 由于states_tensor已经经过了上面critic的计算图,所以这里
+            logger.info(f'更新 Actor: global_step={self.global_step}, states_tensor shape={states_tensor.shape}')
+            self.rho = min(self.rho * (self.amplifier_c ** (self.gep_iteration // self.amplifier_m)), self.max_penalty)
+            self.update_actor(states_tensor,word_indexs)
             self.gep_iteration += 1
+        
+        return critic_loss, actor_loss
+        

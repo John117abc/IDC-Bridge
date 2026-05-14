@@ -107,7 +107,7 @@ def train(args):
         ego_indices.append(controllable[0].item() if len(controllable) > 0 else 0)
 
     # 5. 初始化 agent
-    agent = DiscreteIDCAgent(env, args, args.device)
+    agent = DiscreteIDCAgent(env, args, args.device, builder,ego_indices)
 
     print(f'开始训练')
     # 6. 训练循环
@@ -122,10 +122,10 @@ def train(args):
             logger.info(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{args.max_steps}')
             states = []
             for w in range(args.num_worlds):
-                net, road, ref, ref_err, others = builder.get_idc_observation(
+                network_state, raw_state = builder.get_idc_observation(
                     w, ego_indices[w])
-                states.append(net)
-                agent.buffer.handle_new_experience((net, road, ref, ref_err, others, w))
+                states.append(network_state)
+                agent.buffer.handle_new_experience((network_state, raw_state, w))  # 将原始状态也存入 buffer
                 # 增加对应世界的步数计数器
                 builder.increment_step(w)
             logger.info(f'状态构建完成，开始选择动作')

@@ -27,17 +27,6 @@ class GPUDriveObservationBuilder:
         # 步数计数器
         self.step_counter = {w: 0 for w in range(self.num_worlds)}
 
-        # 缓存目标点
-        self.goal_positions = []
-        for scene in scene_json_list:
-            goals = {}
-            for obj in scene.get('objects', []):
-                aid = obj.get('id', -1)
-                if aid != -1 and 'goalPosition' in obj:
-                    gp = obj['goalPosition']
-                    goals[aid] = (gp['x'], gp['y'])
-            self.goal_positions.append(goals)
-
         # 专家轨迹（如果存在）
         self.expert_traj = None
         self.EXPERT_TRAJ_LEN = None
@@ -48,6 +37,7 @@ class GPUDriveObservationBuilder:
                 logger.info(f"Expert trajectory available, shape: {self.expert_traj.shape}")
             except Exception as e:
                 logger.warning(f"Unable to get expert_trajectory_tensor: {e}")
+        
 
     def reset_world_step(self, world_idx: int, step: int = 0):
         self.step_counter[world_idx] = step
@@ -68,13 +58,10 @@ class GPUDriveObservationBuilder:
             s_ref_error: (3,)
             s_other: (num_other_vehicles, 6)
         """
-        # 获取最新观测
-        obs = self.env.get_obs()  # dict with 'road_map_obs', 'partner_obs', 'ego_state'
-
-        s_ego = self._get_ego_state(world_idx, agent_idx)
-        s_others = self._get_other_vehicles(world_idx, agent_idx, num_other_vehicles)
-        s_road = self._get_road_edges(world_idx, ego_x=s_ego[0], ego_y=s_ego[1])
-        s_ref = self._get_ref_state(world_idx, agent_idx)
+        s_ego = self.get_ego_state(world_idx, agent_idx)
+        s_others = self.get_other_vehicles(world_idx, agent_idx, num_other_vehicles)
+        s_road = self.get_road_edges(world_idx, ego_x=s_ego[0], ego_y=s_ego[1])
+        s_ref = self.get_ref_state(world_idx, agent_idx)
         s_ref_error = self._calc_ref_error(s_ego, s_ref)
 
         # 周车只取[x,y,heading,vy],目前获得的值是这样的[global_x, global_y, vx, vy, abs_heading, 0.0]
@@ -84,13 +71,21 @@ class GPUDriveObservationBuilder:
             s_idc_others.flatten().astype(np.float32),
             s_ref_error.astype(np.float32)
         ])
-        return network_state, s_road, s_ref, s_ref_error, s_others
+
+        # raw_state
+        raw_state = np.concatenate([
+            s_ego,
+            s_others.flatten().astype(np.float32),
+            s_ref.astype(np.float32),
+            s_road.flatten().astype(np.float32),
+        ])
+        return network_state, raw_state
 
     # --------------------------------------------------------
     #  自车状态 [x, y, vx, vy, heading, omega=0]
     #  注意：ego_state 不提供位置和分速度，只能用 absolute_obs
     # --------------------------------------------------------
-    def _get_ego_state(self, world_idx: int, agent_idx: int) -> np.ndarray:
+    def get_ego_state(self, world_idx: int, agent_idx: int) -> np.ndarray:
         # 绝对观测：位置 + 航向
         abs_tensor = self.sim.absolute_self_observation_tensor().to_torch()
         state_abs = abs_tensor[world_idx, agent_idx].cpu().numpy()
@@ -110,7 +105,7 @@ class GPUDriveObservationBuilder:
 
 
 
-    def _get_other_vehicles(self, 
+    def get_other_vehicles(self, 
                             world_idx: int, 
                             ego_agent_idx: int, 
                             max_partners: int = None
@@ -128,7 +123,7 @@ class GPUDriveObservationBuilder:
                         按距离自车升序排列
         """
         # 1. 获取自车状态（用于坐标转换和距离计算）
-        ego_state = self._get_ego_state(world_idx, ego_agent_idx)  # [x, y, vx, vy, heading, omega]
+        ego_state = self.get_ego_state(world_idx, ego_agent_idx)  # [x, y, vx, vy, heading, omega]
         ego_x, ego_y = ego_state[0], ego_state[1]
         ego_heading = ego_state[4]
         
@@ -185,7 +180,7 @@ class GPUDriveObservationBuilder:
         result = np.array([state for _, state in partner_states], dtype=np.float32)
         return result
 
-    def _get_road_edges(self, world_idx: int, ego_x: float, ego_y: float) -> np.ndarray:
+    def get_road_edges(self, world_idx: int, ego_x: float, ego_y: float) -> np.ndarray:
         """
         返回离自车最近的 RoadLine 点（全局绝对坐标）。
         如果没有任何 RoadLine 点，返回自车坐标。
@@ -214,10 +209,11 @@ class GPUDriveObservationBuilder:
         closest_y = line_points[closest_idx, 1]
         
         return np.array([closest_x, closest_y, 0., 0., 0., 0.], dtype=np.float32)
+    
     # --------------------------------------------------------
     #  参考路径
     # --------------------------------------------------------
-    def _get_ref_state(self, world_idx: int, agent_idx: int) -> np.ndarray:
+    def get_ref_state(self, world_idx: int, agent_idx: int) -> np.ndarray:
         """
         专家参考状态：[x_ref, y_ref, vx_ref, 0, heading_ref, 0]
         1. 优先使用专家轨迹的未来点；
@@ -236,6 +232,7 @@ class GPUDriveObservationBuilder:
                 vx = vel[agent_idx, step, 0].item()
                 ref_heading = heading[agent_idx, step].item()
                 return np.array([ref_x, ref_y, vx, 0.0, ref_heading, 0.0], dtype=np.float32)
+            
 
        
 
