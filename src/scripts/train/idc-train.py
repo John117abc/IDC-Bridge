@@ -20,6 +20,36 @@ from agents.idc_agent import DiscreteIDCAgent
 from buffer import PERBuffer
 from utils import get_logger
 logger = get_logger('idc-agent')
+
+# 方式2：多维动作 (num_worlds, max_agents, action_dim)
+def create_forward_actions_multidim(num_worlds, max_agents, action_dim=3):
+    """
+    创建三维动作张量
+    形状: (num_worlds, max_agents, action_dim)
+    """
+    # 向前走的动作：[转向=0, 加速度=0.5, 头部倾斜=0]
+    forward_action = torch.tensor([0.5, 0.0, 0.0], dtype=torch.float32)
+    
+    # 扩展到所有智能体
+    actions = forward_action.reshape(1, 1, -1).expand(num_worlds, max_agents, -1).clone()
+    return actions
+
+def extend_action_to_3d(actions_2d):
+    """
+    将二维动作 [delta, a] 扩展为三维动作 [delta, a, 0]
+    
+    参数:
+        actions_2d (torch.Tensor): 形状 (batch, max_agents, 2) 的动作张量
+    返回:
+        torch.Tensor: 形状 (batch, max_agents, 3) 的动作张量，第三维恒为 0
+    """
+    batch, agents, _ = actions_2d.shape
+    # 创建形状匹配的零张量作为第三维
+    zeros = torch.zeros((batch, agents, 1), dtype=actions_2d.dtype, device=actions_2d.device)
+    # 沿最后一个维度拼接
+    actions_3d = torch.cat([actions_2d, zeros], dim=-1)
+    return actions_3d
+
 # ==============================================
 # 训练主循环
 # ==============================================
@@ -87,58 +117,35 @@ def train(args):
         for w in range(args.num_worlds):
             builder.reset_world_step(w, 0)
 
-        logger.info(f'观察空间形状: {obs.shape}, 动作空间: {env.action_space}')
-
         for step in range(args.max_steps):
-            # 收集所有 ego 的 IDC 观测
+            # 记录状态，供后续动作选择和训练使用
+            logger.info(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{args.max_steps}')
             states = []
-            road_list = []
-            
             for w in range(args.num_worlds):
-                net, road, ref, ref_err, other = builder.get_idc_observation(
-                    w, ego_indices[w], perceived_distance=30.0)
+                net, road, ref, ref_err, others = builder.get_idc_observation(
+                    w, ego_indices[w])
                 states.append(net)
-                road_list.append(road)
-                agent.road_states[w] = road      # 缓存，供后续约束计算
-
-            states_batch = torch.tensor(np.stack(states), dtype=torch.float32, device=args.device)
-
-            # 选动作
-            _, action_1d = agent.select_action(states_batch, deterministic=False)
-
-
-            # 构造 GPUDrive 所需的动作张量 [num_worlds, max_agents]
-            act_template = torch.zeros((args.num_worlds, args.max_agents), dtype=torch.int64)
-            for w in range(args.num_worlds):
-                act_template[w, ego_indices[w]] = int(action_1d[w])
-            env.step_dynamics(act_template)
-
-            next_obs = env.get_obs()
-            print(f'下一步观测形状: {next_obs.shape}')
-            rewards = env.get_rewards()
-            dones = env.get_dones()
-            infos = env.get_infos()
-            print(f'奖励形状: {rewards.shape}, done 形状: {dones.shape}')
-            print("infos type:", type(infos))
-            if hasattr(infos, 'shape'):
-                info_dict = dict(infos)
-                print("infos 形状:", infos.shape)
-                print("infos[0,0]", infos[0,0].cpu().numpy())   # 第一个 world 第一个 agent
-            else:
-                # 如果是 list of dicts
-                print("infos sample:", infos[0])
-            # 收集经验（需将 builder 的步数 +1）
-            for w in range(args.num_worlds):
+                agent.buffer.handle_new_experience((net, road, ref, ref_err, others, w))
+                # 增加对应世界的步数计数器
                 builder.increment_step(w)
-            # 注意：builder 步数递增后，再取观测会是下一步的，存经验时需保存 next_obs
-            # 这里简化处理，实际应将 next_obs 转为 IDC 观测存入 buffer
+            logger.info(f'状态构建完成，开始选择动作')
+            # 创建批量动作
+            # actions = create_forward_actions_multidim(args.num_worlds, args.max_agents, action_dim=3)
+            actions = agent.select_action(states)  # [num_worlds, max_agents, action_dim]
+            actions = extend_action_to_3d(actions)
+            logger.info(f'动作选择完成，开始环境交互，动作形状: {actions.shape}')
+            env.step_dynamics(actions)
 
-            # 更新 agent（每收集一定步数后调用一次）
-            # if step % args.update_freq == 0:
-                # agent.update(...)   # 需要传入 ref_path 和 road_states_batch
-
+            logger.info(f'环境交互完成，开始更新智能体')
+            # 更新参数
+            agent.update()
+            next_obs = env.get_obs()
             obs = next_obs
-
+            agent.global_step += 1
+            # 暂时用不到
+            # rewards = env.get_rewards()
+            # dones = env.get_dones()
+            # infos = env.get_infos()
 
     # 每个环境的帧保存为单独的 GIF
     print("结束")
@@ -162,7 +169,7 @@ if __name__ == "__main__":
     parser.add_argument('--max-penalty', type=float, default=100.0)
     parser.add_argument('--amplifier-c', type=float, default=1.5)
     parser.add_argument('--amplifier-m', type=int, default=10)
-    parser.add_argument('--update-freq', type=int, default=10)
+    parser.add_argument('--update-freq', type=int, default=5)
     parser.add_argument('--seed', type=int, default=20)
     args = parser.parse_args()
     train(args)
