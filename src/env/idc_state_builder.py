@@ -34,9 +34,12 @@ class GPUDriveObservationBuilder:
             try:
                 self.expert_traj = self.sim.expert_trajectory_tensor().to_torch()
                 self.EXPERT_TRAJ_LEN = self.expert_traj.shape[2] // 16
-                logger.info(f"Expert trajectory available, shape: {self.expert_traj.shape}")
+                logger.debug(f"Expert trajectory available, shape: {self.expert_traj.shape}")
             except Exception as e:
                 logger.warning(f"Unable to get expert_trajectory_tensor: {e}")
+        
+        logger.debug(f'专家轨迹长度：{self.EXPERT_TRAJ_LEN}')
+
         
 
     def reset_world_step(self, world_idx: int, step: int = 0):

@@ -70,7 +70,7 @@ class DiscreteIDCAgent:
         self.HALF_W = 1.0
 
         # 缓冲区
-        self.buffer = PERBuffer(capacity=100000, min_start_train=100)
+        self.buffer = PERBuffer(capacity=100000, min_start_train=args.batch_size)
         self.global_step = 1
         self.gep_iteration = 0
 
@@ -207,7 +207,7 @@ class DiscreteIDCAgent:
         logger.debug(f'更新 Critic: states batch size={len(states)}')
         targets = self.compute_rollout_target(states,word_indexs)
         values = self.critic(states)
-        loss = F.mse_loss(values, targets)
+        loss = F.mse_loss(values, targets.unsqueeze(1))
         self.critic_optimizer.zero_grad()
         loss.backward()
         self.critic_optimizer.step()
@@ -219,13 +219,13 @@ class DiscreteIDCAgent:
         s = states
         for t in range(self.horizon):
             u = self.actor(s)  # 假设 u 形状 [batch, action_dim]
-            
             # 关键修改：使用 torch.stack 代替 torch.tensor，保留梯度
             l_list = [self.utility(s_i, u_i, w_i[i]) for i, (s_i, u_i) in enumerate(zip(s, u))]
             l = torch.stack(l_list)          # [batch]，每个元素保持梯度
-            p_list = [self.penalty(s_i) for s_i in s]
+            p_list = [self.penalty(s_i, w_i[i]) for i, s_i in enumerate(s)]
             p = torch.stack(p_list)          # [batch]
-            
+            # 打印控制消耗和惩罚值的统计信息
+            logger.info(f'Actor 更新: step {t}, 平均效用 {l.mean().item():.4f}, 平均惩罚 {p.mean().item():.4f}')
             total_cost += (l + self.rho * p)
             s = self.f_pred_batch(s, u)
         
@@ -254,7 +254,7 @@ class DiscreteIDCAgent:
         # 控制能量
         steer_cost = u[0]**2
         acc_cost = u[1]**2
-        # 加权和（论文中系数）
+        # 加权和
         l = (self.pos_err_weight * pos_err**2 +
             self.speed_err_weight * speed_err**2 +
             self.heading_err_weight * heading_err**2 +
@@ -262,25 +262,27 @@ class DiscreteIDCAgent:
             self.acc_cost_weight * acc_cost)
         return l
 
-    def penalty(self, s):
+    def penalty(self, s, w_i):
         """
         计算状态 s 下的约束违反惩罚（用于 Actor 更新）
         包括：与周围车辆安全距离、与道路边界安全距离、红灯停止线
         返回标量惩罚值（非负）
         """
         violation = torch.tensor(0.0).to(self.device)
-        # ego = s.ego
-        # # 与其他车辆的碰撞约束
-        # for other in s.others:
-        #     dist = euclidean_distance(ego[0:2], other[0:2])
-        #     safe_dist = self.D_veh_safe
-        #     if dist < safe_dist:
-        #         violation += (safe_dist - dist)**2
-        # # 与道路边界约束
-        # road_boundary_dist = distance_to_road_boundary(ego[0:2], s.path_ref)
-        # if road_boundary_dist < self.D_road_safe:
-        #     violation += (self.D_road_safe - road_boundary_dist)**2
-        # 红灯停止线（简化：如果红灯且超越停止线）
+        ego = s[:self.DIM_EGO]  # [6]
+        # 与其他车辆的碰撞约束
+        for other in s[self.DIM_EGO:self.DIM_EGO+self.DIM_OTHERS].view(-1, 4):  # 每4维一个车辆状态
+            dist = torch.sqrt((ego[0] - other[0])**2 + (ego[1] - other[1])**2)
+            safe_dist = self.D_veh_safe
+            if dist < safe_dist:
+                violation += (safe_dist - dist)**2
+        # 与道路边界约束
+        closest_edge_point = self.state_builder.get_road_edges(w_i, ego_x=ego[0].detach().item(), ego_y=ego[1].detach().item())  # 假设返回与最近道路边界的距离
+        # 计算自车与道路边界的距离
+        road_boundary_dist = torch.sqrt((closest_edge_point[0] - ego[0])**2 + (closest_edge_point[1] - ego[1])**2)
+        if road_boundary_dist < self.D_road_safe:
+            violation += (self.D_road_safe - road_boundary_dist)**2
+        # 红灯停止线，后续开发
         # if s.traffic_light == 'red' and ego[0] > stop_line_position(s.path_ref):
         #     violation += (ego[0] - stop_line_position)**2
         return violation
@@ -293,11 +295,11 @@ class DiscreteIDCAgent:
         critic_loss = self.update_critic(states_tensor,word_indexs)
         # 2. 更新 Actor（每隔几次 Critic 更新）
         actor_loss = None
-        if self.global_step % self.update_freq == 0:
+        if self.global_step % self.update_freq == 0 and self.rho <= self.max_penalty:
             # 由于states_tensor已经经过了上面critic的计算图,所以这里
-            logger.info(f'更新 Actor: global_step={self.global_step}, states_tensor shape={states_tensor.shape}')
-            self.rho = min(self.rho * (self.amplifier_c ** (self.gep_iteration // self.amplifier_m)), self.max_penalty)
-            self.update_actor(states_tensor,word_indexs)
+            logger.debug(f'更新 Actor: global_step={self.global_step}, states_tensor shape={states_tensor.shape}')
+            self.rho = min(self.rho * self.amplifier_c, self.max_penalty)
+            actor_loss = self.update_actor(states_tensor,word_indexs)
             self.gep_iteration += 1
         
         return critic_loss, actor_loss

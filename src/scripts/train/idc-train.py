@@ -1,7 +1,6 @@
 import sys
 import numpy as np
 import torch
-import imageio
 import json
 import os
 # 导入智能体
@@ -109,7 +108,7 @@ def train(args):
     # 5. 初始化 agent
     agent = DiscreteIDCAgent(env, args, args.device, builder,ego_indices)
 
-    print(f'开始训练')
+    logger.debug(f'训练开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={args.max_steps}')
     # 6. 训练循环
     for epoch in range(args.epochs):
         obs = env.reset()
@@ -119,7 +118,7 @@ def train(args):
 
         for step in range(args.max_steps):
             # 记录状态，供后续动作选择和训练使用
-            logger.info(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{args.max_steps}')
+            logger.debug(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{args.max_steps}')
             states = []
             for w in range(args.num_worlds):
                 network_state, raw_state = builder.get_idc_observation(
@@ -128,17 +127,23 @@ def train(args):
                 agent.buffer.handle_new_experience((network_state, raw_state, w))  # 将原始状态也存入 buffer
                 # 增加对应世界的步数计数器
                 builder.increment_step(w)
-            logger.info(f'状态构建完成，开始选择动作')
+            logger.debug(f'状态构建完成，开始选择动作')
             # 创建批量动作
-            # actions = create_forward_actions_multidim(args.num_worlds, args.max_agents, action_dim=3)
             actions = agent.select_action(states)  # [num_worlds, max_agents, action_dim]
             actions = extend_action_to_3d(actions)
-            logger.info(f'动作选择完成，开始环境交互，动作形状: {actions.shape}')
+            logger.debug(f'动作选择完成，开始环境交互，动作形状: {actions.shape}')
             env.step_dynamics(actions)
 
-            logger.info(f'环境交互完成，开始更新智能体')
+            logger.debug(f'环境交互完成，开始更新智能体')
             # 更新参数
-            agent.update()
+            if agent.buffer.should_start_training():
+                logger.debug(f'开始训练: global_step={agent.global_step}, buffer size={len(agent.buffer)}')
+                critic_loss, actor_loss = agent.update()
+                logger.debug(f'训练完成: global_step={agent.global_step}')
+
+                # 打印损失
+                logger.debug(f'Critic Loss: {critic_loss:.4f}, Actor Loss: {actor_loss ==None and "N/A" or f"{actor_loss:.4f}" }, Penalty Coefficient (rho): {agent.rho:.4f}')
+            
             next_obs = env.get_obs()
             obs = next_obs
             agent.global_step += 1
@@ -148,28 +153,28 @@ def train(args):
             # infos = env.get_infos()
 
     # 每个环境的帧保存为单独的 GIF
-    print("结束")
+    logger.debug('训练完成')
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir', type=str, required=True)
-    parser.add_argument('--num-worlds', type=int, default=10)
+    parser.add_argument('--num-worlds', type=int, default=2)
     parser.add_argument('--max-agents', type=int, default=1)
-    parser.add_argument('--max-steps', type=int, default=8)
-    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--max-steps', type=int, default=90)
+    parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--dt', type=float, default=0.05)
     parser.add_argument('--horizon', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=100)
+    parser.add_argument('--batch-size', type=int, default=10)
     parser.add_argument('--hidden-dim', type=int, default=256)
     parser.add_argument('--lr-actor', type=float, default=3e-4)
     parser.add_argument('--lr-critic', type=float, default=3e-4)
     parser.add_argument('--init-penalty', type=float, default=1.0)
-    parser.add_argument('--max-penalty', type=float, default=100.0)
-    parser.add_argument('--amplifier-c', type=float, default=1.5)
-    parser.add_argument('--amplifier-m', type=int, default=10)
-    parser.add_argument('--update-freq', type=int, default=5)
+    parser.add_argument('--max-penalty', type=float, default=10.0)
+    parser.add_argument('--amplifier-c', type=float, default=1.001)
+    parser.add_argument('--amplifier-m', type=int, default=1e-4)
+    parser.add_argument('--update-freq', type=int, default=2)
     parser.add_argument('--seed', type=int, default=20)
     args = parser.parse_args()
     train(args)

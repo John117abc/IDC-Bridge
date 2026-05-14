@@ -93,7 +93,7 @@ def save_checkpoint(
 
     # 5. 保存
     torch.save(checkpoint, file_path)
-    logger.info(f'训练文件保存在：{file_path}')
+    logger.debug(f'训练文件保存在：{file_path}')
 
 
 def load_checkpoint(model, filepath, optimizer=None, device=None):
