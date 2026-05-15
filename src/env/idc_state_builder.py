@@ -78,14 +78,13 @@ class GPUDriveObservationBuilder:
         s_ego = self.get_ego_state(world_idx, agent_idx)
         s_others = self.get_other_vehicles(world_idx, agent_idx, num_other_vehicles)
         s_road = self.get_road_edges(world_idx, ego_x=s_ego[0], ego_y=s_ego[1])
-        s_ref = self.get_ref_state(world_idx, agent_idx, self.step_counter[world_idx])
+        s_ref = self.get_ref_state(world_idx, agent_idx, ego_x=s_ego[0], ego_y=s_ego[1])
         s_ref_error = self._calc_ref_error(s_ego, s_ref)
 
         # 周车只取[x,y,heading,vy],目前获得的值是这样的[global_x, global_y, vx, vy, abs_heading, 0.0]
-        s_idc_others = s_others[:, [0, 1, 4, 3]]  # 选择 x, y, heading, vy 四个维度
         network_state = np.concatenate([
             s_ego,
-            s_idc_others.flatten().astype(np.float32),
+            s_others.flatten().astype(np.float32),
             s_ref_error.astype(np.float32)
         ])
 
@@ -184,7 +183,7 @@ class GPUDriveObservationBuilder:
             # 距离（用于排序）
             distance = np.hypot(global_x - ego_x, global_y - ego_y)
             
-            partner_states.append((distance, [global_x, global_y, vx, vy, abs_heading, 0.0]))
+            partner_states.append((distance, [global_x, global_y, abs_heading, speed]))
         
         # 4. 按距离排序
         partner_states.sort(key=lambda x: x[0])
@@ -194,7 +193,7 @@ class GPUDriveObservationBuilder:
             partner_states = partner_states[:max_partners]
         
         # 6. 转换为 numpy 数组
-        result = np.array([state for _, state in partner_states], dtype=np.float32)
+        result = np.array([state for _, state in partner_states], dtype=np.float32)  # shape (N,4)
         return result
 
     def get_road_edges(self, world_idx: int, ego_x: float, ego_y: float) -> np.ndarray:
@@ -228,31 +227,32 @@ class GPUDriveObservationBuilder:
         return np.array([closest_x, closest_y, 0., 0., 0., 0.], dtype=np.float32)
     
 
-    # ==========================================
-    # 参考路径
-    # ==========================================
-    # ==========================================
-    def get_ref_state(self, world_idx: int, agent_idx: int, step: int) -> np.ndarray:
+    def get_nearest_ref_point(self, world_idx: int, agent_idx: int, ego_x: float, ego_y: float):
         """
-        基于官方数据布局提取的参考状态
+        返回专家轨迹上离自车最近点的索引、位置、航向、速度。
         """
-        if self.expert_pos is not None and step < self.EXPERT_TRAJ_LEN:
-            # 提取当前步的专家数据
-            # 使用 .detach().cpu().numpy() 确保转换安全
-            p = self.expert_pos[world_idx, agent_idx, step]
-            v = self.expert_vel[world_idx, agent_idx, step]
-            h = self.expert_heading[world_idx, agent_idx, step]
-            
-            return np.array([
-                p[0].item(),  # ref_x
-                p[1].item(),  # ref_y
-                v[0].item(),  # ref_vx
-                0.0,          # 占位
-                h[0].item(),  # ref_heading
-                0.0           # 占位
-            ], dtype=np.float32)
+        pos_traj = self.expert_pos[world_idx, agent_idx]  # (T, 2)
+        # 计算所有点到自车的欧氏距离平方
+        dx = pos_traj[:, 0] - ego_x
+        dy = pos_traj[:, 1] - ego_y
+        dist_sq = dx*dx + dy*dy
+        nearest_idx = torch.argmin(dist_sq).item()
+        
+        ref_x = pos_traj[nearest_idx, 0].item()
+        ref_y = pos_traj[nearest_idx, 1].item()
+        ref_heading = self.expert_heading[world_idx, agent_idx, nearest_idx].item()
+        ref_speed = torch.norm(self.expert_vel[world_idx, agent_idx, nearest_idx]).item()  # 速度大小
+        
+        return nearest_idx, (ref_x, ref_y, ref_heading, ref_speed)
 
-        return np.zeros(6, dtype=np.float32)
+    def get_ref_state(self, world_idx: int, agent_idx: int, ego_x: float, ego_y: float) -> np.ndarray:
+        """
+        基于最近点返回参考状态 [x, y, vx, vy, heading, 0]
+        """
+        _, (ref_x, ref_y, ref_heading, ref_speed) = self.get_nearest_ref_point(world_idx, agent_idx, ego_x, ego_y)
+        ref_vx = ref_speed * np.cos(ref_heading)
+        ref_vy = ref_speed * np.sin(ref_heading)
+        return np.array([ref_x, ref_y, ref_vx, ref_vy, ref_heading, 0.0], dtype=np.float32)
 
     @staticmethod
     def _calc_ref_error(ego_state: np.ndarray, ref_state: np.ndarray) -> np.ndarray:

@@ -12,7 +12,7 @@ def save_checkpoint(
         model,
         model_name: str,
         env_name: str,
-        file_dir: str = "checkpoints",
+        file_dir: str,
         metrics: dict = None,
         extension: str = "pth",
         optimizer=None,
@@ -36,14 +36,15 @@ def save_checkpoint(
         extra_info: 其他自定义信息
     """
     # 获取根目录
-    from src.utils import get_project_root
 
-    file_dir = get_project_root() / file_dir
+    file_dir =  f'{file_dir}/checkpoints'
 
+    # 确保保存目录存在
+    logger.info(f'正在保存模型检查点，目录: {file_dir}')
     # 1. 获取当前日期和时间
     today = datetime.now().strftime("%Y%m%d")
     time_now = datetime.now().strftime("%H%M%S")
-
+    
     # 2. 构建日期子目录路径
     dated_dir = os.path.join(file_dir, today)
     os.makedirs(dated_dir, exist_ok=True)
@@ -114,9 +115,8 @@ def load_checkpoint(model, filepath, optimizer=None, device=None):
     Returns:
         checkpoint: 完整的 checkpoint 字典（包含 extra_info、metrics 等）
     """
-    from src.utils import get_project_root
 
-    filepath = Path(get_project_root()) / filepath
+    filepath = Path(filepath)
 
     if not filepath.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {filepath}")

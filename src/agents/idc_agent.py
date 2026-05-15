@@ -11,6 +11,7 @@ from models.continuous_actor_critic import ContinuousActor, ContinuousCritic
 from models.kinematic_bicycle import KinematicBicycleModel
 from buffer import PERBuffer
 from utils import get_logger
+from utils import save_checkpoint, load_checkpoint
 
 logger = get_logger('idc-agent')
 
@@ -20,6 +21,7 @@ logger = get_logger('idc-agent')
 # ==============================================
 class DiscreteIDCAgent:
     def __init__(self, env, args, device,state_builder,ego_indices):
+        self.args = args
         self.env = env
         self.device = device
         self.num_worlds = env.num_worlds
@@ -60,12 +62,11 @@ class DiscreteIDCAgent:
         self.rho = args.init_penalty
         self.max_penalty = args.max_penalty
         self.amplifier_c = args.amplifier_c
-        self.amplifier_m = args.amplifier_m
         self.gamma = 0.99
 
         # 安全距离
-        self.D_veh_safe = 0.5   # 米，可根据需要调整
-        self.D_road_safe = 0.3
+        self.D_veh_safe = 1.0   # 米，可根据需要调整
+        self.D_road_safe = 0.5
         self.HALF_L = 2.25
         self.HALF_W = 1.0
 
@@ -79,6 +80,12 @@ class DiscreteIDCAgent:
 
         # 道路状态缓存，键为 world_idx
         self.road_states = [None] * self.num_worlds
+
+        # 回合数
+        self.globe_eps = 0
+
+        # 历史损失
+        self.history_loss = []
 
 
     def select_action(self, state, deterministic=False):
@@ -114,18 +121,18 @@ class DiscreteIDCAgent:
 
     def predict_others(self,others_state):
         """
-        others_state: [batch, N * 4]  (px, py, phi, vlon)
+        others_state: [batch, N * 4]  (px, py, phi, speed)
         返回下一时刻的 others_state
         """
         logger.debug(f'预测周车下一状态: others_state shape={others_state.shape}')
-        px, py, phi, vlon = others_state.view(others_state.shape[0], int(self.DIM_OTHERS / 4), 4).unbind(dim=-1)  # [batch, N]
-        px_next = px + vlon * torch.cos(phi) * self.dt
-        py_next = py + vlon * torch.sin(phi) * self.dt
+        px, py, phi, speed = others_state.view(others_state.shape[0], int(self.DIM_OTHERS / 4), 4).unbind(dim=-1)  # [batch, N]
+        px_next = px + speed * torch.cos(phi) * self.dt
+        py_next = py + speed * torch.sin(phi) * self.dt
         phi_next = phi
-        vlon_next = vlon
-        return torch.stack([px_next, py_next, phi_next, vlon_next], dim=-1)
+        speed_next = speed
+        return torch.stack([px_next, py_next, phi_next, speed_next], dim=-1)
     
-    def compute_rollout_target(self, states,word_indexs,step_counts):
+    def compute_rollout_target(self, states,word_indexs):
         """
         states: list of state objects  (batch)
         返回长度为 batch 的 tensor，每个元素是累计效用
@@ -137,20 +144,23 @@ class DiscreteIDCAgent:
         total_utility = torch.zeros(batch).to(self.device)
         s = states   # 原始对象列表
         w_i = word_indexs
-        s_c = list(step_counts)
         for t in range(self.horizon):
             # 从当前状态计算动作
             logger.debug(f' s 的形状: {s.shape if isinstance(s, torch.Tensor) else "list of length " + str(len(s))}')
             u = self.actor(s)   # [batch, 2]
-            # 计算即时效用并且对应的s_c需要加一
+            # 计算即时效用
             l_list = []
             for i, (s_i, u_i) in enumerate(zip(s, u)):
-                val = self.utility(s_i, u_i, w_i[i], s_c[i])
+                val = self.utility(s_i, u_i, w_i[i])
                 l_list.append(val)
-                s_c[i] += 1        
-            l = torch.stack(l_list)          # [batch]，每个元素保持梯度            total_utility += l
+            l = torch.stack(l_list)          # [batch]，每个元素保持梯度
             # 使用预测模型 f_pred 更新状态（这里需要更新对象中的数值）
             s = self.f_pred_batch(s, u)   # 返回新的状态对象列表（或张量）
+            # 累计效用，考虑折扣
+            total_utility += (self.gamma ** t) * l
+        
+        # 裁剪
+        total_utility = torch.clamp(total_utility, min=-1000.0, max=1000.0)
         return total_utility
 
     def batch_state_to_tensor(self, states):
@@ -186,10 +196,14 @@ class DiscreteIDCAgent:
         y_next = ego_next[:, 1]
         theta_next = ego_next[:, 2]
         v_next = ego_next[:, 3]
-        v_lon_next = v_next * torch.cos(theta_next)
-        v_lat_next = v_next * torch.sin(theta_next)
-        ego_next_formatted = torch.stack([x_next, y_next, v_lon_next, v_lat_next, theta_next, torch.zeros_like(theta_next)], dim=-1)  # [batch, 6]
-
+        v_lon_next = v_next                       # 车速就是纵向速度
+        v_lat_next = torch.zeros_like(v_next)    # 无侧滑假设
+        ego_next_formatted = torch.stack([
+            x_next, y_next, 
+            v_lon_next, v_lat_next, 
+            theta_next, 
+            torch.zeros_like(theta_next)
+        ], dim=-1)
         # 使用简单的运动学模型预测周车状态（假设动作对周车无影响）
         others_next = self.predict_others(others_tensors)  # [batch, N, 4]
         # 将 ego_next 和 others_next 转回状态对象列表
@@ -208,31 +222,45 @@ class DiscreteIDCAgent:
         return torch.cat([ego_tensor, others_tensor.view(-1), ref_error_tensor], dim=-1)  # [TOTAL_STATE_DIM]
 
 
-    def update_critic(self,states,word_indexs,step_counts):
+    def update_critic(self, states, word_indexs):
         logger.debug(f'更新 Critic: states batch size={len(states)}')
-        targets = self.compute_rollout_target(states,word_indexs,step_counts)
-        # 截断目标值，防止过大导致训练不稳定
+        with torch.no_grad():
+            targets = self.compute_rollout_target(states, word_indexs).detach()
+        logger.info(f"[DEBUG] target stats: min={targets.min().item():.2f}, max={targets.max().item():.2f}, mean={targets.mean().item():.2f}, has_nan={torch.isnan(targets).any()}")
+        
         targets = torch.clamp(targets, -100.0, 100.0)
         values = self.critic(states)
+        logger.info(f"[DEBUG] value stats: min={values.min().item():.2f}, max={values.max().item():.2f}, mean={values.mean().item():.2f}, has_nan={torch.isnan(values).any()}")
+        
         loss = F.mse_loss(values, targets.unsqueeze(1))
+        logger.info(f"[DEBUG] loss = {loss.item():.4f}")
+        
         self.critic_optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+        # 打印梯度范数
+        total_norm = 0
+        for p in self.critic.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        logger.debug(f"[DEBUG] grad norm = {total_norm:.4f}")
+        
         self.critic_optimizer.step()
         return loss.detach().item()
 
-    def update_actor(self, states, w_i, step_counts):
+    def update_actor(self, states, w_i):
         logger.debug(f'更新 Actor: states batch size={len(states)}')
         total_cost = 0.0
         s = states
-        s_c = list(step_counts)
         for t in range(self.horizon):
             u = self.actor(s)  # 假设 u 形状 [batch, action_dim]
             # 关键修改：使用 torch.stack 代替 torch.tensor，保留梯度
             l_list = []
             for i, (s_i, u_i) in enumerate(zip(s, u)):
-                val = self.utility(s_i, u_i, w_i[i], s_c[i])
+                val = self.utility(s_i, u_i, w_i[i])
                 l_list.append(val)
-                s_c[i] += 1            
             l = torch.stack(l_list)          # [batch]，每个元素保持梯度
             p_list = [self.penalty(s_i, w_i[i]) for i, s_i in enumerate(s)]
             p = torch.stack(p_list)          # [batch]
@@ -247,22 +275,22 @@ class DiscreteIDCAgent:
         actor_loss = total_cost.mean()
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.actor_optimizer.step()
         return actor_loss.detach().item()
 
-    def utility(self, s, u,w_i,step_count):
+    def utility(self, s, u,w_i):
         """
         s: 状态对象（包含 ego, others, ref）
         u: [delta, a] 控制量
         w_i: 世界索引
-        step_count: 步数计数器
         返回标量代价 l = 跟踪误差 + 控制能量
         """
         # 从 s 中获取自车状态和参考路径
         logger.debug(f'计算效用: 状态={s.shape}, 动作={u.shape}')
         ego = s[:self.DIM_EGO]  # [6]
         # 通过state_builder的w_i所以计算参考
-        ref = self.state_builder.get_ref_state(w_i, self.ego_indices[w_i], step_count) 
+        ref = self.state_builder.get_ref_state(w_i, self.ego_indices[w_i], ego_x=ego[0].detach().item(), ego_y=ego[1].detach().item())  # [6]，包含参考位置、速度、航向等信息
         # 计算跟踪误差
         pos_err = torch.sqrt((ego[0] - ref[0])**2 + (ego[1] - ref[1])**2)  # 位置误差
         heading_err = ego[4] - ref[4]  # 航向误差
@@ -312,19 +340,65 @@ class DiscreteIDCAgent:
         return violation
     
     def update(self):
-        states,step_counts, word_indexs = zip(*self.buffer.sample_batch(self.batch_size))
+        states, word_indexs = zip(*self.buffer.sample_batch(self.batch_size))
         # 1. 更新 Critic
         # 首先处理把state转成tensor，然后计算 rollout 目标，最后更新 critic 网络
         states_tensor = self.batch_state_to_tensor(states)
-        critic_loss = self.update_critic(states_tensor,word_indexs,step_counts)
+        critic_loss = self.update_critic(states_tensor,word_indexs)
         # 2. 更新 Actor（每隔几次 Critic 更新）
         actor_loss = None
         if self.global_step % self.update_freq == 0 and self.rho <= self.max_penalty:
             # 由于states_tensor已经经过了上面critic的计算图,所以这里
             logger.debug(f'更新 Actor: global_step={self.global_step}, states_tensor shape={states_tensor.shape}')
             self.rho = min(self.rho * self.amplifier_c, self.max_penalty)
-            actor_loss = self.update_actor(states_tensor.detach(),word_indexs,step_counts)
+            actor_loss = self.update_actor(states_tensor,word_indexs)
             self.gep_iteration += 1
         
         return critic_loss, actor_loss
+        
+
+    def save(self, save_info: Dict[str, Any]) -> None:
+        # 满足回合数才会保存模型
+        if self.globe_eps % self.args.save_freq == 0:
+            logger.info(f'保存模型: globe_eps={self.globe_eps}, global_step={self.global_step}')
+            model = {'actor': self.actor, 'critic': self.critic}
+            optimizer = {'actor_optim': self.actor_optimizer, 'critic_optim': self.critic_optimizer}
+            # 先加载历史损失数据，如果有的话
+            self.history_loss.append(save_info.get('history_loss', []).copy())
+            extra_info = {
+                'config': self.args,
+                'global_step': self.global_step,
+                'history': self.history_loss,
+                'globe_eps': self.globe_eps,
+                'state_dim': self.TOTAL_STATE_DIM,
+                'rho': self.rho,
+                'gep_iteration': self.gep_iteration,
+                
+            }
+            metrics = {'episode': extra_info['globe_eps']}
+            save_checkpoint(model=model, 
+                            model_name='idc-waymo-v1.0', 
+                            optimizer=optimizer,
+                            file_dir=self.args.file_dir,
+                            env_name=save_info.get('env_name', 'unknown_env'),
+                            extra_info=extra_info, 
+                            metrics=metrics)
+    
+
+    def load(self, path: str) -> Dict[str, Any]:
+        checkpoint = load_checkpoint(
+            model={'actor': self.actor, 'critic': self.critic},
+            filepath=path,
+            optimizer={'actor_optim': self.actor_optimizer, 'critic_optim': self.critic_optimizer},
+            device=self.device
+        )
+        loaded_dim = checkpoint.get('state_dim', self.TOTAL_STATE_DIM)
+        if loaded_dim != self.TOTAL_STATE_DIM:
+            logger.warning(f"加载模型维度{loaded_dim}与当前{self.TOTAL_STATE_DIM}不一致")
+        self.globe_eps = checkpoint['globe_eps']
+        self.history_loss = checkpoint['history']
+        self.global_step = checkpoint['global_step']
+        self.rho = checkpoint['rho']
+        self.gep_iteration = checkpoint['gep_iteration']
+        return checkpoint
         
