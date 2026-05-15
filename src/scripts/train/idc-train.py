@@ -56,6 +56,7 @@ def train(args):
     
     print("Data root:", args.data_dir)
     print("Files found:", os.listdir(args.data_dir))
+    
     # 1. 数据加载器
     data_loader = SceneDataLoader(
         root=args.data_dir,
@@ -79,8 +80,7 @@ def train(args):
         dist_to_goal_threshold=2.0,
         polyline_reduction_threshold=0.1,
         obs_radius=50.0,
-        episode_len=args.max_steps,
-        
+        # episode_len=args.max_steps,
     )
     
     env = GPUDriveTorchEnv(
@@ -98,7 +98,7 @@ def train(args):
             scenes.append(json.load(f))
 
     builder = GPUDriveObservationBuilder(env, scenes)
-
+    max_step = builder.EXPERT_TRAJ_LEN - args.horizon - 1  # 确保有足够的步数进行预测
     # 4. 确定每个 world 的 ego index
     ego_indices = []
     for w in range(args.num_worlds):
@@ -108,7 +108,7 @@ def train(args):
     # 5. 初始化 agent
     agent = DiscreteIDCAgent(env, args, args.device, builder,ego_indices)
 
-    logger.debug(f'训练开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={args.max_steps}')
+    logger.info(f'训练开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={max_step}')
     # 6. 训练循环
     for epoch in range(args.epochs):
         obs = env.reset()
@@ -116,15 +116,15 @@ def train(args):
         for w in range(args.num_worlds):
             builder.reset_world_step(w, 0)
 
-        for step in range(args.max_steps):
+        for step in range(max_step):
             # 记录状态，供后续动作选择和训练使用
-            logger.debug(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{args.max_steps}')
+            logger.debug(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
             states = []
             for w in range(args.num_worlds):
-                network_state, raw_state = builder.get_idc_observation(
+                network_state = builder.get_idc_observation(
                     w, ego_indices[w])
                 states.append(network_state)
-                agent.buffer.handle_new_experience((network_state, raw_state, w))  # 将原始状态也存入 buffer
+                agent.buffer.handle_new_experience((network_state, builder.step_counter[w], w))  # 将原始状态也存入 buffer
                 # 增加对应世界的步数计数器
                 builder.increment_step(w)
             logger.debug(f'状态构建完成，开始选择动作')
@@ -142,7 +142,7 @@ def train(args):
                 logger.debug(f'训练完成: global_step={agent.global_step}')
 
                 # 打印损失
-                logger.debug(f'Critic Loss: {critic_loss:.4f}, Actor Loss: {actor_loss ==None and "N/A" or f"{actor_loss:.4f}" }, Penalty Coefficient (rho): {agent.rho:.4f}')
+                logger.info(f'Critic Loss: {critic_loss:.4f}, Actor Loss: {actor_loss ==None and "N/A" or f"{actor_loss:.4f}" }, Penalty Coefficient (rho): {agent.rho:.4f}')
             
             next_obs = env.get_obs()
             obs = next_obs

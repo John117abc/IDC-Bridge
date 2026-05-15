@@ -125,7 +125,7 @@ class DiscreteIDCAgent:
         vlon_next = vlon
         return torch.stack([px_next, py_next, phi_next, vlon_next], dim=-1)
     
-    def compute_rollout_target(self, states,word_indexs):
+    def compute_rollout_target(self, states,word_indexs,step_counts):
         """
         states: list of state objects  (batch)
         返回长度为 batch 的 tensor，每个元素是累计效用
@@ -137,12 +137,17 @@ class DiscreteIDCAgent:
         total_utility = torch.zeros(batch).to(self.device)
         s = states   # 原始对象列表
         w_i = word_indexs
+        s_c = list(step_counts)
         for t in range(self.horizon):
             # 从当前状态计算动作
             logger.debug(f' s 的形状: {s.shape if isinstance(s, torch.Tensor) else "list of length " + str(len(s))}')
             u = self.actor(s)   # [batch, 2]
-            # 计算即时效用（需要针对每个样本调用 utility）
-            l_list = [self.utility(s_i, u_i, w_i[i]) for i, (s_i, u_i) in enumerate(zip(s, u))]
+            # 计算即时效用并且对应的s_c需要加一
+            l_list = []
+            for i, (s_i, u_i) in enumerate(zip(s, u)):
+                val = self.utility(s_i, u_i, w_i[i], s_c[i])
+                l_list.append(val)
+                s_c[i] += 1        
             l = torch.stack(l_list)          # [batch]，每个元素保持梯度            total_utility += l
             # 使用预测模型 f_pred 更新状态（这里需要更新对象中的数值）
             s = self.f_pred_batch(s, u)   # 返回新的状态对象列表（或张量）
@@ -203,9 +208,9 @@ class DiscreteIDCAgent:
         return torch.cat([ego_tensor, others_tensor.view(-1), ref_error_tensor], dim=-1)  # [TOTAL_STATE_DIM]
 
 
-    def update_critic(self,states,word_indexs):
+    def update_critic(self,states,word_indexs,step_counts):
         logger.debug(f'更新 Critic: states batch size={len(states)}')
-        targets = self.compute_rollout_target(states,word_indexs)
+        targets = self.compute_rollout_target(states,word_indexs,step_counts)
         values = self.critic(states)
         loss = F.mse_loss(values, targets.unsqueeze(1))
         self.critic_optimizer.zero_grad()
@@ -213,19 +218,24 @@ class DiscreteIDCAgent:
         self.critic_optimizer.step()
         return loss.detach().item()
 
-    def update_actor(self, states, w_i):
+    def update_actor(self, states, w_i, step_counts):
         logger.debug(f'更新 Actor: states batch size={len(states)}')
         total_cost = 0.0
         s = states
+        s_c = list(step_counts)
         for t in range(self.horizon):
             u = self.actor(s)  # 假设 u 形状 [batch, action_dim]
             # 关键修改：使用 torch.stack 代替 torch.tensor，保留梯度
-            l_list = [self.utility(s_i, u_i, w_i[i]) for i, (s_i, u_i) in enumerate(zip(s, u))]
+            l_list = []
+            for i, (s_i, u_i) in enumerate(zip(s, u)):
+                val = self.utility(s_i, u_i, w_i[i], s_c[i])
+                l_list.append(val)
+                s_c[i] += 1            
             l = torch.stack(l_list)          # [batch]，每个元素保持梯度
             p_list = [self.penalty(s_i, w_i[i]) for i, s_i in enumerate(s)]
             p = torch.stack(p_list)          # [batch]
             # 打印控制消耗和惩罚值的统计信息
-            logger.info(f'Actor 更新: step {t}, 平均效用 {l.mean().item():.4f}, 平均惩罚 {p.mean().item():.4f}')
+            logger.debug(f'Actor 更新: step {t}, 平均效用 {l.mean().item():.4f}, 平均惩罚 {p.mean().item():.4f}')
             total_cost += (l + self.rho * p)
             s = self.f_pred_batch(s, u)
         
@@ -235,22 +245,25 @@ class DiscreteIDCAgent:
         self.actor_optimizer.step()
         return actor_loss.detach().item()
 
-    def utility(self, s, u,w_i):
+    def utility(self, s, u,w_i,step_count):
         """
         s: 状态对象（包含 ego, others, ref）
         u: [delta, a] 控制量
         w_i: 世界索引
+        step_count: 步数计数器
         返回标量代价 l = 跟踪误差 + 控制能量
         """
         # 从 s 中获取自车状态和参考路径
         logger.debug(f'计算效用: 状态={s.shape}, 动作={u.shape}')
         ego = s[:self.DIM_EGO]  # [6]
         # 通过state_builder的w_i所以计算参考
-        ref = self.state_builder.get_ref_state(w_i, self.ego_indices[w_i])
+        ref = self.state_builder.get_ref_state(w_i, self.ego_indices[w_i], step_count) 
         # 计算跟踪误差
-        pos_err = math.sqrt(ref[0]**2 + ref[1]**2)  # 位置误差
+        pos_err = torch.sqrt((ego[0] - ref[0])**2 + (ego[1] - ref[1])**2)  # 位置误差
         heading_err = ego[4] - ref[4]  # 航向误差
         speed_err = ego[2] - ref[2]  # 速度误差
+        logger.debug(f'位置误差: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
+        logger.debug(f'效用计算: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
         # 控制能量
         steer_cost = u[0]**2
         acc_cost = u[1]**2
@@ -275,6 +288,7 @@ class DiscreteIDCAgent:
             dist = torch.sqrt((ego[0] - other[0])**2 + (ego[1] - other[1])**2)
             safe_dist = self.D_veh_safe
             if dist < safe_dist:
+                logger.debug(f' Penalty: 车辆间距过近，dist={dist:.4f}, safe_dist={safe_dist:.4f}')
                 violation += (safe_dist - dist)**2
         # 与道路边界约束
         closest_edge_point = self.state_builder.get_road_edges(w_i, ego_x=ego[0].detach().item(), ego_y=ego[1].detach().item())  # 假设返回与最近道路边界的距离
@@ -288,18 +302,18 @@ class DiscreteIDCAgent:
         return violation
     
     def update(self):
-        states, _, word_indexs = zip(*self.buffer.sample_batch(self.batch_size))
+        states,step_counts, word_indexs = zip(*self.buffer.sample_batch(self.batch_size))
         # 1. 更新 Critic
         # 首先处理把state转成tensor，然后计算 rollout 目标，最后更新 critic 网络
         states_tensor = self.batch_state_to_tensor(states)
-        critic_loss = self.update_critic(states_tensor,word_indexs)
+        critic_loss = self.update_critic(states_tensor,word_indexs,step_counts)
         # 2. 更新 Actor（每隔几次 Critic 更新）
         actor_loss = None
         if self.global_step % self.update_freq == 0 and self.rho <= self.max_penalty:
             # 由于states_tensor已经经过了上面critic的计算图,所以这里
             logger.debug(f'更新 Actor: global_step={self.global_step}, states_tensor shape={states_tensor.shape}')
             self.rho = min(self.rho * self.amplifier_c, self.max_penalty)
-            actor_loss = self.update_actor(states_tensor,word_indexs)
+            actor_loss = self.update_actor(states_tensor,word_indexs,step_counts)
             self.gep_iteration += 1
         
         return critic_loss, actor_loss

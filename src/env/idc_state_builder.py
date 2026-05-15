@@ -64,7 +64,7 @@ class GPUDriveObservationBuilder:
         s_ego = self.get_ego_state(world_idx, agent_idx)
         s_others = self.get_other_vehicles(world_idx, agent_idx, num_other_vehicles)
         s_road = self.get_road_edges(world_idx, ego_x=s_ego[0], ego_y=s_ego[1])
-        s_ref = self.get_ref_state(world_idx, agent_idx)
+        s_ref = self.get_ref_state(world_idx, agent_idx, self.step_counter[world_idx])
         s_ref_error = self._calc_ref_error(s_ego, s_ref)
 
         # 周车只取[x,y,heading,vy],目前获得的值是这样的[global_x, global_y, vx, vy, abs_heading, 0.0]
@@ -76,13 +76,13 @@ class GPUDriveObservationBuilder:
         ])
 
         # raw_state
-        raw_state = np.concatenate([
-            s_ego,
-            s_others.flatten().astype(np.float32),
-            s_ref.astype(np.float32),
-            s_road.flatten().astype(np.float32),
-        ])
-        return network_state, raw_state
+        # raw_state = np.concatenate([
+        #     s_ego,
+        #     s_others.flatten().astype(np.float32),
+        #     s_ref.astype(np.float32),
+        #     s_road.flatten().astype(np.float32),
+        # ])
+        return network_state
 
     # --------------------------------------------------------
     #  自车状态 [x, y, vx, vy, heading, omega=0]
@@ -216,14 +216,13 @@ class GPUDriveObservationBuilder:
     # --------------------------------------------------------
     #  参考路径
     # --------------------------------------------------------
-    def get_ref_state(self, world_idx: int, agent_idx: int) -> np.ndarray:
+    def get_ref_state(self, world_idx: int, agent_idx: int,step: int) -> np.ndarray:
         """
         专家参考状态：[x_ref, y_ref, vx_ref, 0, heading_ref, 0]
         1. 优先使用专家轨迹的未来点；
         """
         # ---------- 专家轨迹 ----------
         if self.expert_traj is not None:
-            step = self.step_counter[world_idx]
             if step < self.EXPERT_TRAJ_LEN:
                 traj = self.expert_traj[world_idx]  # [num_agents, T*16]
                 T = self.EXPERT_TRAJ_LEN
