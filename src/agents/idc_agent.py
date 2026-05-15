@@ -211,6 +211,8 @@ class DiscreteIDCAgent:
     def update_critic(self,states,word_indexs,step_counts):
         logger.debug(f'更新 Critic: states batch size={len(states)}')
         targets = self.compute_rollout_target(states,word_indexs,step_counts)
+        # 截断目标值，防止过大导致训练不稳定
+        targets = torch.clamp(targets, -100.0, 100.0)
         values = self.critic(states)
         loss = F.mse_loss(values, targets.unsqueeze(1))
         self.critic_optimizer.zero_grad()
@@ -234,8 +236,11 @@ class DiscreteIDCAgent:
             l = torch.stack(l_list)          # [batch]，每个元素保持梯度
             p_list = [self.penalty(s_i, w_i[i]) for i, s_i in enumerate(s)]
             p = torch.stack(p_list)          # [batch]
+            # 截断成本和惩罚值，防止过大导致训练不稳定
+            l = torch.clamp(l, -10.0, 10.0)
+            p = torch.clamp(p, 0.0, 10.0)
             # 打印控制消耗和惩罚值的统计信息
-            logger.debug(f'Actor 更新: step {t}, 平均效用 {l.mean().item():.4f}, 平均惩罚 {p.mean().item():.4f}')
+            # logger.info(f'Actor 更新: step {t}, 平均效用 {l.mean().item():.4f}, 平均惩罚 {p.mean().item():.4f}')
             total_cost += (l + self.rho * p)
             s = self.f_pred_batch(s, u)
         
@@ -261,9 +266,7 @@ class DiscreteIDCAgent:
         # 计算跟踪误差
         pos_err = torch.sqrt((ego[0] - ref[0])**2 + (ego[1] - ref[1])**2)  # 位置误差
         heading_err = ego[4] - ref[4]  # 航向误差
-        speed_err = ego[2] - ref[2]  # 速度误差
-        logger.debug(f'位置误差: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
-        logger.debug(f'效用计算: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
+        speed_err = torch.sqrt((ego[2] - ref[2])**2 + (ego[3] - ref[3])**2)  # 速度误差
         # 控制能量
         steer_cost = u[0]**2
         acc_cost = u[1]**2
@@ -273,6 +276,13 @@ class DiscreteIDCAgent:
             self.heading_err_weight * heading_err**2 +
             self.steer_cost_weight * steer_cost +
             self.acc_cost_weight * acc_cost)
+        # 如果损失过大打印一下数据
+        # logger.info(f'参考信息：ref_x={ref[0]:.4f}, ref_y={ref[1]:.4f}, ref_vlon={ref[2]:.4f}, ref_phi={ref[4]:.4f}')
+        # logger.info(f'位置误差: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
+        # logger.info(f'效用计算: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
+        # if l.item() > 10.0:
+        #     logger.info(f'位置误差: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
+        #     logger.info(f'效用计算: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
         return l
 
     def penalty(self, s, w_i):
@@ -313,7 +323,7 @@ class DiscreteIDCAgent:
             # 由于states_tensor已经经过了上面critic的计算图,所以这里
             logger.debug(f'更新 Actor: global_step={self.global_step}, states_tensor shape={states_tensor.shape}')
             self.rho = min(self.rho * self.amplifier_c, self.max_penalty)
-            actor_loss = self.update_actor(states_tensor,word_indexs,step_counts)
+            actor_loss = self.update_actor(states_tensor.detach(),word_indexs,step_counts)
             self.gep_iteration += 1
         
         return critic_loss, actor_loss

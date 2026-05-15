@@ -16,8 +16,7 @@ from gpudrive.visualize.utils import img_from_fig
 sys.path.insert(0, '/workspace/idc/src')
 from env.idc_state_builder import GPUDriveObservationBuilder
 from agents.idc_agent import DiscreteIDCAgent
-from buffer import PERBuffer
-from utils import get_logger
+from utils import get_logger,VisualRecorder
 logger = get_logger('idc-agent')
 
 # 方式2：多维动作 (num_worlds, max_agents, action_dim)
@@ -89,7 +88,14 @@ def train(args):
         max_cont_agents=args.max_agents, # Maximum number of agents to control per scenario
         device=args.device,
         action_type="continuous",
-)
+    )
+
+    # 初始化记录器
+    recorder = VisualRecorder(
+        num_worlds=args.num_worlds,
+        save_dir="/workspace/idc/gifs",
+        fps=5
+    )
 
     # 3. 场景 JSON 加载（用于 builder）
     scenes = []
@@ -142,8 +148,12 @@ def train(args):
                 logger.debug(f'训练完成: global_step={agent.global_step}')
 
                 # 打印损失
-                logger.info(f'Critic Loss: {critic_loss:.4f}, Actor Loss: {actor_loss ==None and "N/A" or f"{actor_loss:.4f}" }, Penalty Coefficient (rho): {agent.rho:.4f}')
+                if actor_loss is not None:
+                    logger.info(f'Critic Loss: {critic_loss:.4f}, Actor Loss: {actor_loss ==None and "N/A" or f"{actor_loss:.4f}" }, Penalty Coefficient (rho): {agent.rho:.4f}')
             
+            # 记录帧
+            recorder.record(env, epoch, step)
+
             next_obs = env.get_obs()
             obs = next_obs
             agent.global_step += 1
@@ -153,6 +163,8 @@ def train(args):
             # infos = env.get_infos()
 
     # 每个环境的帧保存为单独的 GIF
+    recorder.save_all_gifs()
+
     logger.debug('训练完成')
 
 if __name__ == "__main__":
@@ -162,7 +174,7 @@ if __name__ == "__main__":
     parser.add_argument('--num-worlds', type=int, default=2)
     parser.add_argument('--max-agents', type=int, default=1)
     parser.add_argument('--max-steps', type=int, default=90)
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--dt', type=float, default=0.05)
     parser.add_argument('--horizon', type=int, default=10)

@@ -10,6 +10,7 @@ from .geometry import batch_world_to_ego
 from .trajectory import resample_path_equal_distance
 from .vehicle_model import get_two_circles
 from .action_mapper import DiscreteActionMapper
+from .visualr_recorder import VisualRecorder
 
 __all__ = ['get_logger',
            'save_checkpoint',
@@ -32,4 +33,5 @@ __all__ = ['get_logger',
            'batch_world_to_ego',
            'resample_path_equal_distance',
            'get_two_circles',
-           'DiscreteActionMapper']
+           'DiscreteActionMapper',
+           'VisualRecorder']

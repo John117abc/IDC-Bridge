@@ -27,20 +27,34 @@ class GPUDriveObservationBuilder:
         # 步数计数器
         self.step_counter = {w: 0 for w in range(self.num_worlds)}
 
-        # 专家轨迹（如果存在）
-        self.expert_traj = None
+        # ==========================================
+        # 1. 初始化部分 (在类的 __init__ 或 reset 中)
+        # ==========================================
+        self.expert_pos = None
+        self.expert_vel = None
+        self.expert_heading = None
         self.EXPERT_TRAJ_LEN = None
-        if hasattr(self.sim, 'expert_trajectory_tensor'):
-            try:
-                self.expert_traj = self.sim.expert_trajectory_tensor().to_torch()
-                self.EXPERT_TRAJ_LEN = self.expert_traj.shape[2] // 16
-                logger.debug(f"Expert trajectory available, shape: {self.expert_traj.shape}")
-            except Exception as e:
-                logger.warning(f"Unable to get expert_trajectory_tensor: {e}")
+        # 预处理专家轨迹数据，转换为适合快速索引的格式
+        self._setup_expert_data()
         
         logger.debug(f'专家轨迹长度：{self.EXPERT_TRAJ_LEN}')
 
+    
+    def _setup_expert_data(self):
+        # 假设 sim.expert_trajectory_tensor() 返回形状为 [num_worlds, num_agents, 16*91]
+        raw_traj = self.sim.expert_trajectory_tensor().to_torch()
+        W, A, total_feats = raw_traj.shape
+        T = 91  # 根据官方代码确认为 91
+        self.EXPERT_TRAJ_LEN = T
+
+        # 按照官方定义的 Offset 一次性切片 (利用 GPU 向量化操作)
+        # 形状都会变为 [W, A, T, dim]
+        self.expert_pos = raw_traj[:, :, :2*T].reshape(W, A, T, 2)
+        self.expert_vel = raw_traj[:, :, 2*T:4*T].reshape(W, A, T, 2)
+        self.expert_heading = raw_traj[:, :, 4*T:5*T].reshape(W, A, T, 1)
         
+        # 如果以后需要模仿学习，可以顺便存下这个：
+        # self.expert_actions = raw_traj[:, :, 6*T:16*T].reshape(W, A, T, 10)
 
     def reset_world_step(self, world_idx: int, step: int = 0):
         self.step_counter[world_idx] = step
@@ -213,30 +227,32 @@ class GPUDriveObservationBuilder:
         
         return np.array([closest_x, closest_y, 0., 0., 0., 0.], dtype=np.float32)
     
-    # --------------------------------------------------------
-    #  参考路径
-    # --------------------------------------------------------
-    def get_ref_state(self, world_idx: int, agent_idx: int,step: int) -> np.ndarray:
-        """
-        专家参考状态：[x_ref, y_ref, vx_ref, 0, heading_ref, 0]
-        1. 优先使用专家轨迹的未来点；
-        """
-        # ---------- 专家轨迹 ----------
-        if self.expert_traj is not None:
-            if step < self.EXPERT_TRAJ_LEN:
-                traj = self.expert_traj[world_idx]  # [num_agents, T*16]
-                T = self.EXPERT_TRAJ_LEN
-                pos = traj[:, :2 * T].reshape(-1, T, 2)
-                vel = traj[:, 2 * T:4 * T].reshape(-1, T, 2)
-                heading = traj[:, 4 * T:5 * T].reshape(-1, T)
-                ref_x = pos[agent_idx, step, 0].item()
-                ref_y = pos[agent_idx, step, 1].item()
-                vx = vel[agent_idx, step, 0].item()
-                ref_heading = heading[agent_idx, step].item()
-                return np.array([ref_x, ref_y, vx, 0.0, ref_heading, 0.0], dtype=np.float32)
-            
 
-       
+    # ==========================================
+    # 参考路径
+    # ==========================================
+    # ==========================================
+    def get_ref_state(self, world_idx: int, agent_idx: int, step: int) -> np.ndarray:
+        """
+        基于官方数据布局提取的参考状态
+        """
+        if self.expert_pos is not None and step < self.EXPERT_TRAJ_LEN:
+            # 提取当前步的专家数据
+            # 使用 .detach().cpu().numpy() 确保转换安全
+            p = self.expert_pos[world_idx, agent_idx, step]
+            v = self.expert_vel[world_idx, agent_idx, step]
+            h = self.expert_heading[world_idx, agent_idx, step]
+            
+            return np.array([
+                p[0].item(),  # ref_x
+                p[1].item(),  # ref_y
+                v[0].item(),  # ref_vx
+                0.0,          # 占位
+                h[0].item(),  # ref_heading
+                0.0           # 占位
+            ], dtype=np.float32)
+
+        return np.zeros(6, dtype=np.float32)
 
     @staticmethod
     def _calc_ref_error(ego_state: np.ndarray, ref_state: np.ndarray) -> np.ndarray:
