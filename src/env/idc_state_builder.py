@@ -39,6 +39,71 @@ class GPUDriveObservationBuilder:
         
         logger.debug(f'专家轨迹长度：{self.EXPERT_TRAJ_LEN}')
 
+    def generate_candidate_paths(self, ego_indices, num_paths=3,
+                                  num_points=91, lane_width=3.75):
+        """为每个 world 的 controlled agent 生成多条候选 Cubic Bezier 路径"""
+        self.candidate_paths = {}
+        self.num_candidate_paths = num_paths
+
+        for w in range(self.num_worlds):
+            a = ego_indices[w]
+            self.candidate_paths[w] = {}
+
+            sp = self.expert_pos[w, a, 0].cpu().numpy()
+            ep = self.expert_pos[w, a, -1].cpu().numpy()
+            sh = float(self.expert_heading[w, a, 0].item())
+            eh = float(self.expert_heading[w, a, -1].item())
+            spd = float(self.expert_vel[w, a].norm(dim=-1).mean().item())
+
+            paths = []
+            offsets = [0.0]
+            if num_paths >= 3:
+                offsets = [-lane_width, 0.0, lane_width]
+
+            for offset in offsets:
+                path = self._make_bezier_path(
+                    sp, sh, ep, eh, offset, spd, num_points)
+                paths.append(path)
+
+            self.candidate_paths[w][a] = paths
+
+    def _make_bezier_path(self, p0, h0, p3, h3,
+                           lateral_offset, speed, num_points):
+        dx = p3[0] - p0[0]
+        dy = p3[1] - p0[1]
+        dist = float(np.hypot(dx, dy))
+        if dist < 1e-6:
+            dist = 1.0
+
+        tx, ty = dx / dist, dy / dist
+        px, py = -ty, tx
+
+        s = np.array([p0[0] + lateral_offset * px,
+                       p0[1] + lateral_offset * py], dtype=np.float32)
+        e = np.array([p3[0] + lateral_offset * px,
+                       p3[1] + lateral_offset * py], dtype=np.float32)
+
+        d = dist / 3.0
+        P0 = s
+        P1 = s + np.array([d * np.cos(h0), d * np.sin(h0)], dtype=np.float32)
+        P2 = e - np.array([d * np.cos(h3), d * np.sin(h3)], dtype=np.float32)
+        P3 = e
+
+        t_vals = np.linspace(0, 1, num_points)
+        bt = np.zeros((num_points, 2), dtype=np.float32)
+        for i, t in enumerate(t_vals):
+            bt[i] = ((1 - t) ** 3 * P0 + 3 * (1 - t) ** 2 * t * P1
+                     + 3 * (1 - t) * t ** 2 * P2 + t ** 3 * P3)
+
+        headings = np.zeros(num_points, dtype=np.float32)
+        for i in range(num_points - 1):
+            headings[i] = np.arctan2(bt[i + 1, 1] - bt[i, 1],
+                                     bt[i + 1, 0] - bt[i, 0])
+        headings[-1] = headings[-2]
+
+        speeds = np.full(num_points, speed, dtype=np.float32)
+        return {'pos': bt, 'heading': headings, 'speed': speeds}
+
     
     def _setup_expert_data(self):
         # 假设 sim.expert_trajectory_tensor() 返回形状为 [num_worlds, num_agents, 16*91]
@@ -66,40 +131,90 @@ class GPUDriveObservationBuilder:
     def get_idc_observation(self, 
                             world_idx: int, 
                             agent_idx: int,
-                            num_other_vehicles: int = 8) -> Tuple[np.ndarray, ...]:
-        """
-        返回:
-            network_state: (6 + num_other_vehicles*6 + num_road_points*6*2 + 3)
-            s_road: (num_road_points*2*6,) 左右道路边缘展平向量
-            s_ref_raw: (6,)
-            s_ref_error: (3,)
-            s_other: (num_other_vehicles, 6)
-        """
+                            num_other_vehicles: int = 8,
+                            path_idx: int = 0) -> np.ndarray:
         s_ego = self.get_ego_state(world_idx, agent_idx)
         s_others = self.get_other_vehicles(world_idx, agent_idx, num_other_vehicles)
-        s_road = self.get_road_edges(world_idx, ego_x=s_ego[0], ego_y=s_ego[1])
-        s_ref = self.get_ref_state(world_idx, agent_idx, ego_x=s_ego[0], ego_y=s_ego[1])
+        s_ref = self.get_ref_state_from_path(world_idx, agent_idx, path_idx,
+                                              ego_x=s_ego[0], ego_y=s_ego[1])
         s_ref_error = self._calc_ref_error(s_ego, s_ref)
 
-        # 周车只取[x,y,heading,vy],目前获得的值是这样的[global_x, global_y, vx, vy, abs_heading, 0.0]
         network_state = np.concatenate([
             s_ego,
             s_others.flatten().astype(np.float32),
             s_ref_error.astype(np.float32)
         ])
-
-        # raw_state
-        # raw_state = np.concatenate([
-        #     s_ego,
-        #     s_others.flatten().astype(np.float32),
-        #     s_ref.astype(np.float32),
-        #     s_road.flatten().astype(np.float32),
-        # ])
         return network_state
 
+    def get_idc_observations_batch(self, ego_indices: list,
+                                    num_other_vehicles: int = 8,
+                                    path_indices: list = None) -> list:
+        """
+        批量构建所有 world 的网络状态。
+        每步只拉一次 GPUDrive tensor，减少 GPU→CPU 传输次数。
+        path_indices: 可选，list of int，每个 world 使用的候选路径索引。
+        """
+        abs_np = self.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+        rel_np = self.sim.self_observation_tensor().to_torch().cpu().numpy()
+        partner_np = self.sim.partner_observations_tensor().to_torch().cpu().numpy()
+
+        states = []
+        for w in range(self.num_worlds):
+            aidx = ego_indices[w]
+            x = float(abs_np[w, aidx, 0])
+            y = float(abs_np[w, aidx, 1])
+            heading = float(abs_np[w, aidx, 7])
+            speed = float(rel_np[w, aidx, 0])
+            ego = np.array([x, y, speed, 0.0, heading, 0.0], dtype=np.float32)
+
+            partners = partner_np[w, aidx]
+            cos_h = np.cos(heading)
+            sin_h = np.sin(heading)
+            others_list = []
+            for i in range(partners.shape[0]):
+                p = partners[i]
+                p_speed = p[0]
+                rel_x = p[1]
+                rel_y = p[2]
+                rel_h = p[3]
+                abs_h = heading + rel_h
+                gx = x + rel_x * cos_h - rel_y * sin_h
+                gy = y + rel_x * sin_h + rel_y * cos_h
+                dist = np.hypot(gx - x, gy - y)
+                others_list.append((dist, [gx, gy, abs_h, p_speed]))
+            others_list.sort(key=lambda t: t[0])
+            others = np.array([d[1] for d in others_list[:num_other_vehicles]], dtype=np.float32)
+            if others.shape[0] < num_other_vehicles:
+                pad = np.zeros((num_other_vehicles - others.shape[0], 4), dtype=np.float32)
+                others = np.vstack([others, pad]) if others.shape[0] > 0 else pad
+
+            pid = path_indices[w] if path_indices is not None else 0
+            _, (rx, ry, rh, rs) = self._nearest_on_candidate(
+                w, aidx, pid, x, y)
+            ref = np.array([rx, ry, rs, 0.0, rh, 0.0], dtype=np.float32)
+            ref_err = self._calc_ref_error(ego, ref)
+
+            state = np.concatenate([
+                ego,
+                others.flatten().astype(np.float32),
+                ref_err.astype(np.float32)
+            ])
+            states.append(state)
+        return states
+
+    def get_ego_positions_batch(self, ego_indices: list) -> np.ndarray:
+        """仅拉取 self 绝对观测，返回 [num_worlds, 2] 的 (x, y) 坐标。"""
+        abs_np = self.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+        pos = np.zeros((self.num_worlds, 2), dtype=np.float32)
+        for w in range(self.num_worlds):
+            a = ego_indices[w]
+            pos[w, 0] = float(abs_np[w, a, 0])
+            pos[w, 1] = float(abs_np[w, a, 1])
+        return pos
+
     # --------------------------------------------------------
-    #  自车状态 [x, y, vx, vy, heading, omega=0]
-    #  注意：ego_state 不提供位置和分速度，只能用 absolute_obs
+    #  自车状态 [x, y, v_lon, v_lat, heading, omega=0] (车体坐标系)
+    #  注意：ego_state 不提供位置和速度分量，只能用 absolute_obs
     # --------------------------------------------------------
     def get_ego_state(self, world_idx: int, agent_idx: int) -> np.ndarray:
         # 绝对观测：位置 + 航向
@@ -113,11 +228,9 @@ class GPUDriveObservationBuilder:
         rel_tensor = self.sim.self_observation_tensor().to_torch()
         speed = rel_tensor[world_idx, agent_idx, 0].item()
         
-        vx = speed * np.cos(heading)
-        vy = speed * np.sin(heading)
         omega = 0.0  # 角速度不直接提供
-        
-        return np.array([x, y, vx, vy, heading, omega], dtype=np.float32)
+
+        return np.array([x, y, speed, 0.0, heading, omega], dtype=np.float32)
 
 
 
@@ -247,12 +360,30 @@ class GPUDriveObservationBuilder:
 
     def get_ref_state(self, world_idx: int, agent_idx: int, ego_x: float, ego_y: float) -> np.ndarray:
         """
-        基于最近点返回参考状态 [x, y, vx, vy, heading, 0]
+        基于最近点返回参考状态 [ref_x, ref_y, ref_v_lon, ref_v_lat, ref_heading, 0] (车体坐标系)
+        默认使用候选路径 0（中心路径）。
         """
-        _, (ref_x, ref_y, ref_heading, ref_speed) = self.get_nearest_ref_point(world_idx, agent_idx, ego_x, ego_y)
-        ref_vx = ref_speed * np.cos(ref_heading)
-        ref_vy = ref_speed * np.sin(ref_heading)
-        return np.array([ref_x, ref_y, ref_vx, ref_vy, ref_heading, 0.0], dtype=np.float32)
+        _, (ref_x, ref_y, ref_heading, ref_speed) = self._nearest_on_candidate(
+            world_idx, agent_idx, 0, ego_x, ego_y)
+        return np.array([ref_x, ref_y, ref_speed, 0.0, ref_heading, 0.0], dtype=np.float32)
+
+    def _nearest_on_candidate(self, world_idx, agent_idx, path_idx, ego_x, ego_y):
+        """在指定候选路径上找最近参考点"""
+        path = self.candidate_paths[world_idx][agent_idx][path_idx]
+        pos = path['pos']
+        dx = pos[:, 0] - ego_x
+        dy = pos[:, 1] - ego_y
+        dist_sq = dx * dx + dy * dy
+        nearest = int(np.argmin(dist_sq))
+        return nearest, (float(pos[nearest, 0]), float(pos[nearest, 1]),
+                         float(path['heading'][nearest]),
+                         float(path['speed'][nearest]))
+
+    def get_ref_state_from_path(self, world_idx, agent_idx, path_idx,
+                                  ego_x, ego_y):
+        _, (rx, ry, rh, rs) = self._nearest_on_candidate(
+            world_idx, agent_idx, path_idx, ego_x, ego_y)
+        return np.array([rx, ry, rs, 0.0, rh, 0.0], dtype=np.float32)
 
     @staticmethod
     def _calc_ref_error(ego_state: np.ndarray, ref_state: np.ndarray) -> np.ndarray:
@@ -267,3 +398,47 @@ class GPUDriveObservationBuilder:
 
         delta_v = math.hypot(ego_state[2], ego_state[3]) - ref_state[2]
         return np.array([delta_p, delta_phi, delta_v], dtype=np.float32)
+
+    def get_ref_states_batch(self, world_indices, ego_xs, ego_ys,
+                              ego_indices_map: list,
+                              path_indices=None) -> torch.Tensor:
+        """
+        批量获取参考状态，返回 [batch, 6] tensor。
+        path_indices: 可选，list of int，指定每条数据使用的候选路径索引。
+        """
+        refs = []
+        for i in range(len(world_indices)):
+            w = world_indices[i]
+            a = ego_indices_map[w]
+            pid = path_indices[i] if path_indices is not None else 0
+            _, (rx, ry, rh, rs) = self._nearest_on_candidate(
+                w, a, pid, float(ego_xs[i]), float(ego_ys[i]))
+            refs.append([rx, ry, rs, 0.0, rh, 0.0])
+        return torch.tensor(refs, device=ego_xs.device, dtype=torch.float32)
+
+    def get_road_edges_batch(self, world_indices, ego_xs, ego_ys) -> torch.Tensor:
+        """
+        批量获取离自车最近的道路边界点，每步只拉一次 road tensor。
+        返回 [batch, 2] tensor。
+        """
+        road_tensor = self.sim.map_observation_tensor().to_torch().cpu().numpy()
+        TYPE_IDX = 6
+        ROADLINE_TYPE = 1
+
+        edges = []
+        for idx in range(len(world_indices)):
+            w = world_indices[idx]
+            ex = float(ego_xs[idx])
+            ey = float(ego_ys[idx])
+            road_points = road_tensor[w]
+            line_mask = road_points[:, TYPE_IDX] == ROADLINE_TYPE
+            line_points = road_points[line_mask]
+            if len(line_points) == 0:
+                edges.append([ex, ey])
+            else:
+                dx = line_points[:, 0] - ex
+                dy = line_points[:, 1] - ey
+                closest = np.argmin(dx * dx + dy * dy)
+                edges.append([float(line_points[closest, 0]),
+                              float(line_points[closest, 1])])
+        return torch.tensor(edges, device=ego_xs.device, dtype=torch.float32)

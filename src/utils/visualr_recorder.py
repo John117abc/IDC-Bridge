@@ -1,5 +1,6 @@
 import os
 import imageio
+from datetime import datetime
 
 from gpudrive.visualize.utils import img_from_fig
 
@@ -45,26 +46,26 @@ class VisualRecorder:
     
     def save_all_gifs(self, custom_save_dir=None, custom_fps=None):
         """
-        将所有环境的帧保存为单独的 GIF 文件
-        
-        参数:
-            custom_save_dir: 自定义保存目录，如果不指定则使用初始化时的目录
-            custom_fps: 自定义帧率，如果不指定则使用初始化时的帧率
+        将所有环境的帧保存为单独的 GIF 文件，自动创建日期子目录并带时间戳。
         """
         save_dir = custom_save_dir or self.save_dir
         fps = custom_fps or self.fps
-        
-        print("开始保存")
-        os.makedirs(save_dir, exist_ok=True)
-        
+
+        now = datetime.now()
+        date_dir = os.path.join(save_dir, now.strftime('%Y%m%d'))
+        os.makedirs(date_dir, exist_ok=True)
+
+        ts = now.strftime('%H%M%S')
+        print(f"开始保存到: {date_dir}")
+
         for env_name, frame_list in self.frames.items():
-            path = os.path.join(save_dir, f"rollout_{env_name}.gif")
-            if frame_list:  # 确保有帧数据才保存
+            path = os.path.join(date_dir, f"rollout_{env_name}_{ts}.gif")
+            if frame_list:
                 imageio.mimsave(path, frame_list, fps=fps)
                 print(f"已保存: {path}")
             else:
                 print(f"警告: {env_name} 没有记录任何帧")
-        
+
         print("所有 GIF 保存完成")
     
     def reset(self):

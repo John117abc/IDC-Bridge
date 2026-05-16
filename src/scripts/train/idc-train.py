@@ -16,21 +16,8 @@ from gpudrive.visualize.utils import img_from_fig
 sys.path.insert(0, '/workspace/idc/src')
 from env.idc_state_builder import GPUDriveObservationBuilder
 from agents.idc_agent import DiscreteIDCAgent
-from utils import get_logger,VisualRecorder
+from utils import get_logger, VisualRecorder, TrajectoryVisualizer
 logger = get_logger('idc-agent')
-
-# 方式2：多维动作 (num_worlds, max_agents, action_dim)
-def create_forward_actions_multidim(num_worlds, max_agents, action_dim=3):
-    """
-    创建三维动作张量
-    形状: (num_worlds, max_agents, action_dim)
-    """
-    # 向前走的动作：[转向=0, 加速度=0.5, 头部倾斜=0]
-    forward_action = torch.tensor([0.5, 0.0, 0.0], dtype=torch.float32)
-    
-    # 扩展到所有智能体
-    actions = forward_action.reshape(1, 1, -1).expand(num_worlds, max_agents, -1).clone()
-    return actions
 
 def extend_action_to_3d(actions_2d):
     """
@@ -93,7 +80,7 @@ def train(args):
     # 初始化记录器
     recorder = VisualRecorder(
         num_worlds=args.num_worlds,
-        save_dir="/workspace/idc/gifs",
+        save_dir="/workspace/data/gifs",
         fps=5
     )
 
@@ -111,6 +98,8 @@ def train(args):
         controllable = env.cont_agent_mask[w].nonzero(as_tuple=True)[0]
         ego_indices.append(controllable[0].item() if len(controllable) > 0 else 0)
 
+    builder.generate_candidate_paths(ego_indices, num_paths=3)
+
     # 5. 初始化 agent
     agent = DiscreteIDCAgent(env, args, args.device, builder,ego_indices)
 
@@ -121,27 +110,39 @@ def train(args):
 
     logger.info(f'训练开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={max_step}')
 
+    # 可视化：每 epoch 为前几个 world 画轨迹对比图
+    VIZ_WORLDS = list(range(min(6, args.num_worlds)))
+    viz_dir = os.path.join(args.file_dir, 'traj_plots')
+    os.makedirs(viz_dir, exist_ok=True)
+
     # 历史损失
     history_loss = []
 
     # 6. 训练循环
     for epoch in range(args.epochs):
         obs = env.reset()
-        # 重置 builder 的步数计数器
         for w in range(args.num_worlds):
             builder.reset_world_step(w, 0)
 
+        viz_list = [TrajectoryVisualizer(builder, w, ego_indices[w])
+                    for w in VIZ_WORLDS]
+
         for step in range(max_step):
-            # 记录状态，供后续动作选择和训练使用
             logger.info(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
-            states = []
+
+            path_indices = [np.random.randint(builder.num_candidate_paths)
+                           for _ in range(args.num_worlds)]
+            states = builder.get_idc_observations_batch(ego_indices,
+                                                        path_indices=path_indices)
             for w in range(args.num_worlds):
-                network_state = builder.get_idc_observation(
-                    w, ego_indices[w])
-                states.append(network_state)
-                agent.buffer.handle_new_experience((network_state, w))  # 将原始状态也存入 buffer
-                # 增加对应世界的步数计数器
+                agent.buffer.handle_new_experience((states[w], w, path_indices[w]))
                 builder.increment_step(w)
+
+            # 记录可视化世界的自车位置
+            positions = builder.get_ego_positions_batch(ego_indices)
+            for i, w in enumerate(VIZ_WORLDS):
+                viz_list[i].record_step(positions[w, 0], positions[w, 1])
+
             logger.debug(f'状态构建完成，开始选择动作')
             # 创建批量动作
             actions = agent.select_action(states)  # [num_worlds, max_agents, action_dim]
@@ -173,6 +174,11 @@ def train(args):
             # infos = env.get_infos()
         
         agent.globe_eps += 1  # 每个 epoch 结束后增加全局回合数
+        
+        for viz in viz_list:
+            if len(viz.actual_x) > 0:
+                viz.save_plot(viz_dir, epoch + 1)
+
         # 保存模型
         save_info = {
                 'history_loss':history_loss,
@@ -189,21 +195,21 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir', type=str, required=True)
-    parser.add_argument('--num-worlds', type=int, default=10)
+    parser.add_argument('--num-worlds', type=int, default=200)
     parser.add_argument('--max-agents', type=int, default=1)
     parser.add_argument('--max-steps', type=int, default=90)
-    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--dt', type=float, default=0.05)
+    parser.add_argument('--dt', type=float, default=0.1)
     parser.add_argument('--horizon', type=int, default=25)
-    parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--hidden-dim', type=int, default=256)
-    parser.add_argument('--lr-actor', type=float, default=3e-4)
-    parser.add_argument('--lr-critic', type=float, default=8e-4)
+    parser.add_argument('--lr-actor', type=float, default=1e-5)
+    parser.add_argument('--lr-critic', type=float, default=3e-4)
     parser.add_argument('--init-penalty', type=float, default=1.0)
-    parser.add_argument('--max-penalty', type=float, default=1.0)
-    parser.add_argument('--amplifier-c', type=float, default=1.001)
-    parser.add_argument('--update-freq', type=int, default=1)
+    parser.add_argument('--max-penalty', type=float, default=100.0)
+    parser.add_argument('--amplifier-c', type=float, default=1.015)
+    parser.add_argument('--pim-interval', type=int, default=30)
     parser.add_argument('--seed', type=int, default=20)
     parser.add_argument('--save-freq', type=int, default=1)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")

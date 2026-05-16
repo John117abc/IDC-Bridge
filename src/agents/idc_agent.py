@@ -17,7 +17,7 @@ logger = get_logger('idc-agent')
 
 
 # ==============================================
-# IDC Agent 适配类（离散动作 + Gumbel-Softmax）
+# IDC Agent
 # ==============================================
 class DiscreteIDCAgent:
     def __init__(self, env, args, device,state_builder,ego_indices):
@@ -30,7 +30,7 @@ class DiscreteIDCAgent:
         self.ego_indices = ego_indices  # 每个世界中自车的索引列表
 
         # IDC 维度定义
-        self.DIM_EGO = 6                  # [x, y, v_lon, v_lat, phi, omega] (omega=0)
+        self.DIM_EGO = 6                  # [x, y, v_lon, v_lat, phi, omega] (车体坐标系)
         self.DIM_OTHERS = 32               # 8 车 × 4 (x, y, phi, v_lon)
         self.DIM_REF_ERROR = 3            # [delta_p, delta_phi, delta_v]
         self.TOTAL_STATE_DIM = self.DIM_EGO + self.DIM_OTHERS + self.DIM_REF_ERROR
@@ -40,7 +40,6 @@ class DiscreteIDCAgent:
         self.dt = args.dt
         self.horizon = args.horizon
         self.batch_size = args.batch_size
-        self.update_freq = args.update_freq
 
         # 网络
         self.actor = ContinuousActor(self.TOTAL_STATE_DIM, args.hidden_dim).to(device)
@@ -63,10 +62,12 @@ class DiscreteIDCAgent:
         self.max_penalty = args.max_penalty
         self.amplifier_c = args.amplifier_c
         self.gamma = 0.99
+        self.pev_step = 0
+        self.pim_interval = args.pim_interval
 
         # 安全距离
-        self.D_veh_safe = 1.0   # 米，可根据需要调整
-        self.D_road_safe = 0.5
+        self.D_veh_safe = 5.0    # 双圆模型: r_ego + r_veh = 2.5 + 2.5
+        self.D_road_safe = 1.5
         self.HALF_L = 2.25
         self.HALF_W = 1.0
 
@@ -74,9 +75,6 @@ class DiscreteIDCAgent:
         self.buffer = PERBuffer(capacity=100000, min_start_train=args.batch_size)
         self.global_step = 1
         self.gep_iteration = 0
-
-        # 参考速度
-        self.ref_vlon = 5.0
 
         # 道路状态缓存，键为 world_idx
         self.road_states = [None] * self.num_worlds
@@ -132,36 +130,15 @@ class DiscreteIDCAgent:
         speed_next = speed
         return torch.stack([px_next, py_next, phi_next, speed_next], dim=-1)
     
-    def compute_rollout_target(self, states,word_indexs):
-        """
-        states: list of state objects  (batch)
-        返回长度为 batch 的 tensor，每个元素是累计效用
-        """
-        logger.debug(f'计算 rollout 目标: states batch size={len(states)}')
-        batch = len(states)
-        # 假设路径信息可以用连续表示（如跟踪误差已经在 utility_fn 里动态计算）
-        # 为简化，我们直接在 rollout 循环中调用 utility_fn，它需要原始状态对象
-        total_utility = torch.zeros(batch).to(self.device)
-        s = states   # 原始对象列表
-        w_i = word_indexs
+    def compute_rollout_target(self, states, world_indices, path_indices=None):
+        total_utility = torch.zeros(states.shape[0], device=self.device)
+        s, w_i, p_i = states, world_indices, path_indices
         for t in range(self.horizon):
-            # 从当前状态计算动作
-            logger.debug(f' s 的形状: {s.shape if isinstance(s, torch.Tensor) else "list of length " + str(len(s))}')
-            u = self.actor(s)   # [batch, 2]
-            # 计算即时效用
-            l_list = []
-            for i, (s_i, u_i) in enumerate(zip(s, u)):
-                val = self.utility(s_i, u_i, w_i[i])
-                l_list.append(val)
-            l = torch.stack(l_list)          # [batch]，每个元素保持梯度
-            # 使用预测模型 f_pred 更新状态（这里需要更新对象中的数值）
-            s = self.f_pred_batch(s, u)   # 返回新的状态对象列表（或张量）
-            # 累计效用，考虑折扣
-            total_utility += (self.gamma ** t) * l
-        
-        # 裁剪
-        total_utility = torch.clamp(total_utility, min=-1000.0, max=1000.0)
-        return total_utility
+            u = self.actor(s)
+            l = self.utility_batch(s, u, w_i, p_i)
+            s = self.f_pred_batch(s, u, w_i)
+            total_utility = total_utility + (self.gamma ** t) * torch.clamp(l, -10.0, 10.0)
+        return torch.clamp(total_utility, -1000.0, 1000.0)
 
     def batch_state_to_tensor(self, states):
         logger.debug(f'将状态对象列表转换为张量表示: batch_size={len(states)},第一个状态={states[0] if len(states) > 0 else "N/A"}')
@@ -176,43 +153,67 @@ class DiscreteIDCAgent:
         state_tensor = torch.cat([ego_tensors, others_flat, ref_error_tensors], dim=-1)
         return state_tensor
     
-    def f_pred_batch(self, states, actions):
+    def f_pred_batch(self, states, actions, w_i):
         """
-        states: list of state objects (batch)
+        states: tensor [batch, TOTAL_STATE_DIM]
         actions: tensor [batch, 2]
-        返回新的状态对象列表（或张量）
+        w_i: list/tuple of world indices [batch]
         """
-        # 将 states 转为张量表示
-        ego_tensors = states[:, :self.DIM_EGO]  # [batch, DIM_EGO]
-        others_tensors = states[:, self.DIM_EGO:self.DIM_EGO+self.DIM_OTHERS]  # [batch, DIM_OTHERS]
-        ref_error_tensors = states[:, self.DIM_EGO+self.DIM_OTHERS:self.DIM_EGO+self.DIM_OTHERS+self.DIM_REF_ERROR]  # [batch, DIM_REF_ERROR]
-        logger.debug(f'预测下一状态: others_tensors shape={others_tensors.shape}')
+        ego_tensors = states[:, :self.DIM_EGO]
+        others_tensors = states[:, self.DIM_EGO:self.DIM_EGO+self.DIM_OTHERS]
         
-        # 使用自行车模型预测下一时刻自车状态x_next, y_next, theta_next, v_next
+        # 1. 预测自车和周车的下一时刻状态
         ego_next = self.dynamics(ego_tensors[...,:6], actions)
         
-        # 自车预测状态转成[x, y, v_lon, v_lat, phi, omega]格式（假设omega=0）
-        x_next = ego_next[:, 0]
-        y_next = ego_next[:, 1]
-        theta_next = ego_next[:, 2]
-        v_next = ego_next[:, 3]
-        v_lon_next = v_next                       # 车速就是纵向速度
-        v_lat_next = torch.zeros_like(v_next)    # 无侧滑假设
+        x_next, y_next, theta_next, v_next = ego_next[:, 0], ego_next[:, 1], ego_next[:, 2], ego_next[:, 3]
         ego_next_formatted = torch.stack([
             x_next, y_next, 
-            v_lon_next, v_lat_next, 
-            theta_next, 
-            torch.zeros_like(theta_next)
+            v_next, torch.zeros_like(v_next),  # v_lon, v_lat
+            theta_next, torch.zeros_like(theta_next) # phi, omega
         ], dim=-1)
-        # 使用简单的运动学模型预测周车状态（假设动作对周车无影响）
-        others_next = self.predict_others(others_tensors)  # [batch, N, 4]
-        # 将 ego_next 和 others_next 转回状态对象列表
-        logger.debug(f'预测完成，构建下一状态对象列表: ego_next shape={ego_next.shape}, others_next shape={others_next.shape}, ref_error shape={ref_error_tensors.shape}')
+        
+        others_next = self.predict_others(others_tensors)
+        
+        # 2. 计算精准且保留梯度的下一时刻参考误差
+        ref_error_list = []
+        for i in range(len(states)):
+            world_idx = w_i[i]
+            ego_idx = self.ego_indices[world_idx]
+            
+            # 使用 .detach() 查询参考点，打断索引操作的计算图，但不影响后面算误差的梯度
+            ref_numpy = self.state_builder.get_ref_state(
+                world_idx, ego_idx, 
+                ego_x=x_next[i].detach().item(), 
+                ego_y=y_next[i].detach().item()
+            )
+            ref_tensor = torch.tensor(ref_numpy, device=self.device, dtype=torch.float32)
+            
+            # 可导误差计算 (严格对齐 state_builder 中的数学逻辑)
+            dx = ref_tensor[0] - x_next[i]
+            dy = ref_tensor[1] - y_next[i]
+            delta_p = torch.hypot(dx, dy)
+            cross = dy * torch.cos(ref_tensor[4]) - dx * torch.sin(ref_tensor[4])
+            # 保持与 math.copysign 一致的符号逻辑
+            sign = torch.where(cross >= 0, torch.tensor(1.0, device=self.device), torch.tensor(-1.0, device=self.device))
+            delta_p = delta_p * sign
+            
+            delta_phi = theta_next[i] - ref_tensor[4]
+            delta_phi = torch.atan2(torch.sin(delta_phi), torch.cos(delta_phi))
+            
+            ego_speed = torch.hypot(ego_next_formatted[i, 2], ego_next_formatted[i, 3])
+            delta_v = ego_speed - ref_tensor[2]
+            
+            ref_error_list.append(torch.stack([delta_p, delta_phi, delta_v]))
+
+        ref_error_tensors = torch.stack(ref_error_list)
+        
+        # 3. 组合并返回最终状态
         next_states = []
         for i in range(len(states)):
             next_s = self.tensor_to_state_tensor(ego_next_formatted[i], others_next[i], ref_error_tensors[i])
             next_states.append(next_s)
-        return torch.stack(next_states)  # [batch, TOTAL_STATE_DIM]
+            
+        return torch.stack(next_states)
     
     def tensor_to_state_tensor(self, ego_tensor, others_tensor, ref_error_tensor):
         """
@@ -222,13 +223,12 @@ class DiscreteIDCAgent:
         return torch.cat([ego_tensor, others_tensor.view(-1), ref_error_tensor], dim=-1)  # [TOTAL_STATE_DIM]
 
 
-    def update_critic(self, states, word_indexs):
-        logger.debug(f'更新 Critic: states batch size={len(states)}')
+    def update_critic(self, states, world_indices, path_indices=None):
+        logger.debug(f'更新 Critic: states batch size={states.shape[0]}')
         with torch.no_grad():
-            targets = self.compute_rollout_target(states, word_indexs).detach()
+            targets = self.compute_rollout_target(states, world_indices, path_indices).detach()
         logger.info(f"[DEBUG] target stats: min={targets.min().item():.2f}, max={targets.max().item():.2f}, mean={targets.mean().item():.2f}, has_nan={torch.isnan(targets).any()}")
         
-        targets = torch.clamp(targets, -100.0, 100.0)
         values = self.critic(states)
         logger.info(f"[DEBUG] value stats: min={values.min().item():.2f}, max={values.max().item():.2f}, mean={values.mean().item():.2f}, has_nan={torch.isnan(values).any()}")
         
@@ -250,28 +250,18 @@ class DiscreteIDCAgent:
         self.critic_optimizer.step()
         return loss.detach().item()
 
-    def update_actor(self, states, w_i):
-        logger.debug(f'更新 Actor: states batch size={len(states)}')
-        total_cost = 0.0
+    def update_actor(self, states, w_i, p_i=None):
+        total_cost = torch.zeros(states.shape[0], device=self.device)
         s = states
         for t in range(self.horizon):
-            u = self.actor(s)  # 假设 u 形状 [batch, action_dim]
-            # 关键修改：使用 torch.stack 代替 torch.tensor，保留梯度
-            l_list = []
-            for i, (s_i, u_i) in enumerate(zip(s, u)):
-                val = self.utility(s_i, u_i, w_i[i])
-                l_list.append(val)
-            l = torch.stack(l_list)          # [batch]，每个元素保持梯度
-            p_list = [self.penalty(s_i, w_i[i]) for i, s_i in enumerate(s)]
-            p = torch.stack(p_list)          # [batch]
-            # 截断成本和惩罚值，防止过大导致训练不稳定
+            u = self.actor(s)
+            l = self.utility_batch(s, u, w_i, p_i)
+            p = self.penalty_batch(s, w_i)
             l = torch.clamp(l, -10.0, 10.0)
             p = torch.clamp(p, 0.0, 10.0)
-            # 打印控制消耗和惩罚值的统计信息
-            # logger.info(f'Actor 更新: step {t}, 平均效用 {l.mean().item():.4f}, 平均惩罚 {p.mean().item():.4f}')
-            total_cost += (l + self.rho * p)
-            s = self.f_pred_batch(s, u)
-        
+            total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
+            s = self.f_pred_batch(s, u, w_i)
+
         actor_loss = total_cost.mean()
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -279,81 +269,92 @@ class DiscreteIDCAgent:
         self.actor_optimizer.step()
         return actor_loss.detach().item()
 
-    def utility(self, s, u,w_i):
+    def utility_batch(self, s, u, w_i, p_i=None):
         """
-        s: 状态对象（包含 ego, others, ref）
-        u: [delta, a] 控制量
-        w_i: 世界索引
-        返回标量代价 l = 跟踪误差 + 控制能量
+        s: [batch, TOTAL_STATE_DIM], u: [batch, 2]
+        p_i: 可选，list of int，每条数据的候选路径索引
+        返回 [batch] 标量代价
         """
-        # 从 s 中获取自车状态和参考路径
-        logger.debug(f'计算效用: 状态={s.shape}, 动作={u.shape}')
-        ego = s[:self.DIM_EGO]  # [6]
-        # 通过state_builder的w_i所以计算参考
-        ref = self.state_builder.get_ref_state(w_i, self.ego_indices[w_i], ego_x=ego[0].detach().item(), ego_y=ego[1].detach().item())  # [6]，包含参考位置、速度、航向等信息
-        # 计算跟踪误差
-        pos_err = torch.sqrt((ego[0] - ref[0])**2 + (ego[1] - ref[1])**2)  # 位置误差
-        heading_err = ego[4] - ref[4]  # 航向误差
-        speed_err = torch.sqrt((ego[2] - ref[2])**2 + (ego[3] - ref[3])**2)  # 速度误差
-        # 控制能量
-        steer_cost = u[0]**2
-        acc_cost = u[1]**2
-        # 加权和
-        l = (self.pos_err_weight * pos_err**2 +
-            self.speed_err_weight * speed_err**2 +
-            self.heading_err_weight * heading_err**2 +
-            self.steer_cost_weight * steer_cost +
-            self.acc_cost_weight * acc_cost)
-        # 如果损失过大打印一下数据
-        # logger.info(f'参考信息：ref_x={ref[0]:.4f}, ref_y={ref[1]:.4f}, ref_vlon={ref[2]:.4f}, ref_phi={ref[4]:.4f}')
-        # logger.info(f'位置误差: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
-        # logger.info(f'效用计算: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
-        # if l.item() > 10.0:
-        #     logger.info(f'位置误差: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
-        #     logger.info(f'效用计算: pos_err={pos_err:.4f}, heading_err={heading_err:.4f}, speed_err={speed_err:.4f}')
+        ego = s[:, :self.DIM_EGO]
+        refs = self.state_builder.get_ref_states_batch(
+            w_i, ego[:, 0], ego[:, 1], self.ego_indices, p_i)
+
+        pos_err = torch.sqrt((ego[:, 0] - refs[:, 0]) ** 2
+                           + (ego[:, 1] - refs[:, 1]) ** 2)
+        heading_err = ego[:, 4] - refs[:, 4]
+        heading_err = torch.atan2(torch.sin(heading_err), torch.cos(heading_err))
+        speed_err = torch.sqrt((ego[:, 2] - refs[:, 2]) ** 2
+                             + (ego[:, 3] - refs[:, 3]) ** 2)
+
+        steer_cost = u[:, 0] ** 2
+        acc_cost = u[:, 1] ** 2
+
+        l = (self.pos_err_weight * pos_err ** 2
+             + self.speed_err_weight * speed_err ** 2
+             + self.heading_err_weight * heading_err ** 2
+             + self.steer_cost_weight * steer_cost
+             + self.acc_cost_weight * acc_cost)
         return l
 
-    def penalty(self, s, w_i):
+    def _two_circle_centers(self, x, y, phi):
         """
-        计算状态 s 下的约束违反惩罚（用于 Actor 更新）
-        包括：与周围车辆安全距离、与道路边界安全距离、红灯停止线
-        返回标量惩罚值（非负）
+        x, y, phi: [batch, ...] tensors
+        返回前圆心和后圆心: (front, rear) 各 [batch, ..., 2]
         """
-        violation = torch.tensor(0.0).to(self.device)
-        ego = s[:self.DIM_EGO]  # [6]
-        # 与其他车辆的碰撞约束
-        for other in s[self.DIM_EGO:self.DIM_EGO+self.DIM_OTHERS].view(-1, 4):  # 每4维一个车辆状态
-            dist = torch.sqrt((ego[0] - other[0])**2 + (ego[1] - other[1])**2)
-            safe_dist = self.D_veh_safe
-            if dist < safe_dist:
-                logger.debug(f' Penalty: 车辆间距过近，dist={dist:.4f}, safe_dist={safe_dist:.4f}')
-                violation += (safe_dist - dist)**2
-        # 与道路边界约束
-        closest_edge_point = self.state_builder.get_road_edges(w_i, ego_x=ego[0].detach().item(), ego_y=ego[1].detach().item())  # 假设返回与最近道路边界的距离
-        # 计算自车与道路边界的距离
-        road_boundary_dist = torch.sqrt((closest_edge_point[0] - ego[0])**2 + (closest_edge_point[1] - ego[1])**2)
-        if road_boundary_dist < self.D_road_safe:
-            violation += (self.D_road_safe - road_boundary_dist)**2
-        # 红灯停止线，后续开发
-        # if s.traffic_light == 'red' and ego[0] > stop_line_position(s.path_ref):
-        #     violation += (ego[0] - stop_line_position)**2
-        return violation
+        dx = self.HALF_L * torch.cos(phi)
+        dy = self.HALF_L * torch.sin(phi)
+        front = torch.stack([x + dx, y + dy], dim=-1)
+        rear = torch.stack([x - dx, y - dy], dim=-1)
+        return front, rear
+
+    def penalty_batch(self, s, w_i):
+        """
+        s: [batch, TOTAL_STATE_DIM]
+        返回 [batch] 标量惩罚值（双圆碰撞模型，可导）
+        """
+        ego = s[:, :self.DIM_EGO]
+        others = s[:, self.DIM_EGO:self.DIM_EGO + self.DIM_OTHERS].view(-1, 8, 4)
+
+        # 自车双圆心 [batch, 2, 2]
+        ego_front, ego_rear = self._two_circle_centers(ego[:, 0], ego[:, 1], ego[:, 4])
+        ego_circles = torch.stack([ego_front, ego_rear], dim=1)  # [batch, 2, 2]
+
+        # 周车双圆心 [batch, 8, 2, 2]
+        oth_front, oth_rear = self._two_circle_centers(
+            others[:, :, 0], others[:, :, 1], others[:, :, 2])
+        oth_circles = torch.stack([oth_front, oth_rear], dim=2)  # [batch, 8, 2, 2]
+
+        # 4 组距离: ego[2] × other[8,2] → [batch, 8, 2, 2]
+        diff = ego_circles[:, None, :, None, :] - oth_circles[:, :, None, :, :]
+        dist = torch.sqrt((diff ** 2).sum(dim=-1))  # [batch, 8, 2, 2]
+        veh_violation = F.relu(self.D_veh_safe - dist).pow(2).sum(dim=(1, 2, 3))
+
+        # 道路边界惩罚
+        edge_pts = self.state_builder.get_road_edges_batch(
+            w_i, ego[:, 0], ego[:, 1])
+        edge_dist = torch.sqrt((edge_pts[:, 0] - ego[:, 0]) ** 2
+                             + (edge_pts[:, 1] - ego[:, 1]) ** 2)
+        road_violation = F.relu(self.D_road_safe - edge_dist).pow(2)
+
+        return veh_violation + road_violation
     
     def update(self):
-        states, word_indexs = zip(*self.buffer.sample_batch(self.batch_size))
-        # 1. 更新 Critic
-        # 首先处理把state转成tensor，然后计算 rollout 目标，最后更新 critic 网络
+        samples = self.buffer.sample_batch(self.batch_size)
+        states, word_indexs, path_indices = zip(*samples)
         states_tensor = self.batch_state_to_tensor(states)
-        critic_loss = self.update_critic(states_tensor,word_indexs)
-        # 2. 更新 Actor（每隔几次 Critic 更新）
+
+        # PEV: 每次 update 都更新 critic
+        critic_loss = self.update_critic(states_tensor, word_indexs, path_indices)
+        self.pev_step += 1
+
+        # PIM: 积累足够 PEV 步后才更新 actor 并放大 ρ
         actor_loss = None
-        if self.global_step % self.update_freq == 0 and self.rho <= self.max_penalty:
-            # 由于states_tensor已经经过了上面critic的计算图,所以这里
-            logger.debug(f'更新 Actor: global_step={self.global_step}, states_tensor shape={states_tensor.shape}')
+        if self.pev_step >= self.pim_interval:
+            self.pev_step = 0
             self.rho = min(self.rho * self.amplifier_c, self.max_penalty)
-            actor_loss = self.update_actor(states_tensor,word_indexs)
             self.gep_iteration += 1
-        
+            actor_loss = self.update_actor(states_tensor, word_indexs, path_indices)
+
         return critic_loss, actor_loss
         
 
