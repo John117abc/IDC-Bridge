@@ -91,8 +91,7 @@ def train(args):
             scenes.append(json.load(f))
 
     builder = GPUDriveObservationBuilder(env, scenes)
-    max_step = builder.EXPERT_TRAJ_LEN
-    # 4. 确定每个 world 的 ego index
+    max_step = builder.EXPERT_TRAJ_LEN if builder.EXPERT_TRAJ_LEN is not None else 91
     ego_indices = []
     for w in range(args.num_worlds):
         controllable = env.cont_agent_mask[w].nonzero(as_tuple=True)[0]
@@ -103,10 +102,12 @@ def train(args):
     # 5. 初始化 agent
     agent = DiscreteIDCAgent(env, args, args.device, builder,ego_indices)
 
+    epochs = args.epochs
     # 判断是否需要加载模型
     if args.load_model:
         logger.info(f'正在加载模型: {args.model_path}')
         agent.load(args.model_path)
+        epochs = agent.globe_eps
 
     logger.info(f'训练开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={max_step}')
 
@@ -119,7 +120,7 @@ def train(args):
     history_loss = []
 
     # 6. 训练循环
-    for epoch in range(args.epochs):
+    for epoch in range(epochs):
         obs = env.reset()
         for w in range(args.num_worlds):
             builder.reset_world_step(w, 0)
@@ -134,6 +135,18 @@ def train(args):
                            for _ in range(args.num_worlds)]
             states = builder.get_idc_observations_batch(ego_indices,
                                                         path_indices=path_indices)
+
+            # [DIAG] 参考误差: 哪个 world 偏离最大
+            if step % 5 == 0:
+                max_dp, max_w = 0.0, 0
+                for w in range(args.num_worlds):
+                    s = states[w]
+                    ref_start = agent.DIM_EGO + agent.DIM_OTHERS
+                    dp, dphi, dv = abs(s[ref_start]), abs(s[ref_start+1]), abs(s[ref_start+2])
+                    if dp > max_dp:
+                        max_dp, max_w = dp, w
+                logger.info(f'[DIAG-ref] max pos_err={max_dp:.2f}m @world_{max_w}')
+
             for w in range(args.num_worlds):
                 agent.buffer.handle_new_experience((states[w], w, path_indices[w]))
                 builder.increment_step(w)
@@ -166,7 +179,6 @@ def train(args):
             # recorder.record(env, epoch, step)
 
             next_obs = env.get_obs()
-            obs = next_obs
             agent.global_step += 1
             # 暂时用不到
             # rewards = env.get_rewards()

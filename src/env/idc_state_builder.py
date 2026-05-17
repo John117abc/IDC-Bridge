@@ -177,6 +177,9 @@ class GPUDriveObservationBuilder:
                 rel_x = p[1]
                 rel_y = p[2]
                 rel_h = p[3]
+                # 跳过 GPUDrive 空槽位: speed=0, rel_x=0, rel_y=0 的 phantom 车
+                if p_speed == 0.0 and rel_x == 0.0 and rel_y == 0.0:
+                    continue
                 abs_h = heading + rel_h
                 gx = x + rel_x * cos_h - rel_y * sin_h
                 gy = y + rel_x * sin_h + rel_y * cos_h

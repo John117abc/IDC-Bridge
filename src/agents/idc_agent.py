@@ -66,8 +66,8 @@ class DiscreteIDCAgent:
         self.pim_interval = args.pim_interval
 
         # 安全距离
-        self.D_veh_safe = 5.0    # 双圆模型: r_ego + r_veh = 2.5 + 2.5
-        self.D_road_safe = 1.5
+        self.D_veh_safe = 2.0    # 两车圆心威胁距离: 并排邻车道 ~3.75m 不受罚
+        self.D_road_safe = 1.0
         self.HALF_L = 2.25
         self.HALF_W = 1.0
 
@@ -114,6 +114,12 @@ class DiscreteIDCAgent:
 
             # 组合最终动作 [batch, max_agents, 2]
             action = torch.stack([a_phy, delta_phy], dim=-1)
+
+            # [DIAG] 前几个 world 的实际动作值
+            if self.global_step % 10 == 0:
+                n_show = min(5, batch_size)
+                for i in range(n_show):
+                    logger.info(f'[DIAG-act] world_{i} acc={action[i,0,0].item():.3f} steer={action[i,0,1].item():.3f}')
             return action
 
 
@@ -133,6 +139,7 @@ class DiscreteIDCAgent:
     def compute_rollout_target(self, states, world_indices, path_indices=None):
         total_utility = torch.zeros(states.shape[0], device=self.device)
         s, w_i, p_i = states, world_indices, path_indices
+        l_min_log, l_max_log = float('inf'), float('-inf')
         for t in range(self.horizon):
             u = self.actor(s)
             if torch.isnan(u).any():
@@ -140,10 +147,16 @@ class DiscreteIDCAgent:
             l = self.utility_batch(s, u, w_i, p_i)
             if torch.isnan(l).any():
                 logger.warning(f'[NaN] utility at rollout step {t}')
+            l_min_log = min(l_min_log, l.min().item())
+            l_max_log = max(l_max_log, l.max().item())
             s = self.f_pred_batch(s, u, w_i)
             if torch.isnan(s).any():
                 logger.warning(f'[NaN] f_pred state at rollout step {t}')
-            total_utility = total_utility + (self.gamma ** t) * torch.clamp(l, -10.0, 10.0)
+            total_utility = total_utility + (self.gamma ** t) * l
+        if self.global_step % 50 == 0:
+            tu = total_utility
+            logger.info(f'[DIAG-critic] utility raw range=[{l_min_log:.2f}, {l_max_log:.2f}], '
+                        f'target raw mean={tu.mean().item():.2f} min={tu.min().item():.2f} max={tu.max().item():.2f}')
         return torch.clamp(total_utility, -1000.0, 1000.0)
 
     def batch_state_to_tensor(self, states):
@@ -267,10 +280,13 @@ class DiscreteIDCAgent:
             u = self.actor(s)
             l = self.utility_batch(s, u, w_i, p_i)
             p = self.penalty_batch(s, w_i)
-            l = torch.clamp(l, -10.0, 10.0)
-            p = torch.clamp(p, 0.0, 10.0)
+            if t == 0:
+                logger.info(f'[DIAG-pen] raw penalty min={p.min().item():.2f} max={p.max().item():.2f} '
+                            f'mean={p.mean().item():.2f}  (rho={self.rho:.4f})')
             total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
             s = self.f_pred_batch(s, u, w_i)
+
+        total_cost = torch.clamp(total_cost, -100.0, 100.0)
 
         actor_loss = total_cost.mean()
 
@@ -358,7 +374,12 @@ class DiscreteIDCAgent:
         # 4 组距离: ego[2] × other[8,2] → [batch, 8, 2, 2]
         diff = ego_circles[:, None, :, None, :] - oth_circles[:, :, None, :, :]
         dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # [batch, 8, 2, 2]
-        veh_violation = F.relu(self.D_veh_safe - dist).pow(2).sum(dim=(1, 2, 3))
+        logger.info(f'[DIAG-pos] ego=({ego[0,0].item():.2f},{ego[0,1].item():.2f}) '
+                    f'oth0=({others[0,0,0].item():.2f},{others[0,0,1].item():.2f}) '
+                    f'min_dist={dist[0,:,:,:].min().item():.4f} max_dist={dist[0,:,:,:].max().item():.4f}')
+        # 每辆周车取和最危险的一对圆碰撞，再跨所有周车求和
+        pair_pen = F.relu(self.D_veh_safe - dist).pow(2)          # [batch, 8, 2, 2]
+        veh_violation = pair_pen.flatten(2).max(dim=2).values.sum(dim=1)  # [batch]
 
         # 道路边界惩罚
         edge_pts = self.state_builder.get_road_edges_batch(
