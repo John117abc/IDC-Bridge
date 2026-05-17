@@ -109,5 +109,5 @@ python src/scripts/train/idc-eval.py \
 
 如果用了这个项目，请引用：
 
-- 原版 IDC 论文：[https://arxiv.org/abs/2103.10290](https://arxiv.org/abs/2103.10290)
+- 原版 IDC 论文：[Integrated Decision and Control: Toward  Interpretable and Computationally  Efficient Driving Intelligence](https://arxiv.org/abs/2103.10290)
 - GPUDrive：[GPUDrive: Data-driven, multi-agent driving simulation at 1 million FPS](https://arxiv.org/abs/2408.01584)
