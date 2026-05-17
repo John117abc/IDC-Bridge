@@ -65,7 +65,7 @@ class KinematicBicycleModel(nn.Module):
             next_state: 张量 shape (..., 4)，与 state 同型
         """
         vx, vy = state[..., 2], state[..., 3]
-        x, y, theta, v = state[..., 0], state[..., 1], state[..., 4], torch.sqrt(vx**2 + vy**2)
+        x, y, theta, v = state[..., 0], state[..., 1], state[..., 4], torch.sqrt(vx**2 + vy**2 + 1e-6)
         a, delta = action[..., 0], action[..., 1]
 
         dt = self.dt

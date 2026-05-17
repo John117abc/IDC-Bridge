@@ -11,10 +11,10 @@ file_dir = get_project_root() / 'logs'
 
 def get_logger(
         name: str = __name__,
-        log_dir: str = "logs",
+        log_dir: str = "/workspace/data/logs",
         level: int = logging.INFO,
         use_console: bool = True,
-        use_file: bool = False
+        use_file: bool = True
 ):
     """
     获取 logger，将同一天、同一模块的日志写入同一个文件。
@@ -50,8 +50,8 @@ def get_logger(
     # --- 文件输出：按天 + 模块 聚合 ---
     if use_file:
         # 1. 构建日志目录：logs/YYYYMMDD/
-        project_root = Path(get_project_root())
-        base_log_dir = project_root / log_dir
+        project_root = Path(log_dir)
+        base_log_dir = project_root
         today_str = datetime.now().strftime("%Y%m%d")
         dated_log_dir = base_log_dir / today_str
         os.makedirs(dated_log_dir, exist_ok=True)

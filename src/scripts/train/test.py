@@ -33,7 +33,7 @@ def create_forward_actions_multidim(num_worlds, max_agents, action_dim=3):
     形状: (num_worlds, max_agents, action_dim)
     """
     # 向前走的动作：[转向=0, 加速度=0.5, 头部倾斜=0]
-    forward_action = torch.tensor([0.5, 0.0, 0.0], dtype=torch.float32)
+    forward_action = torch.tensor([0.0, 0.5, 0.0], dtype=torch.float32)
     
     # 扩展到所有智能体
     actions = forward_action.reshape(1, 1, -1).expand(num_worlds, max_agents, -1).clone()

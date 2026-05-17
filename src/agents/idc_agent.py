@@ -113,7 +113,7 @@ class DiscreteIDCAgent:
             a_phy = (norm_action[..., 1] + 1) / 2 * (1.5 - (-3.0)) + (-3.0)   # 范围 [-3.0, 1.5]
 
             # 组合最终动作 [batch, max_agents, 2]
-            action = torch.stack([delta_phy, a_phy], dim=-1)    # 或 torch.cat 后 reshape
+            action = torch.stack([a_phy, delta_phy], dim=-1)
             return action
 
 
@@ -135,8 +135,14 @@ class DiscreteIDCAgent:
         s, w_i, p_i = states, world_indices, path_indices
         for t in range(self.horizon):
             u = self.actor(s)
+            if torch.isnan(u).any():
+                logger.warning(f'[NaN] actor output at rollout step {t}')
             l = self.utility_batch(s, u, w_i, p_i)
+            if torch.isnan(l).any():
+                logger.warning(f'[NaN] utility at rollout step {t}')
             s = self.f_pred_batch(s, u, w_i)
+            if torch.isnan(s).any():
+                logger.warning(f'[NaN] f_pred state at rollout step {t}')
             total_utility = total_utility + (self.gamma ** t) * torch.clamp(l, -10.0, 10.0)
         return torch.clamp(total_utility, -1000.0, 1000.0)
 
@@ -228,13 +234,17 @@ class DiscreteIDCAgent:
         with torch.no_grad():
             targets = self.compute_rollout_target(states, world_indices, path_indices).detach()
         logger.info(f"[DEBUG] target stats: min={targets.min().item():.2f}, max={targets.max().item():.2f}, mean={targets.mean().item():.2f}, has_nan={torch.isnan(targets).any()}")
-        
+
+        if torch.isnan(targets).any():
+            logger.warning(f'Target 包含 NaN，跳过本次 Critic 更新')
+            return float('nan')
+
         values = self.critic(states)
         logger.info(f"[DEBUG] value stats: min={values.min().item():.2f}, max={values.max().item():.2f}, mean={values.mean().item():.2f}, has_nan={torch.isnan(values).any()}")
-        
+
         loss = F.mse_loss(values, targets.unsqueeze(1))
         logger.info(f"[DEBUG] loss = {loss.item():.4f}")
-        
+
         self.critic_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
@@ -246,7 +256,7 @@ class DiscreteIDCAgent:
                 total_norm += param_norm.item() ** 2
         total_norm = total_norm ** 0.5
         logger.debug(f"[DEBUG] grad norm = {total_norm:.4f}")
-        
+
         self.critic_optimizer.step()
         return loss.detach().item()
 
@@ -263,11 +273,32 @@ class DiscreteIDCAgent:
             s = self.f_pred_batch(s, u, w_i)
 
         actor_loss = total_cost.mean()
+
+        # 保存权重副本，用于 NaN 回滚
+        backup = {name: param.clone() for name, param in self.actor.named_parameters()}
+
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.actor_optimizer.step()
-        return actor_loss.detach().item()
+
+        # 检测 NaN 权重并回滚
+        has_nan = False
+        for name, param in self.actor.named_parameters():
+            if torch.isnan(param).any():
+                has_nan = True
+                break
+        if has_nan:
+            logger.warning(f'Actor 权重出现 NaN，回滚到更新前。rho={self.rho:.4f}, gep_iter={self.gep_iteration}')
+            with torch.no_grad():
+                for name, param in self.actor.named_parameters():
+                    param.copy_(backup[name])
+            self.pev_step = max(0, self.pev_step - 1)
+            self.gep_iteration = max(0, self.gep_iteration - 1)
+            self.rho = self.rho / self.amplifier_c
+            actor_loss = torch.tensor(float('nan'))
+
+        return actor_loss.detach().item() if not has_nan else float('nan')
 
     def utility_batch(self, s, u, w_i, p_i=None):
         """
@@ -280,11 +311,11 @@ class DiscreteIDCAgent:
             w_i, ego[:, 0], ego[:, 1], self.ego_indices, p_i)
 
         pos_err = torch.sqrt((ego[:, 0] - refs[:, 0]) ** 2
-                           + (ego[:, 1] - refs[:, 1]) ** 2)
+                            + (ego[:, 1] - refs[:, 1]) ** 2 + 1e-8)
         heading_err = ego[:, 4] - refs[:, 4]
         heading_err = torch.atan2(torch.sin(heading_err), torch.cos(heading_err))
         speed_err = torch.sqrt((ego[:, 2] - refs[:, 2]) ** 2
-                             + (ego[:, 3] - refs[:, 3]) ** 2)
+                              + (ego[:, 3] - refs[:, 3]) ** 2 + 1e-8)
 
         steer_cost = u[:, 0] ** 2
         acc_cost = u[:, 1] ** 2
@@ -326,14 +357,14 @@ class DiscreteIDCAgent:
 
         # 4 组距离: ego[2] × other[8,2] → [batch, 8, 2, 2]
         diff = ego_circles[:, None, :, None, :] - oth_circles[:, :, None, :, :]
-        dist = torch.sqrt((diff ** 2).sum(dim=-1))  # [batch, 8, 2, 2]
+        dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # [batch, 8, 2, 2]
         veh_violation = F.relu(self.D_veh_safe - dist).pow(2).sum(dim=(1, 2, 3))
 
         # 道路边界惩罚
         edge_pts = self.state_builder.get_road_edges_batch(
             w_i, ego[:, 0], ego[:, 1])
         edge_dist = torch.sqrt((edge_pts[:, 0] - ego[:, 0]) ** 2
-                             + (edge_pts[:, 1] - ego[:, 1]) ** 2)
+                              + (edge_pts[:, 1] - ego[:, 1]) ** 2 + 1e-8)
         road_violation = F.relu(self.D_road_safe - edge_dist).pow(2)
 
         return veh_violation + road_violation
