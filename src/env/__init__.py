@@ -1,3 +1,3 @@
-from .idc_state_builder_bak import GPUDriveObservationBuilder
+from .idc_state_builder import GPUDriveObservationBuilder
 
 __all__ = ['GPUDriveObservationBuilder']

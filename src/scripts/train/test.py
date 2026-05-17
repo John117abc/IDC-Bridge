@@ -18,7 +18,7 @@ from gpudrive.datatypes.observation import (
 )
 
 sys.path.insert(0, '/workspace/idc/src')
-from env.idc_state_builder_bak import GPUDriveObservationBuilder
+from env.idc_state_builder import GPUDriveObservationBuilder
 MAX_NUM_OBJECTS = 1  # Maximum number of objects in the scene we control
 NUM_WORLDS = 2  # Number of parallel environments
 UNIQUE_SCENES = 2 # Number of unique scenes

@@ -103,11 +103,12 @@ def train(args):
     agent = DiscreteIDCAgent(env, args, args.device, builder,ego_indices)
 
     epochs = args.epochs
+    current_epoch = 0
     # 判断是否需要加载模型
     if args.load_model:
         logger.info(f'正在加载模型: {args.model_path}')
         agent.load(args.model_path)
-        epochs = agent.globe_eps
+        current_epoch = agent.globe_eps
 
     logger.info(f'训练开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={max_step}')
 
@@ -121,6 +122,7 @@ def train(args):
 
     # 6. 训练循环
     for epoch in range(epochs):
+        epoch += current_epoch
         obs = env.reset()
         for w in range(args.num_worlds):
             builder.reset_world_step(w, 0)
@@ -178,7 +180,6 @@ def train(args):
             # 记录帧
             # recorder.record(env, epoch, step)
 
-            next_obs = env.get_obs()
             agent.global_step += 1
             # 暂时用不到
             # rewards = env.get_rewards()
@@ -187,6 +188,7 @@ def train(args):
         
         agent.globe_eps += 1  # 每个 epoch 结束后增加全局回合数
         
+        logger.info(f'开始保存轨迹图像')
         for viz in viz_list:
             if len(viz.actual_x) > 0:
                 viz.save_plot(viz_dir, epoch + 1)
@@ -223,9 +225,9 @@ if __name__ == "__main__":
     parser.add_argument('--amplifier-c', type=float, default=1.015)
     parser.add_argument('--pim-interval', type=int, default=30)
     parser.add_argument('--seed', type=int, default=5)
-    parser.add_argument('--save-freq', type=int, default=10)
+    parser.add_argument('--save-freq', type=int, default=5)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
-    parser.add_argument('--load-model', type=bool, default=False)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260515/idc-waymo-v1.0_examples_065150_episode=5.pth")
+    parser.add_argument('--load-model', type=bool, default=True)
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260517/idc-waymo-v1.0_examples_122041_episode=20.pth")
     args = parser.parse_args()
     train(args)

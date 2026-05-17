@@ -16,7 +16,7 @@ from gpudrive.visualize.utils import img_from_fig
 sys.path.insert(0, '/workspace/idc/src')
 from env.idc_state_builder import GPUDriveObservationBuilder
 from agents.idc_agent import DiscreteIDCAgent
-from utils import get_logger, VisualRecorder, TrajectoryVisualizer
+from utils import get_logger, VisualRecorder, TrajectoryVisualizer, LossPlotter
 logger = get_logger('idc-agent')
 
 def extend_action_to_3d(actions_2d):
@@ -107,6 +107,10 @@ def evaluate(args):
     logger.info(f'正在加载模型: {args.model_path}')
     agent.load(args.model_path)
 
+    # 生成损失曲线图
+    logger.info('正在生成损失曲线图...')
+    LossPlotter(agent.history_loss, f'{args.file_dir}/loss_img', 'idc-waymo-v1.0').plot_all()
+
     logger.info(f'评估开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={max_step}')
 
     viz_dir = os.path.join(args.file_dir, 'eval_plots')
@@ -163,7 +167,7 @@ if __name__ == "__main__":
     parser.add_argument('--num-worlds', type=int, default=5)
     parser.add_argument('--max-agents', type=int, default=1)
     parser.add_argument('--max-steps', type=int, default=90)
-    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--dt', type=float, default=0.1)
     parser.add_argument('--horizon', type=int, default=25)
@@ -179,6 +183,6 @@ if __name__ == "__main__":
     parser.add_argument('--save-freq', type=int, default=1)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
     parser.add_argument('--load-model', type=bool, default=False)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260517/idc-waymo-v1.0_examples_085030_episode=60.pth")
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260517/idc-waymo-v1.0_examples_122041_episode=20.pth")
     args = parser.parse_args()
     evaluate(args)

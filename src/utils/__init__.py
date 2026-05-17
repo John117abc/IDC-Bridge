@@ -6,6 +6,7 @@ from .env import setup_code_environment
 from .common import normalize_Kinematics_obs,get_project_root,RunningNormalizer,normalize_idc_scenario_relative,average_idc_list,unpack_idc_numpy
 from .draw import Plotter
 from .traj_visualizer import TrajectoryVisualizer
+from .loss_plotter import LossPlotter
 from .collision import ellipse_min_dist_sq,rect_min_dist_sq,rect_min_dist_sq_batch
 from .geometry import batch_world_to_ego
 from .trajectory import resample_path_equal_distance
@@ -35,5 +36,6 @@ __all__ = ['get_logger',
            'resample_path_equal_distance',
            'get_two_circles',
             'DiscreteActionMapper',
-            'VisualRecorder',
-            'TrajectoryVisualizer']
+             'VisualRecorder',
+             'TrajectoryVisualizer',
+             'LossPlotter']
