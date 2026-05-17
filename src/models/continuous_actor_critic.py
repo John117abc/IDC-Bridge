@@ -17,6 +17,11 @@ class ContinuousActor(nn.Module):
             nn.Linear(hidden_dim, 2),
             nn.Tanh()
         )
+        # 加速度通道给轻微正偏置: tanh(0.2)≈0.197 → a≈0.3 m/s² 怠速蠕行
+        # 转向通道保持零偏置
+        nn.init.constant_(self.net[6].bias, 0.0)
+        self.net[6].bias.data[1] = 0.2
+
     def forward(self, x):
         return self.net(x)
 

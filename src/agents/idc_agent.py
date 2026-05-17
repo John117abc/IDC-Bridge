@@ -109,17 +109,24 @@ class DiscreteIDCAgent:
             # 转向映射：[-1,1] → [-0.4,0.4] rad
             delta_phy = norm_action[..., 0] * 0.4
 
-            # 加速度映射：线性插值 [-1,1] → [-3.0, 1.5]
-            a_phy = (norm_action[..., 1] + 1) / 2 * (1.5 - (-3.0)) + (-3.0)   # 范围 [-3.0, 1.5]
+            # 加速度映射：分段线性，norm=0 时输出 0（默认滑行），范围保持 [-3.0, 1.5]
+            a_phy = torch.where(
+                norm_action[..., 1] >= 0,
+                norm_action[..., 1] * 1.5,
+                norm_action[..., 1] * 3.0
+            )
 
             # 组合最终动作 [batch, max_agents, 2]
             action = torch.stack([a_phy, delta_phy], dim=-1)
 
-            # [DIAG] 前几个 world 的实际动作值
+            # [DIAG] 前几个 world 的实际动作值和 norm_action 原始输出
             if self.global_step % 10 == 0:
                 n_show = min(5, batch_size)
                 for i in range(n_show):
-                    logger.info(f'[DIAG-act] world_{i} acc={action[i,0,0].item():.3f} steer={action[i,0,1].item():.3f}')
+                    raw_steer = norm_action[i, 0, 0].item()  # tanh 前 [-1,1]
+                    raw_acc = norm_action[i, 0, 1].item()
+                    logger.info(f'[DIAG-act] world_{i} acc={action[i,0,0].item():.3f} steer={action[i,0,1].item():.3f} '
+                                f'| norm_steer={raw_steer:.4f} norm_acc={raw_acc:.4f}')
             return action
 
 
@@ -152,12 +159,12 @@ class DiscreteIDCAgent:
             s = self.f_pred_batch(s, u, w_i)
             if torch.isnan(s).any():
                 logger.warning(f'[NaN] f_pred state at rollout step {t}')
-            total_utility = total_utility + (self.gamma ** t) * l
+            total_utility = total_utility + (self.gamma ** t) * torch.clamp(l, -50.0, 50.0)
         if self.global_step % 50 == 0:
             tu = total_utility
             logger.info(f'[DIAG-critic] utility raw range=[{l_min_log:.2f}, {l_max_log:.2f}], '
                         f'target raw mean={tu.mean().item():.2f} min={tu.min().item():.2f} max={tu.max().item():.2f}')
-        return torch.clamp(total_utility, -1000.0, 1000.0)
+        return torch.clamp(total_utility, -5000.0, 5000.0)
 
     def batch_state_to_tensor(self, states):
         logger.debug(f'将状态对象列表转换为张量表示: batch_size={len(states)},第一个状态={states[0] if len(states) > 0 else "N/A"}')
@@ -286,7 +293,7 @@ class DiscreteIDCAgent:
             total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
             s = self.f_pred_batch(s, u, w_i)
 
-        total_cost = torch.clamp(total_cost, -100.0, 100.0)
+        total_cost = torch.clamp(total_cost, -500.0, 500.0)
 
         actor_loss = total_cost.mean()
 
@@ -374,7 +381,7 @@ class DiscreteIDCAgent:
         # 4 组距离: ego[2] × other[8,2] → [batch, 8, 2, 2]
         diff = ego_circles[:, None, :, None, :] - oth_circles[:, :, None, :, :]
         dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # [batch, 8, 2, 2]
-        logger.info(f'[DIAG-pos] ego=({ego[0,0].item():.2f},{ego[0,1].item():.2f}) '
+        logger.debug(f'[DIAG-pos] ego=({ego[0,0].item():.2f},{ego[0,1].item():.2f}) '
                     f'oth0=({others[0,0,0].item():.2f},{others[0,0,1].item():.2f}) '
                     f'min_dist={dist[0,:,:,:].min().item():.4f} max_dist={dist[0,:,:,:].max().item():.4f}')
         # 每辆周车取和最危险的一对圆碰撞，再跨所有周车求和

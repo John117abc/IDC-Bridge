@@ -40,7 +40,7 @@ class GPUDriveObservationBuilder:
         logger.debug(f'专家轨迹长度：{self.EXPERT_TRAJ_LEN}')
 
     def generate_candidate_paths(self, ego_indices, num_paths=3,
-                                  num_points=91, lane_width=3.75):
+                                   num_points=91, lane_width=3.75):
         """为每个 world 的 controlled agent 生成多条候选 Cubic Bezier 路径"""
         self.candidate_paths = {}
         self.num_candidate_paths = num_paths
@@ -53,7 +53,8 @@ class GPUDriveObservationBuilder:
             ep = self.expert_pos[w, a, -1].cpu().numpy()
             sh = float(self.expert_heading[w, a, 0].item())
             eh = float(self.expert_heading[w, a, -1].item())
-            spd = float(self.expert_vel[w, a].norm(dim=-1).mean().item())
+            # 专家时变速度（每步一个标量），红绿灯路口专家速度会降到 0
+            expert_spd = self.expert_vel[w, a].norm(dim=-1).cpu().numpy()
 
             paths = []
             offsets = [0.0]
@@ -62,13 +63,13 @@ class GPUDriveObservationBuilder:
 
             for offset in offsets:
                 path = self._make_bezier_path(
-                    sp, sh, ep, eh, offset, spd, num_points)
+                    sp, sh, ep, eh, offset, expert_spd, num_points)
                 paths.append(path)
 
             self.candidate_paths[w][a] = paths
 
     def _make_bezier_path(self, p0, h0, p3, h3,
-                           lateral_offset, speed, num_points):
+                           lateral_offset, expert_speeds, num_points):
         dx = p3[0] - p0[0]
         dy = p3[1] - p0[1]
         dist = float(np.hypot(dx, dy))
@@ -101,7 +102,9 @@ class GPUDriveObservationBuilder:
                                      bt[i + 1, 0] - bt[i, 0])
         headings[-1] = headings[-2]
 
-        speeds = np.full(num_points, speed, dtype=np.float32)
+        # 直接用专家的时变速度（第 i 步参考速度 = 专家在第 i 步的实际速度）
+        # 红绿灯路口专家速度降到 0，参考速度也会跟停
+        speeds = np.asarray(expert_speeds, dtype=np.float32)
         return {'pos': bt, 'heading': headings, 'speed': speeds}
 
     

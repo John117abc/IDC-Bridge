@@ -161,6 +161,33 @@ def train(args):
             logger.debug(f'状态构建完成，开始选择动作')
             # 创建批量动作
             actions = agent.select_action(states)  # [num_worlds, max_agents, action_dim]
+
+            # [DIAG] 第一步打印初始速度和对应动作
+            if step == 0:
+                state_tensor = agent.batch_state_to_tensor(states[:2])
+                with torch.no_grad():
+                    norm_action_raw = agent.actor(state_tensor)  # tanh 前 [-1,1]
+                    norm_2d = norm_action_raw.view(2, 1, 2)
+                for i in [0, 1]:
+                    init_speed = float(states[i][2])
+                    acc = actions[i, 0, 0].item()
+                    steer = actions[i, 0, 1].item()
+                    rsteer = norm_2d[i, 0, 0].item()
+                    racc = norm_2d[i, 0, 1].item()
+                    w = i
+                    a = ego_indices[w]
+                    pid = path_indices[w]
+                    ref_spd0 = builder.candidate_paths[w][a][pid]['speed'][0]
+                    # utility 分解
+                    ego = np.array([float(states[i][j]) for j in range(6)])
+                    ref = builder.get_ref_state_from_path(w, a, pid, ego[0], ego[1])
+                    pos_err = np.hypot(ego[0] - ref[0], ego[1] - ref[1])
+                    heading_err = ego[4] - ref[4]
+                    speed_err = np.hypot(ego[2], ego[3]) - ref[2]
+                    logger.info(f'[DIAG-init] world_{i} speed={init_speed:.2f} acc={acc:.3f} steer={steer:.3f} '
+                                f'norm_acc={racc:.4f} ref_spd={ref_spd0:.2f} '
+                                f'pos_err={pos_err:.2f} heading_err={heading_err:.3f} speed_err={speed_err:.2f}')
+
             actions = extend_action_to_3d(actions)
             logger.debug(f'动作选择完成，开始环境交互，动作形状: {actions.shape}')
             env.step_dynamics(actions)
@@ -227,7 +254,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=5)
     parser.add_argument('--save-freq', type=int, default=5)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
-    parser.add_argument('--load-model', type=bool, default=True)
+    parser.add_argument('--load-model', type=bool, default=False)
     parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260517/idc-waymo-v1.0_examples_122041_episode=20.pth")
     args = parser.parse_args()
     train(args)
