@@ -26,6 +26,8 @@ class GPUDriveObservationBuilder:
 
         # 步数计数器
         self.step_counter = {w: 0 for w in range(self.num_worlds)}
+        # 道路张量缓存（一集不变，避免 rollout 中重复 GPU→CPU 传输）
+        self._road_cache = None
 
         # ==========================================
         # 1. 初始化部分 (在类的 __init__ 或 reset 中)
@@ -67,6 +69,16 @@ class GPUDriveObservationBuilder:
                 paths.append(path)
 
             self.candidate_paths[w][a] = paths
+
+        # 诊断: 打印候选路径坐标范围，确认与 ego 坐标系对齐
+        for w in range(min(self.num_worlds, 3)):
+            a = ego_indices[w]
+            for pid, p in enumerate(self.candidate_paths[w][a]):
+                pos = p['pos']
+                logger.info(f'[PATH-RANGE] world_{w} path_{pid} '
+                            f'start=({pos[0,0]:.1f},{pos[0,1]:.1f}) end=({pos[-1,0]:.1f},{pos[-1,1]:.1f}) '
+                            f'len={np.hypot(pos[-1,0]-pos[0,0], pos[-1,1]-pos[0,1]):.1f}m '
+                            f'speed_start={p["speed"][0]:.2f} speed_end={p["speed"][-1]:.2f}')
 
     def _make_bezier_path(self, p0, h0, p3, h3,
                            lateral_offset, expert_speeds, num_points):
@@ -123,6 +135,10 @@ class GPUDriveObservationBuilder:
         
         # 如果以后需要模仿学习，可以顺便存下这个：
         # self.expert_actions = raw_traj[:, :, 6*T:16*T].reshape(W, A, T, 10)
+
+    def clear_cache(self):
+        """每集开始时调用，使道路缓存失效。"""
+        self._road_cache = None
 
     def reset_world_step(self, world_idx: int, step: int = 0):
         self.step_counter[world_idx] = step
@@ -199,6 +215,11 @@ class GPUDriveObservationBuilder:
                 w, aidx, pid, x, y)
             ref = np.array([rx, ry, rs, 0.0, rh, 0.0], dtype=np.float32)
             ref_err = self._calc_ref_error(ego, ref)
+
+            # 诊断大偏离: pos_err > 100m 时打印 ego/ref 坐标和路径索引
+            if abs(ref_err[0]) > 100.0:
+                logger.warning(f'[LARGE-ERR] world_{w} step={self.step_counter[w]} pos_err={ref_err[0]:.1f}m '
+                               f'ego=({x:.1f},{y:.1f}) ref=({rx:.1f},{ry:.1f}) path={pid}')
 
             state = np.concatenate([
                 ego,
@@ -427,7 +448,9 @@ class GPUDriveObservationBuilder:
         批量获取离自车最近的道路边界点，每步只拉一次 road tensor。
         返回 [batch, 2] tensor。
         """
-        road_tensor = self.sim.map_observation_tensor().to_torch().cpu().numpy()
+        if self._road_cache is None:
+            self._road_cache = self.sim.map_observation_tensor().to_torch().cpu().numpy()
+        road_tensor = self._road_cache
         TYPE_IDX = 6
         ROADLINE_TYPE = 1
 

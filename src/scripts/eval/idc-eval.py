@@ -121,6 +121,7 @@ def evaluate(args):
         obs = env.reset()
         for w in range(args.num_worlds):
             builder.reset_world_step(w, 0)
+        builder.clear_cache()
 
         viz_list = [TrajectoryVisualizer(builder, w, ego_indices[w])
                     for w in range(args.num_worlds)]

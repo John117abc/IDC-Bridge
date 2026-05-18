@@ -132,7 +132,7 @@ class PERBuffer:
         new_priorities: list/array of float, 长度与上次采样的 batch_size 相同
         """
         p_array = np.array(new_priorities, dtype=np.float64)
-        if len(np.unique(p_array)) > 1:
+        if len(np.unique(p_array)) >  1:
             logger.debug(f"经验缓冲区更新 update: {len(p_array)} priorities, unique values: {len(np.unique(p_array))}")
 
         if self.last_indices is None:

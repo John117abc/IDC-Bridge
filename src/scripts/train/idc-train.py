@@ -126,12 +126,16 @@ def train(args):
         obs = env.reset()
         for w in range(args.num_worlds):
             builder.reset_world_step(w, 0)
+        builder.clear_cache()
 
         viz_list = [TrajectoryVisualizer(builder, w, ego_indices[w])
                     for w in VIZ_WORLDS]
 
         for step in range(max_step):
-            logger.info(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
+            if step % 10 == 0:
+                logger.info(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
+            else:
+                logger.debug(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
 
             path_indices = [np.random.randint(builder.num_candidate_paths)
                            for _ in range(args.num_worlds)]
@@ -184,13 +188,22 @@ def train(args):
                     pos_err = np.hypot(ego[0] - ref[0], ego[1] - ref[1])
                     heading_err = ego[4] - ref[4]
                     speed_err = np.hypot(ego[2], ego[3]) - ref[2]
-                    logger.info(f'[DIAG-init] world_{i} speed={init_speed:.2f} acc={acc:.3f} steer={steer:.3f} '
+                    logger.debug(f'[DIAG-init] world_{i} speed={init_speed:.2f} acc={acc:.3f} steer={steer:.3f} '
                                 f'norm_acc={racc:.4f} ref_spd={ref_spd0:.2f} '
                                 f'pos_err={pos_err:.2f} heading_err={heading_err:.3f} speed_err={speed_err:.2f}')
 
             actions = extend_action_to_3d(actions)
             logger.debug(f'动作选择完成，开始环境交互，动作形状: {actions.shape}')
             env.step_dynamics(actions)
+
+            # 检测极端位置 teleport (15575m级跳变)
+            if step % 5 == 0:
+                abs_np = builder.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+                for w in range(args.num_worlds):
+                    a = ego_indices[w]
+                    x, y = float(abs_np[w, a, 0]), float(abs_np[w, a, 1])
+                    if abs(x) > 1e5 or abs(y) > 1e5:
+                        logger.warning(f'[TELEPORT] world_{w} step={step} x={x:.1f} y={y:.1f}')
 
             logger.debug(f'环境交互完成，开始更新智能体')
             # 更新参数
@@ -245,7 +258,7 @@ if __name__ == "__main__":
     parser.add_argument('--horizon', type=int, default=25)
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--hidden-dim', type=int, default=256)
-    parser.add_argument('--lr-actor', type=float, default=1e-5)
+    parser.add_argument('--lr-actor', type=float, default=3e-5)
     parser.add_argument('--lr-critic', type=float, default=3e-4)
     parser.add_argument('--init-penalty', type=float, default=1.0)
     parser.add_argument('--max-penalty', type=float, default=100.0)
