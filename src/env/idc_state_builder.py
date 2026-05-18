@@ -4,7 +4,7 @@ from typing import List, Dict, Tuple, Optional
 import torch
 
 from utils import get_logger
-logger = get_logger('per_buffer')
+logger = get_logger('idc_state_builder')
 
 
 class GPUDriveObservationBuilder:
@@ -207,7 +207,7 @@ class GPUDriveObservationBuilder:
             others_list.sort(key=lambda t: t[0])
             others = np.array([d[1] for d in others_list[:num_other_vehicles]], dtype=np.float32)
             if others.shape[0] < num_other_vehicles:
-                pad = np.zeros((num_other_vehicles - others.shape[0], 4), dtype=np.float32)
+                pad = np.full((num_other_vehicles - others.shape[0], 4), 1e6, dtype=np.float32)
                 others = np.vstack([others, pad]) if others.shape[0] > 0 else pad
 
             pid = path_indices[w] if path_indices is not None else 0
@@ -218,7 +218,7 @@ class GPUDriveObservationBuilder:
 
             # 诊断大偏离: pos_err > 100m 时打印 ego/ref 坐标和路径索引
             if abs(ref_err[0]) > 100.0:
-                logger.warning(f'[LARGE-ERR] world_{w} step={self.step_counter[w]} pos_err={ref_err[0]:.1f}m '
+                logger.debug(f'[LARGE-ERR] world_{w} step={self.step_counter[w]} pos_err={ref_err[0]:.1f}m '
                                f'ego=({x:.1f},{y:.1f}) ref=({rx:.1f},{ry:.1f}) path={pid}')
 
             state = np.concatenate([

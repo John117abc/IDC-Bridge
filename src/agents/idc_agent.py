@@ -53,7 +53,7 @@ class DiscreteIDCAgent:
         # IDC 成本权重
         self.pos_err_weight = 0.2
         self.speed_err_weight = 0.01
-        self.heading_err_weight = 0.3
+        self.heading_err_weight = 0.6
         self.steer_cost_weight = 0.1
         self.acc_cost_weight = 0.005
 
@@ -67,7 +67,7 @@ class DiscreteIDCAgent:
 
         # 安全距离
         self.D_veh_safe = 2.0    # 两车圆心威胁距离: 并排邻车道 ~3.75m 不受罚
-        self.D_road_safe = 1.0
+        self.D_road_safe = 5.0
         self.HALF_L = 2.25
         self.HALF_W = 1.0
 
@@ -165,12 +165,12 @@ class DiscreteIDCAgent:
             s = self.f_pred_batch(s, u, w_i, p_i)
             if torch.isnan(s).any():
                 logger.warning(f'[NaN] f_pred state at rollout step {t}')
-            total_utility = total_utility + (self.gamma ** t) * torch.clamp(l, -10.0, 10.0)
+            total_utility = total_utility + (self.gamma ** t) * torch.clamp(l, -50.0, 50.0)
         if self.global_step % 50 == 0:
             tu = total_utility
             logger.debug(f'[DIAG-critic] utility raw range=[{l_min_log:.2f}, {l_max_log:.2f}], '
                         f'target raw mean={tu.mean().item():.2f} min={tu.min().item():.2f} max={tu.max().item():.2f}')
-        return torch.clamp(total_utility, -250.0, 250.0)
+        return torch.clamp(total_utility, -500.0, 500.0)
 
     def batch_state_to_tensor(self, states):
         logger.debug(f'将状态对象列表转换为张量表示: batch_size={len(states)},第一个状态={states[0] if len(states) > 0 else "N/A"}')
@@ -205,7 +205,7 @@ class DiscreteIDCAgent:
         ref_x, ref_y = refs[:, 0], refs[:, 1]
 
         # 3. 以参考点为锚点 clamp 位置：防止推演异常跳变，不影响正常跟踪
-        max_tracking_dist = 50.0  # 25步推演正常位移 < 37m，50m 预留裕量
+        max_tracking_dist = 150.0  # 25步推演正常位移 < 37m，150m 保留梯度链路
         x_next = torch.clamp(x_raw, ref_x - max_tracking_dist, ref_x + max_tracking_dist)
         y_next = torch.clamp(y_raw, ref_y - max_tracking_dist, ref_y + max_tracking_dist)
 
@@ -241,7 +241,7 @@ class DiscreteIDCAgent:
         if (delta_p.abs() > 100.0).any():
             big = (delta_p.abs() > 100.0).nonzero(as_tuple=True)[0].tolist()
             for i in big[:3]:
-                logger.warning(f'[FPRED-ERR] sample_{i} delta_p={delta_p[i].item():.1f}m '
+                logger.debug(f'[FPRED-ERR] sample_{i} delta_p={delta_p[i].item():.1f}m '
                                f'ego=({x_next[i].item():.1f},{y_next[i].item():.1f}) '
                                f'ref=({ref_x[i].item():.1f},{ref_y[i].item():.1f})')
 
@@ -273,17 +273,17 @@ class DiscreteIDCAgent:
         logger.debug(f'更新 Critic: states batch size={states.shape[0]}')
         with torch.no_grad():
             targets = self.compute_rollout_target(states, world_indices, path_indices).detach()
-        logger.info(f"[DEBUG] target stats: min={targets.min().item():.2f}, max={targets.max().item():.2f}, mean={targets.mean().item():.2f}, has_nan={torch.isnan(targets).any()}")
+        logger.debug(f"[DEBUG] target stats: min={targets.min().item():.2f}, max={targets.max().item():.2f}, mean={targets.mean().item():.2f}, has_nan={torch.isnan(targets).any()}")
 
         if torch.isnan(targets).any():
             logger.warning(f'Target 包含 NaN，跳过本次 Critic 更新')
             return float('nan')
 
         values = self.critic(states)
-        logger.info(f"[DEBUG] value stats: min={values.min().item():.2f}, max={values.max().item():.2f}, mean={values.mean().item():.2f}, has_nan={torch.isnan(values).any()}")
+        logger.debug(f"[DEBUG] value stats: min={values.min().item():.2f}, max={values.max().item():.2f}, mean={values.mean().item():.2f}, has_nan={torch.isnan(values).any()}")
 
         loss = F.mse_loss(values, targets.unsqueeze(1))
-        logger.info(f"[DEBUG] loss = {loss.item():.4f}")
+        logger.debug(f"[DEBUG] loss = {loss.item():.4f}")
 
         self.critic_optimizer.zero_grad()
         loss.backward()
@@ -310,11 +310,11 @@ class DiscreteIDCAgent:
             if t == 0:
                 logger.debug(f'[DIAG-pen] raw penalty min={p.min().item():.2f} max={p.max().item():.2f} '
                             f'mean={p.mean().item():.2f}  (rho={self.rho:.4f})')
-            l = torch.clamp(l, -10.0, 10.0)
+            l = torch.clamp(l, -50.0, 50.0)
             total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
             s = self.f_pred_batch(s, u, w_i, p_i)
 
-        total_cost = torch.clamp(total_cost, -100.0, 100.0)
+        total_cost = torch.clamp(total_cost, -500.0, 500.0)
 
         actor_loss = total_cost.mean()
 
@@ -421,7 +421,7 @@ class DiscreteIDCAgent:
             w_i, ego[:, 0], ego[:, 1])
         edge_dist = torch.sqrt((edge_pts[:, 0] - ego[:, 0]) ** 2
                               + (edge_pts[:, 1] - ego[:, 1]) ** 2 + 1e-8)
-        road_violation = F.relu(self.D_road_safe - edge_dist).pow(2)
+        road_violation = F.relu(edge_dist - self.D_road_safe).pow(2)
 
         return veh_violation + road_violation
     

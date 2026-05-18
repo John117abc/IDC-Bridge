@@ -177,9 +177,133 @@ Penalty 不 clamp（保持碰撞梯度），只靠总计 clamp 兜底。
 | `D_veh_safe` | 2.0 | 双圆心碰撞阈值 |
 | `D_road_safe` | 1.0 | 道路边界阈值 |
 | `pim_interval` | 30 | 多少步PEV后做一次PIM |
-| `amplifier_c` | 1.015~1.02 | ρ每次PIM放大倍率 |
-| `lr_actor` | 1e-5 | |
+| `amplifier_c` | 1.015 | ρ每次PIM放大倍率 |
+| `lr_actor` | 3e-5 | |
 | `lr_critic` | 3e-4 | |
 | `horizon` | 25 | 推演步数 |
 | `batch_size` | 256 | |
 | `num_worlds` | 200 | |
+| `noise_std` | 0.2 → 0.05 | 探索噪声，PIM 后 ×0.95 衰减 |
+| `pos_err_weight` | 0.2 | 位置误差权重 |
+| `heading_err_weight` | 0.3 | 朝向误差权重 |
+
+---
+
+## 10. Critic value 爆炸到 4300+
+
+**现象**：训练中途 Critic value max 从 115 跳到 4296，loss 从 4000 跳到 19.8 万，之后持续震荡在 2400-4330，无法恢复。
+
+**根因**：Critic 只有裸 `Linear+ELU`，无 LayerNorm。当异常世界状态（ego 坐标 15575m）进入时，随机权重 × 大输入 = 爆炸输出。MSE loss 巨大梯度破坏 Critic 权重，级联污染后续所有世界。
+
+```python
+# 改前（裸奔）
+class ContinuousCritic(nn.Module):
+    def __init__(self, state_dim, hidden_dim=256, output_dim=1):
+        self.l1 = nn.Linear(state_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.l3 = nn.Linear(hidden_dim, output_dim)
+```
+
+**修复**：Critic 改为 `Sequential(LN+ELU)×2 + Linear`，与 Actor 架构对齐。
+
+```python
+# 改后（受保护）
+class ContinuousCritic(nn.Module):
+    def __init__(self, state_dim, hidden_dim=256, output_dim=1):
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+```
+
+异常输入被 LayerNorm 归一化后，value max 从 4300 降到 ~24。
+
+---
+
+## 11. 15575m 误差来源诊断
+
+**现象**：`[DIAG-ref] max pos_err=15575m` 反复出现在不同 world。`[LARGE-ERR]` 显示 `ego=(-11000,-11000)`。
+
+**诊断过程**：加了 5 种分层诊断标签：
+- `[PATH-RANGE]`：训练开始时打印路径起点/终点坐标，确认坐标系
+- `[LARGE-ERR]`：`get_idc_observations_batch` 中 pos_err > 100m 时打印 ego/ref
+- `[FPRED-CLAMP]`：推演中位移 > 1m（后被取代）
+- `[FPRED-ERR]`：推演中 delta_p > 100m
+- `[TELEPORT]`：环境步后 abs(x\|y) > 1e5
+
+**结论**：GPUDrive 使用本地坐标系（非 UTM），所有正常坐标在 ±100 范围内。约 2 个世界（world_40、world_105）的 ego 固定为 `(-11000, -11000)`，是特定数据的异常标记值，不是推演漂移产生。占比 1%，影响可忽略。
+
+---
+
+## 12. f_pred_batch clamp 策略演进
+
+| 版本 | 锚点 | 行为 | 问题 |
+|------|------|------|------|
+| v1 | 相对上一步 `prev_x ± 10m` | 每步允许 10m 位移 | 25 步累积可达 250m，无法拦截跨步污染 |
+| v2 | 相对参考路径 `ref_x ± 50m` | 以当前步参考路径为锚点 | 异常从第一步就被截断 |
+
+关键设计：
+- ref 查表必须在 clamp 之前（需要 ref 作为锚点坐标）
+- clamp 后用 clamped 坐标计算 delta_p
+- 窗口外（\|raw - ref\| > 50m）grad=0，不污染 Actor 梯度
+- 50m 窗口：25 步正常推演最大位移 < 37m，50m 预留裕量
+
+```python
+# v2 核心逻辑
+refs = get_ref_states_batch(w_i, x_raw.detach(), y_raw.detach(), ...)
+ref_x, ref_y = refs[:, 0], refs[:, 1]
+x_next = torch.clamp(x_raw, ref_x - 50, ref_x + 50)
+y_next = torch.clamp(y_raw, ref_y - 50, ref_y + 50)
+```
+
+---
+
+## 13. 无效世界过滤（已回滚）
+
+**误判**：尝试用 `abs(path_start) < 5000` 过滤无效世界，但 GPUDrive 所有世界都是本地坐标（±100 内），导致 200/200 世界全被过滤。
+
+**回滚**：删除 bad_worlds 检测和过滤逻辑，恢复全部世界参与训练。仅保留 `[LARGE-ERR]` 诊断。
+
+**教训**：不了解坐标系时不要做硬过滤。GPUDrive 使用本地（relative）坐标，不是 UTM 绝对坐标。
+
+---
+
+## 14. Actor 转向策略锁定在右转
+
+**现象**：训练 100+ 轮后 Critic loss 已收敛（5-20），但 20 个世界的 `norm_steer` 几乎全为负（右转），车在直道上也持续右偏。
+
+**根因**：探索噪声 `std=0.05` 太小（转向噪声仅 `0.02 rad`），Actor 永远采样不到左转样本 → 梯度只反馈"右转还行" → 策略陷入局部最优。
+
+**修复**：
+| 改动 | 当前 | 改为 |
+|------|------|------|
+| 噪声 std | `0.05` 硬编码 | `self.noise_std = 0.2`，PIM 后衰减 `×0.95`，下限 `0.05` |
+| 噪声变量 | 无 | `self.noise_std` / `self.noise_decay_rate` / `self.noise_std_min` |
+| Actor 学习率 | `1e-5` | `3e-5` |
+
+```python
+# select_action
+noise = torch.normal(0, self.noise_std, ...)
+
+# update_actor 末尾
+self.noise_std = max(self.noise_std_min, self.noise_std * self.noise_decay_rate)
+```
+
+---
+
+## 15. 日志降噪
+
+| 内容 | 原级别 | 现级别 | 频率 |
+|------|--------|--------|------|
+| `[DEBUG] target/value/loss stats` | INFO | DEBUG | 每步 |
+| `回合 X/Y, 步数 Z/91` | INFO | INFO(10步)/DEBUG | 每步 |
+| `[FPRED-CLAMP]` | 无 | WARNING | 异常时 |
+| `[FPRED-ERR]` | 无 | WARNING | 异常时 |
+| `[LARGE-ERR]` | 无 | WARNING | 异常时 |
+| `[PATH-RANGE]` | 无 | INFO | 训练开始 |
+| `[DIAG-act/ref/init/critic/pen]` | INFO | INFO | 保持
