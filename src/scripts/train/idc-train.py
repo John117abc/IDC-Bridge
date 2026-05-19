@@ -114,8 +114,6 @@ def train(args):
 
     logger.info(f'训练开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={max_step}')
 
-    # 可视化：每 epoch 为前 10 个 world 画轨迹对比图
-    VIZ_WORLDS = list(range(min(10, args.num_worlds)))
     viz_dir = os.path.join(args.file_dir, 'traj_plots')
     os.makedirs(viz_dir, exist_ok=True)
 
@@ -146,6 +144,8 @@ def train(args):
             builder.reset_world_step(w, 0)
         builder.clear_cache()
 
+        # 可视化：每 epoch 从当前未拉黑世界中选前 10 个画轨迹
+        VIZ_WORLDS = [w for w in range(args.num_worlds) if w not in bad_worlds][:10]
         viz_list = [TrajectoryVisualizer(builder, w, ego_indices[w])
                     for w in VIZ_WORLDS]
 
@@ -200,6 +200,8 @@ def train(args):
             # 记录可视化世界的自车位置
             positions = builder.get_ego_positions_batch(ego_indices)
             for i, w in enumerate(VIZ_WORLDS):
+                if w in bad_worlds:
+                    continue
                 viz_list[i].record_step(positions[w, 0], positions[w, 1])
 
             logger.debug(f'状态构建完成，开始选择动作')
@@ -316,6 +318,6 @@ if __name__ == "__main__":
     parser.add_argument('--save-freq', type=int, default=5)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
     parser.add_argument('--load-model', type=bool, default=True)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260519/idc-waymo-v1.0_examples_133552_episode=15.pth")
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260519/idc-waymo-v1.0_examples_150035_episode=50.pth")
     args = parser.parse_args()
     train(args)

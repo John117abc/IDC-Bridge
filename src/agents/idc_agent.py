@@ -54,7 +54,7 @@ class DiscreteIDCAgent:
 
         # IDC 成本权重
         self.pos_err_weight = 0.3
-        self.speed_err_weight = 0.01
+        self.speed_err_weight = 0.04
         self.heading_err_weight = 0.3
         self.steer_cost_weight = 0.3
         self.acc_cost_weight = 0.005
