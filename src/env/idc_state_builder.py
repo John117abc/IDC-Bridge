@@ -207,8 +207,12 @@ class GPUDriveObservationBuilder:
             others_list.sort(key=lambda t: t[0])
             others = np.array([d[1] for d in others_list[:num_other_vehicles]], dtype=np.float32)
             if others.shape[0] < num_other_vehicles:
-                pad = np.full((num_other_vehicles - others.shape[0], 4), 1e6, dtype=np.float32)
+                n_pad = num_other_vehicles - others.shape[0]
+                pad = np.zeros((n_pad, 4), dtype=np.float32)
                 others = np.vstack([others, pad]) if others.shape[0] > 0 else pad
+            n_real = min(others.shape[0], num_other_vehicles)
+            validity = np.zeros(num_other_vehicles, dtype=np.float32)
+            validity[:n_real] = 1.0  # 前 n_real 个是真实车
 
             pid = path_indices[w] if path_indices is not None else 0
             _, (rx, ry, rh, rs) = self._nearest_on_candidate(
@@ -224,6 +228,7 @@ class GPUDriveObservationBuilder:
             state = np.concatenate([
                 ego,
                 others.flatten().astype(np.float32),
+                validity.astype(np.float32),
                 ref_err.astype(np.float32)
             ])
             states.append(state)

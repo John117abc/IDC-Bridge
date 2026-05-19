@@ -109,6 +109,7 @@ def train(args):
         logger.info(f'正在加载模型: {args.model_path}')
         agent.load(args.model_path)
         current_epoch = agent.globe_eps
+        epochs -= current_epoch
 
     logger.info(f'训练开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={max_step}')
 
@@ -147,7 +148,7 @@ def train(args):
                 max_dp, max_w = 0.0, 0
                 for w in range(args.num_worlds):
                     s = states[w]
-                    ref_start = agent.DIM_EGO + agent.DIM_OTHERS
+                    ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
                     dp, dphi, dv = abs(s[ref_start]), abs(s[ref_start+1]), abs(s[ref_start+2])
                     if dp > max_dp:
                         max_dp, max_w = dp, w
@@ -267,7 +268,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=5)
     parser.add_argument('--save-freq', type=int, default=5)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
-    parser.add_argument('--load-model', type=bool, default=False)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260518/idc-waymo-v1.0_examples_125123_episode=115.pth")
+    parser.add_argument('--load-model', type=bool, default=True)
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260518/idc-waymo-v1.0_examples_153802_episode=65.pth")
     args = parser.parse_args()
     train(args)

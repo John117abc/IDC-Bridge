@@ -32,8 +32,9 @@ class DiscreteIDCAgent:
         # IDC 维度定义
         self.DIM_EGO = 6                  # [x, y, v_lon, v_lat, phi, omega] (车体坐标系)
         self.DIM_OTHERS = 32               # 8 车 × 4 (x, y, phi, v_lon)
+        self.DIM_VALIDITY = 8             # 8 车 validity mask: 1=真实车 0=padding
         self.DIM_REF_ERROR = 3            # [delta_p, delta_phi, delta_v]
-        self.TOTAL_STATE_DIM = self.DIM_EGO + self.DIM_OTHERS + self.DIM_REF_ERROR
+        self.TOTAL_STATE_DIM = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR
         self.DIM_ROAD = 80
 
         # 超参
@@ -67,7 +68,7 @@ class DiscreteIDCAgent:
 
         # 安全距离
         self.D_veh_safe = 2.0    # 两车圆心威胁距离: 并排邻车道 ~3.75m 不受罚
-        self.D_road_safe = 5.0
+        self.D_road_safe = 2.0
         self.HALF_L = 2.25
         self.HALF_W = 1.0
 
@@ -81,9 +82,9 @@ class DiscreteIDCAgent:
 
         # 回合数
         # 探索噪声
-        self.noise_std = 0.2
-        self.noise_decay_rate = 0.95
-        self.noise_std_min = 0.05
+        self.noise_std = 0.15
+        self.noise_decay_rate = 0.98
+        self.noise_std_min = 0.03
 
         # 回合数
         self.globe_eps = 0
@@ -170,7 +171,7 @@ class DiscreteIDCAgent:
             tu = total_utility
             logger.debug(f'[DIAG-critic] utility raw range=[{l_min_log:.2f}, {l_max_log:.2f}], '
                         f'target raw mean={tu.mean().item():.2f} min={tu.min().item():.2f} max={tu.max().item():.2f}')
-        return torch.clamp(total_utility, -500.0, 500.0)
+        return total_utility
 
     def batch_state_to_tensor(self, states):
         logger.debug(f'将状态对象列表转换为张量表示: batch_size={len(states)},第一个状态={states[0] if len(states) > 0 else "N/A"}')
@@ -179,10 +180,11 @@ class DiscreteIDCAgent:
         
         ego_tensors = torch.stack([s[:self.DIM_EGO] for s in states_tensors]).to(self.device)  # [batch, DIM_EGO]
         others_tensors = torch.stack([s[self.DIM_EGO:self.DIM_EGO+self.DIM_OTHERS] for s in states_tensors]).to(self.device)
-        ref_error_tensors = torch.stack([s[self.DIM_EGO+self.DIM_OTHERS:self.DIM_EGO+self.DIM_OTHERS+self.DIM_REF_ERROR] for s in states_tensors]).to(self.device)
+        validity_tensors = torch.stack([s[self.DIM_EGO+self.DIM_OTHERS:self.DIM_EGO+self.DIM_OTHERS+self.DIM_VALIDITY] for s in states_tensors]).to(self.device)
+        ref_error_tensors = torch.stack([s[self.DIM_EGO+self.DIM_OTHERS+self.DIM_VALIDITY:self.DIM_EGO+self.DIM_OTHERS+self.DIM_VALIDITY+self.DIM_REF_ERROR] for s in states_tensors]).to(self.device)
         
         others_flat = others_tensors.view(len(states), -1)
-        state_tensor = torch.cat([ego_tensors, others_flat, ref_error_tensors], dim=-1)
+        state_tensor = torch.cat([ego_tensors, others_flat, validity_tensors, ref_error_tensors], dim=-1)
         return state_tensor
     
     def f_pred_batch(self, states, actions, w_i, p_i=None):
@@ -194,6 +196,9 @@ class DiscreteIDCAgent:
         """
         ego_tensors = states[:, :self.DIM_EGO]
         others_tensors = states[:, self.DIM_EGO:self.DIM_EGO+self.DIM_OTHERS]
+        # 提取 validity mask 并在推演中保持不变
+        val_start = self.DIM_EGO + self.DIM_OTHERS
+        validity_tensors = states[:, val_start:val_start + self.DIM_VALIDITY]
         
         # 1. 动力学推演
         ego_next = self.dynamics(ego_tensors[...,:6], actions)
@@ -256,17 +261,16 @@ class DiscreteIDCAgent:
         # 组合并返回最终状态
         next_states = []
         for i in range(len(states)):
-            next_s = self.tensor_to_state_tensor(ego_next_formatted[i], others_next[i], ref_error_tensors[i])
+            next_s = self.tensor_to_state_tensor(ego_next_formatted[i], others_next[i], validity_tensors[i], ref_error_tensors[i])
             next_states.append(next_s)
             
         return torch.stack(next_states)
     
-    def tensor_to_state_tensor(self, ego_tensor, others_tensor, ref_error_tensor):
+    def tensor_to_state_tensor(self, ego_tensor, others_tensor, validity_tensor, ref_error_tensor):
         """
-        将 ego_tensor 和 others_tensor ref_error_tensor 转成网络能接收的tensor格式的状态对象
-        ego_next shape=torch.Size([10, 4]), others_next shape=torch.Size([10, 8, 4]), ref_error shape=torch.Size([10, 3])
+        将 ego_tensor、others_tensor、validity_tensor、ref_error_tensor 转成网络状态
         """
-        return torch.cat([ego_tensor, others_tensor.view(-1), ref_error_tensor], dim=-1)  # [TOTAL_STATE_DIM]
+        return torch.cat([ego_tensor, others_tensor.view(-1), validity_tensor, ref_error_tensor], dim=-1)
 
 
     def update_critic(self, states, world_indices, path_indices=None):
@@ -313,8 +317,6 @@ class DiscreteIDCAgent:
             l = torch.clamp(l, -50.0, 50.0)
             total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
             s = self.f_pred_batch(s, u, w_i, p_i)
-
-        total_cost = torch.clamp(total_cost, -500.0, 500.0)
 
         actor_loss = total_cost.mean()
 
@@ -395,6 +397,8 @@ class DiscreteIDCAgent:
         """
         ego = s[:, :self.DIM_EGO]
         others = s[:, self.DIM_EGO:self.DIM_EGO + self.DIM_OTHERS].view(-1, 8, 4)
+        val_start = self.DIM_EGO + self.DIM_OTHERS
+        validity = s[:, val_start:val_start + self.DIM_VALIDITY]  # [batch, 8]
 
         # 自车双圆心 [batch, 2, 2]
         ego_front, ego_rear = self._two_circle_centers(ego[:, 0], ego[:, 1], ego[:, 4])
@@ -408,20 +412,17 @@ class DiscreteIDCAgent:
         # 4 组距离: ego[2] × other[8,2] → [batch, 8, 2, 2]
         diff = ego_circles[:, None, :, None, :] - oth_circles[:, :, None, :, :]
         dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # [batch, 8, 2, 2]
-        if self.global_step % 50 == 0:
-            logger.debug(f'[DIAG-pos] ego=({ego[0,0].item():.2f},{ego[0,1].item():.2f}) '
-                        f'oth0=({others[0,0,0].item():.2f},{others[0,0,1].item():.2f}) '
-                        f'min_dist={dist[0,:,:,:].min().item():.4f} max_dist={dist[0,:,:,:].max().item():.4f}')
-        # 每辆周车取和最危险的一对圆碰撞，再跨所有周车求和
+        # 每辆周车取最危险的一对圆碰撞，用 validity mask 屏蔽 padding 车
         pair_pen = F.relu(self.D_veh_safe - dist).pow(2)          # [batch, 8, 2, 2]
-        veh_violation = pair_pen.flatten(2).max(dim=2).values.sum(dim=1)  # [batch]
+        per_veh_max = pair_pen.flatten(2).max(dim=2).values       # [batch, 8]
+        veh_violation = (per_veh_max * validity).sum(dim=1)       # [batch] — padding 车不计入
 
-        # 道路边界惩罚
+        # 道路边界惩罚：线性，始终有梯度拉回道路
         edge_pts = self.state_builder.get_road_edges_batch(
             w_i, ego[:, 0], ego[:, 1])
         edge_dist = torch.sqrt((edge_pts[:, 0] - ego[:, 0]) ** 2
                               + (edge_pts[:, 1] - ego[:, 1]) ** 2 + 1e-8)
-        road_violation = F.relu(edge_dist - self.D_road_safe).pow(2)
+        road_violation = F.relu(edge_dist - self.D_road_safe)  # 线性，不平方
 
         return veh_violation + road_violation
     
