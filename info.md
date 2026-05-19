@@ -335,22 +335,168 @@ self.noise_std = max(self.noise_std_min, self.noise_std * self.noise_decay_rate)
 
 ---
 
-## 日志诊断体系
+## 17. Actor 输出通道在 rollout 中颠倒（致命 bug）
 
-| 诊断标签 | 位置 | 级别 | 触发条件 |
-|----------|------|------|----------|
-| `[PATH-RANGE]` | `generate_candidate_paths` | INFO | 训练开始 |
-| `[DIAG-init]` | `idc-train.py` | INFO | 每 epoch step 0 |
-| `[DIAG-act]` | `select_action` | INFO | 每 10 步 |
-| `[DIAG-ref]` | `idc-train.py` | INFO | 每 5 步 |
-| `[DIAG-critic]` | `compute_rollout_target` | INFO | 每 50 步 |
-| `[DIAG-pen]` | `update_actor` | INFO | 每次 PIM |
-| `[FPRED-CLAMP]` | `f_pred_batch` | WARNING | clamp 触发（\|raw - clamped\| > 1m） |
-| `[FPRED-ERR]` | `f_pred_batch` | WARNING | delta_p > 100m |
-| `[LARGE-ERR]` | `get_idc_observations_batch` | **DEBUG** | pos_err > 100m |
-| `[TELEPORT]` | `idc-train.py` | WARNING | abs(x\|y) > 1e5 |
-| `[DEBUG] target/value/loss stats` | `update_critic` | DEBUG | 每步 |
-| `回合 X/Y, 步数 Z/91` | `idc-train.py` | INFO(10步)/DEBUG | 每步 |
+**现象**：修复所有已知问题后，tracking-only 模式下直线车道仍无法跟踪，车持续画圆，pos_err 15500m+。
+
+**根因**：两个独立问题叠加：
+
+### 17a. 通道语义颠倒
+
+Actor 输出为 `[steer_raw, acc_raw]`（通道 0=转向，通道 1=加速度）。但 `KinematicBicycleModel.forward` 内部按 `action[0]=acc, action[1]=steer` 读取。rollout 直接喂 raw Actor 输出，不做任何通道重排 → 加速通道被当转向，转向通道被当加速。
+
+加速 bias=0.05 → 动力学把它当 steering=0.05 rad → **车持续画圆**。
+
+### 17b. raw tanh 未映射到物理量
+
+`select_action` 把 `[-1,1]` 映射到 `acc [-3.0,1.5] m/s², steer [-0.4,0.4] rad`，但 f_pred_batch 直接喂 raw tanh，rollout 动力学用的物理尺度完全错误。
+
+### 修复
+
+在 `f_pred_batch` 动力学调用前加 4 行，与 `select_action` 保持一致：
+
+```python
+delta_phy = actions[..., 0] * 0.4
+a_phy = torch.where(actions[..., 1] >= 0,
+                    actions[..., 1] * 1.5,
+                    actions[..., 1] * 3.0)
+actions_phy = torch.stack([a_phy, delta_phy], dim=-1)
+ego_next = self.dynamics(ego, actions_phy)
+```
+
+**必须删旧 checkpoint 重训。**
+
+---
+
+## 18. utility_batch 算在动作之前而非之后（致命 bug）
+
+**现象**：通道 bug 修好后，tracking-only 仍不收敛，pos_err 100-130m 缓慢上升。
+
+**根因**：`update_actor` 和 `compute_rollout_target` 循环中 utility 在 f_pred **之前**计算：
+
+```python
+# 原顺序（错误）
+for t in range(horizon):
+    u = actor(s)
+    l = utility_batch(s, u, ...)   # s 是动作前的状态 — pos_err 等不依赖 u！
+    s = f_pred_batch(s, u, ...)
+```
+
+`pos_err`, `heading_err`, `speed_err` 全从 s 读取，与 u 无关。仅 `steer_cost` + `acc_cost`（权重 0.1, 0.005）依赖 u。Actor 唯一梯度信号 = "输出 0 以最小化控制代价"。
+
+### 修复
+
+翻转顺序，utility 计算在 f_pred **之后**：
+
+```python
+# 修正后
+for t in range(horizon):
+    u = actor(s)
+    s = f_pred_batch(s, u, ...)    # 先推演
+    l = utility_batch(s, u, ...)    # 在新状态上算跟踪误差
+```
+
+梯度链路：`Actor 参数 → u → dynamics → s_next → tracking_err → loss`。
+
+---
+
+## 19. 梯度截断链（3 个 clamp 同步修复）
+
+**现象**：修复 issue 17+18 后 pos_err 仍在 100-130m 停滞。
+
+**全量审计发现**：
+
+| # | 位置 | 原值 | 触发条件 | 影响 |
+|---|------|------|---------|------|
+| 19a | `update_actor` utility clamp | `[-50, 50]` | pos_err > 15.8m | 正常跟踪梯度截断 |
+| 19b | `f_pred_batch` 位置 clamp | `ref ± 40m` | rollout 偏离 ref >40m | 位置梯度截断 |
+| 19c | 动力学速度 clamp | `±30 m/s` | 极少触发 | 安全网保留 |
+
+### 修复
+
+- 19a：`clamp(l, -50, 50)` → `clamp(l, -5000, 5000)`
+- 19b：直接删除 — 坏 world 已由训练脚本外部过滤
+- 19c：保留 — `clip_grad_norm(max_norm=1.0)` 做终极梯度保护
+
+---
+
+## 20. GPUDrive 数据世界过滤体系
+
+**现象**：30-35% 世界存在坐标异常（ego=(−11000,−11000) 或参考路径坐标系错位），产生 15560m+ 误差。
+
+**根因**：GPUDrive 本地坐标框架 bug，非车辆物理运动产生。
+
+### 两级过滤
+
+**阶段 1 — 预训练路径坐标检测（一次）**：
+```python
+if np.max(np.abs(path_pos[:,0])) > 5000 or np.max(np.abs(path_pos[:,1])) > 5000:
+    bad_worlds.add(w)
+```
+
+**阶段 2 — 每步 ego 坐标检查**（在 `--no-sign`、DIAG-ref、buffer 插入之前）：
+```python
+if abs(states[w][0]) > 5000 or abs(states[w][1]) > 5000:
+    bad_worlds.add(w)
+```
+
+**数据流顺序**：`get_idc_observations → per-step filter → --no-sign → DIAG-ref → buffer`。异常数据永不流入 downstream。
+
+**诊断验证**：同步打印 `delta_p`，确认所有被过滤世界的 delta_p 均 >15000m，无误杀。
+
+---
+
+## 21. heading 过冲震荡（"画龙"）
+
+**现象**：跟踪开始工作但车大幅左右摆动跨多个车道，pos_err 随 step 累积增长（epoch 初 3.75m → 末 50m）。
+
+**根因**：`heading_err_weight=0.6` vs `steer_cost_weight=0.1`，梯度比 18:1。Actor 学到猛烈转向修正，动力学惯性延迟必然导致过冲震荡。
+
+### 修复
+
+| 参数 | 旧 | 新 | 原因 |
+|------|---|----|------|
+| `heading_err_weight` | 0.6 | **0.3** | heading 修正更温和 |
+| `steer_cost_weight` | 0.1 | **0.3** | 大转向代价更高 |
+
+梯度比从 18:1 → ≈2:1。
+
+---
+
+## 22. delta_phi 计算修正
+
+**现象**：车辆距参考点较远时，路径切线方向的 heading 参考缺乏意义。
+
+**修复**：`delta_phi = atan2(dy, dx) - ego_θ`（参考点方向 vs ego），而非 `ego_θ - ref_θ`（路径切线方向 vs ego）。在 `_calc_ref_error`、`f_pred_batch`、`utility_batch` 三处同步。
+
+---
+
+## 23. 道路 penalty 线性化
+
+**现象**：偏离道路后旧 penalty `relu(1.0 - edge_dist)²` 在 `edge_dist > 1m` 时输出 0 → 梯度死亡。
+
+**修复**：`road_violation = F.relu(edge_dist - D_road_safe)`，线性始终有梯度。`D_road_safe=2.0`。
+
+---
+
+## 24. DIM_VALIDITY + DIM_TEMPORAL
+
+- `DIM_VALIDITY`（8 维）：padding 车辆的 0/1 mask，防 LayerNorm 混淆真实特征
+- `DIM_TEMPORAL`（1 维）：step-counter 时序索引，替代空间最近点搜索（消除弯道跳变）
+
+状态维度：6+32+8+3+1 = **50 维**。
+
+---
+
+## 25. 噪声与学习率最终值
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `noise_std` | 0.1（tracking-only）/ 0.15（正常） | 探索噪声，PIM 后 x0.98 衰减至 min 0.03 |
+| `lr_actor` | 8e-5 | Adam |
+| `lr_critic` | 3e-4 | Adam |
+| `horizon` | 20 | rollout 步数 |
+| `dt` | 0.4 | 动力学步长（秒） |
 
 ---
 
@@ -358,27 +504,51 @@ self.noise_std = max(self.noise_std_min, self.noise_std * self.noise_decay_rate)
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
+| state dim | **50** | ego(6) + others(32) + validity(8) + ref_error(3) + temporal(1) |
 | `pos_err_weight` | 0.2 | 位置误差权重 |
 | `speed_err_weight` | 0.01 | 速度误差权重 |
-| `heading_err_weight` | **0.6** | 朝向误差权重 |
-| `steer_cost_weight` | 0.1 | 转向控制代价 |
+| `heading_err_weight` | **0.3** | 朝向误差权重 |
+| `steer_cost_weight` | **0.3** | 转向控制代价 |
 | `acc_cost_weight` | 0.005 | 加速控制代价 |
 | `D_veh_safe` | 2.0 | 双圆心碰撞阈值 |
-| `D_road_safe` | **5.0** | 道路安全距离 |
+| `D_road_safe` | 2.0 | 道路安全距离 |
 | `HALF_L` | 2.25 | 半车长 |
 | `HALF_W` | 1.0 | 半车宽 |
-| `noise_std` | 0.2 → 0.05（×0.97/PIM） | 探索噪声 |
-| `lr_actor` | **8e-5** | Actor 学习率 |
+| `noise_std` | 0.1（tracking）/ 0.15（正常）→ 0.03（×0.98/PIM） | 探索噪声 |
+| `lr_actor` | 8e-5 | Actor 学习率 |
 | `lr_critic` | 3e-4 | Critic 学习率 |
-| `dt` | 0.1 | 时间步长 |
-| `horizon` | **20** | 推演步数 |
+| `dt` | 0.4 | 时间步长（秒） |
+| `horizon` | 20 | 推演步数 |
 | `batch_size` | 256 | PEV/PIM 采样数 |
 | `num_worlds` | 200 | 环境世界数 |
-| `max_penalty` (ρ 上限) | **10** | 最大惩罚系数 |
-| `amplifier_c` | 1.015 | ρ 每次 PIM 的放大倍率 |
-| `pim_interval` | 30 | 多少次 PEV 后做一次 PIM |
-| `clamp` utility 单步 | **-50/+50** | 防止极端世界污染 |
-| `clamp` Actor total | **-500/+500** | 总计截断 |
-| `clamp` Critic total | **-500/+500** | 总计截断 |
-| `clamp` f_pred 窗口 | **±150m**（ref-anchored） | 推演位置约束 |
-| Actor acceleration bias | 0.05（tanh 后约 0.075 m/s²） | 防刹停 |
+| `max_penalty` (ρ 上限) | 10 | 最大惩罚系数 |
+| `amplifier_c` | 1.015 | ρ 每次 PIM 放大倍率 |
+| `pim_interval` | 30 | PEV 步数到 PIM |
+| `clamp` utility 单步 | **-5000/+5000** | 不截断正常跟踪梯度 |
+| `clamp` f_pred 位置 | **已删除** | 坏 world 由训练脚本过滤 |
+| 动力学速度 clamp | ±30 m/s | 安全网 |
+| Actor acc bias | 0.05（tanh 后约 0.075 m/s²） | 防刹停 |
+| f_pred 通道映射 | raw_steer×0.4→rad, raw_acc×1.5/3.0→m/s², stack([acc,steer]) | 与 select_action 一致 |
+| delta_phi | `atan2(dy, dx) - ego_θ` | 参考点方向 |
+| 道路 penalty | `relu(edge_dist - 2.0)` 线性 | 始终有梯度 |
+| 坏世界过滤 | 阶段1 预训练路径检查 + 每步 ego 检查 | 异常值不进 buffer |
+
+---
+
+## 日志诊断体系
+
+| 诊断标签 | 位置 | 级别 | 触发条件 |
+|----------|------|------|----------|
+| `[FILTER-path]` | 预训练过滤 | WARNING | 路径坐标 >5000 |
+| `[FILTER-ego]` | 每步过滤 | WARNING | ego 坐标 >5000，同步打印 delta_p |
+| `[DIAG-ref]` | 每 5 步 | INFO | 最大 pos_err（仅正常 world） |
+| `[DIAG-init]` | epoch step 0 | INFO | 初始速度、动作、参考速度 |
+| `[DIAG-act]` | select_action | INFO | 每 10 步动作值 |
+| `[DIAG-critic]` | compute_rollout_target | INFO | 每 50 步 utility 范围 |
+| `[DIAG-pen]` | update_actor | INFO | 每次 PIM step 0 penalty 范围 |
+| `[TRACK-DIAG]` | utility_batch | DEBUG | pos_err > 5m 时最差样本 |
+| `[FPRED-ERR]` | f_pred_batch | WARNING | delta_p > 100m |
+| `[LARGE-ERR]` | get_idc_observations_batch | DEBUG | pos_err > 100m |
+| `[TELEPORT]` | idc-train.py | WARNING | abs(x\|y) > 1e5 |
+| `[NaN]` | 各方法 | WARNING | tensor 含 NaN |
+| `回合 X/Y, 步数 Z/91` | idc-train.py | INFO(10步)/DEBUG | 每步 |

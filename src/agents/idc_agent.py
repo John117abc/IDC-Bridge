@@ -53,10 +53,10 @@ class DiscreteIDCAgent:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args.lr_critic)
 
         # IDC 成本权重
-        self.pos_err_weight = 0.2
+        self.pos_err_weight = 0.3
         self.speed_err_weight = 0.01
-        self.heading_err_weight = 0.6
-        self.steer_cost_weight = 0.1
+        self.heading_err_weight = 0.3
+        self.steer_cost_weight = 0.3
         self.acc_cost_weight = 0.005
 
         # GEP 惩罚

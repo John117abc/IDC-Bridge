@@ -165,7 +165,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir', type=str, required=True)
-    parser.add_argument('--num-worlds', type=int, default=5)
+    parser.add_argument('--num-worlds', type=int, default=10)
     parser.add_argument('--max-agents', type=int, default=1)
     parser.add_argument('--max-steps', type=int, default=90)
     parser.add_argument('--epochs', type=int, default=1)
@@ -184,6 +184,6 @@ if __name__ == "__main__":
     parser.add_argument('--save-freq', type=int, default=1)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
     parser.add_argument('--load-model', type=bool, default=False)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260519/idc-waymo-v1.0_examples_110949_episode=50.pth")
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260519/idc-waymo-v1.0_examples_130211_episode=105.pth")
     args = parser.parse_args()
     evaluate(args)
