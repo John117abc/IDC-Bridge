@@ -1,4 +1,5 @@
 import sys
+import math
 import numpy as np
 import torch
 import json
@@ -121,6 +122,22 @@ def train(args):
     # 历史损失
     history_loss = []
 
+    # --- 预训练世界过滤 ---
+    bad_worlds = set()
+
+    # 阶段1：路径坐标异常检测
+    logger.info('Pre-training world filter: checking path coordinates...')
+    for w in range(args.num_worlds):
+        a = ego_indices[w]
+        for pid in range(builder.num_candidate_paths):
+            pos = builder.candidate_paths[w][a][pid]['pos']
+            if np.max(np.abs(pos[:, 0])) > 5000 or np.max(np.abs(pos[:, 1])) > 5000:
+                bad_worlds.add(w)
+                logger.warning(f'[FILTER-path] world_{w} path_{pid} max|pos|=({np.max(np.abs(pos[:,0])):.0f},{np.max(np.abs(pos[:,1])):.0f})')
+                break
+
+    logger.info(f'[FILTER] {len(bad_worlds)}/{args.num_worlds} worlds excluded (path anomaly)')
+
     # 6. 训练循环
     for epoch in range(epochs):
         epoch += current_epoch
@@ -143,10 +160,30 @@ def train(args):
             states = builder.get_idc_observations_batch(ego_indices,
                                                         path_indices=path_indices)
 
+            # [诊断] 每步剔除 ego 坐标异常 world，同时打印 delta_p 判断是否为误杀
+            ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
+            for w in range(args.num_worlds):
+                if w in bad_worlds:
+                    continue
+                if abs(states[w][0]) > 5000 or abs(states[w][1]) > 5000:
+                    bad_worlds.add(w)
+                    dp = abs(states[w][ref_start])
+                    logger.warning(f'[FILTER-ego] world_{w} step={step} ego=({states[w][0]:.0f},{states[w][1]:.0f}) delta_p={dp:.0f}')
+
+            # [诊断] --no-sign: 去掉初始状态 delta_p 符号
+            if args.no_sign:
+                ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
+                for w in range(args.num_worlds):
+                    if w in bad_worlds:
+                        continue
+                    states[w][ref_start] = abs(states[w][ref_start])
+
             # [DIAG] 参考误差: 哪个 world 偏离最大
             if step % 5 == 0:
                 max_dp, max_w = 0.0, 0
                 for w in range(args.num_worlds):
+                    if w in bad_worlds:
+                        continue
                     s = states[w]
                     ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
                     dp, dphi, dv = abs(s[ref_start]), abs(s[ref_start+1]), abs(s[ref_start+2])
@@ -155,6 +192,8 @@ def train(args):
                 logger.info(f'[DIAG-ref] max pos_err={max_dp:.2f}m @world_{max_w}')
 
             for w in range(args.num_worlds):
+                if w in bad_worlds:
+                    continue
                 agent.buffer.handle_new_experience((states[w], w, path_indices[w]))
                 builder.increment_step(w)
 
@@ -265,10 +304,18 @@ if __name__ == "__main__":
     parser.add_argument('--max-penalty', type=float, default=10.0)
     parser.add_argument('--amplifier-c', type=float, default=1.015)
     parser.add_argument('--pim-interval', type=int, default=30)
+    parser.add_argument('--tracking-only', action='store_true', default=False,
+                        help='纯跟踪诊断模式: 无penalty/无噪声/ρ固定为0')
+    parser.add_argument('--fix-speed', action='store_true', default=False,
+                        help='[诊断] speed_err恒为0，排除速度干扰')
+    parser.add_argument('--fix-heading', action='store_true', default=False,
+                        help='[诊断] heading_err恒为0，排除朝向干扰')
+    parser.add_argument('--no-sign', action='store_true', default=False,
+                        help='[诊断] delta_p不去符号，排除符号翻转问题')
     parser.add_argument('--seed', type=int, default=5)
     parser.add_argument('--save-freq', type=int, default=5)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
-    parser.add_argument('--load-model', type=bool, default=True)
+    parser.add_argument('--load-model', type=bool, default=False)
     parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260519/idc-waymo-v1.0_examples_023425_episode=25.pth")
     args = parser.parse_args()
     train(args)

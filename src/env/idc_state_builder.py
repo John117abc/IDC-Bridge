@@ -75,10 +75,19 @@ class GPUDriveObservationBuilder:
             a = ego_indices[w]
             for pid, p in enumerate(self.candidate_paths[w][a]):
                 pos = p['pos']
-                logger.info(f'[PATH-RANGE] world_{w} path_{pid} '
-                            f'start=({pos[0,0]:.1f},{pos[0,1]:.1f}) end=({pos[-1,0]:.1f},{pos[-1,1]:.1f}) '
-                            f'len={np.hypot(pos[-1,0]-pos[0,0], pos[-1,1]-pos[0,1]):.1f}m '
-                            f'speed_start={p["speed"][0]:.2f} speed_end={p["speed"][-1]:.2f}')
+                head = p['heading']
+                spd = p['speed']
+                mid = len(pos) // 2
+                logger.info(f'[BEZIER-CHK] world_{w} path_{pid} '
+                            f'start=({pos[0,0]:.1f},{pos[0,1]:.1f}) head={head[0]:.2f} spd={spd[0]:.2f}')
+                logger.info(f'[BEZIER-CHK] world_{w} path_{pid} '
+                            f'mid=({pos[mid,0]:.1f},{pos[mid,1]:.1f}) head={head[mid]:.2f} spd={spd[mid]:.2f}')
+                logger.info(f'[BEZIER-CHK] world_{w} path_{pid} '
+                            f'end=({pos[-1,0]:.1f},{pos[-1,1]:.1f}) head={head[-1]:.2f} spd={spd[-1]:.2f}')
+
+        # 最近点跳变检测
+        self._last_nearest = {}
+        self._last_ego = {}
 
     def _make_bezier_path(self, p0, h0, p3, h3,
                            lateral_offset, expert_speeds, num_points):
@@ -215,8 +224,12 @@ class GPUDriveObservationBuilder:
             validity[:n_real] = 1.0  # 前 n_real 个是真实车
 
             pid = path_indices[w] if path_indices is not None else 0
-            _, (rx, ry, rh, rs) = self._nearest_on_candidate(
-                w, aidx, pid, x, y)
+            # 用时序索引替代空间最近点，消除跳变
+            t = self.step_counter[w]
+            path = self.candidate_paths[w][aidx][pid]
+            t = max(0, min(t, len(path['pos']) - 1))
+            rx, ry = float(path['pos'][t, 0]), float(path['pos'][t, 1])
+            rh, rs = float(path['heading'][t]), float(path['speed'][t])
             ref = np.array([rx, ry, rs, 0.0, rh, 0.0], dtype=np.float32)
             ref_err = self._calc_ref_error(ego, ref)
 
@@ -229,7 +242,8 @@ class GPUDriveObservationBuilder:
                 ego,
                 others.flatten().astype(np.float32),
                 validity.astype(np.float32),
-                ref_err.astype(np.float32)
+                ref_err.astype(np.float32),
+                np.array([float(t)], dtype=np.float32),
             ])
             states.append(state)
         return states
@@ -400,13 +414,25 @@ class GPUDriveObservationBuilder:
         return np.array([ref_x, ref_y, ref_speed, 0.0, ref_heading, 0.0], dtype=np.float32)
 
     def _nearest_on_candidate(self, world_idx, agent_idx, path_idx, ego_x, ego_y):
-        """在指定候选路径上找最近参考点"""
+        """在指定候选路径上找最近参考点，太远时回退到路径终点"""
         path = self.candidate_paths[world_idx][agent_idx][path_idx]
         pos = path['pos']
         dx = pos[:, 0] - ego_x
         dy = pos[:, 1] - ego_y
         dist_sq = dx * dx + dy * dy
         nearest = int(np.argmin(dist_sq))
+        path_len = float(np.hypot(pos[-1, 0] - pos[0, 0], pos[-1, 1] - pos[0, 1]))
+        min_dist = float(np.sqrt(dist_sq[nearest]))
+        if min_dist > max(path_len * 3, 100.0):  # 距离远超路径长度 → argmin 无意义
+            nearest = len(pos) - 1  # 回退到路径终点（车在前进方向）
+
+        # 诊断：最近点跳变检测
+        key = (world_idx, agent_idx)
+        prev = self._last_nearest.get(key, nearest)
+        if abs(nearest - prev) > 10:
+            logger.warning(f'[NEAREST-JUMP] world_{world_idx} path_{path_idx} '
+                           f'nearest={prev}->{nearest} ego=({ego_x:.1f},{ego_y:.1f})')
+        self._last_nearest[key] = nearest
         return nearest, (float(pos[nearest, 0]), float(pos[nearest, 1]),
                          float(path['heading'][nearest]),
                          float(path['speed'][nearest]))
@@ -425,7 +451,7 @@ class GPUDriveObservationBuilder:
         cross = dy * math.cos(ref_state[4]) - dx * math.sin(ref_state[4])
         delta_p *= math.copysign(1.0, cross)
 
-        delta_phi = ego_state[4] - ref_state[4]
+        delta_phi = math.atan2(dy, dx) - ego_state[4]
         delta_phi = math.atan2(math.sin(delta_phi), math.cos(delta_phi))
 
         delta_v = math.hypot(ego_state[2], ego_state[3]) - ref_state[2]
@@ -433,19 +459,29 @@ class GPUDriveObservationBuilder:
 
     def get_ref_states_batch(self, world_indices, ego_xs, ego_ys,
                               ego_indices_map: list,
-                              path_indices=None) -> torch.Tensor:
+                              path_indices=None,
+                              temporal_indices=None) -> torch.Tensor:
         """
-        批量获取参考状态，返回 [batch, 6] tensor。
-        path_indices: 可选，list of int，指定每条数据使用的候选路径索引。
+        批量获取参考状态，返回 [batch, 7] tensor。
+        列：[rx, ry, rs, 0, rh, 0, nearest_idx]
+        当 temporal_indices 传入时，直接用时序索引替代空间最近点搜索。
         """
         refs = []
         for i in range(len(world_indices)):
             w = world_indices[i]
             a = ego_indices_map[w]
             pid = path_indices[i] if path_indices is not None else 0
-            _, (rx, ry, rh, rs) = self._nearest_on_candidate(
-                w, a, pid, float(ego_xs[i]), float(ego_ys[i]))
-            refs.append([rx, ry, rs, 0.0, rh, 0.0])
+            if temporal_indices is not None:
+                t = int(temporal_indices[i])
+                path = self.candidate_paths[w][a][pid]
+                t = max(0, min(t, len(path['pos']) - 1))
+                rx, ry = float(path['pos'][t, 0]), float(path['pos'][t, 1])
+                rh, rs = float(path['heading'][t]), float(path['speed'][t])
+                nearest = t
+            else:
+                nearest, (rx, ry, rh, rs) = self._nearest_on_candidate(
+                    w, a, pid, float(ego_xs[i]), float(ego_ys[i]))
+            refs.append([rx, ry, rs, 0.0, rh, 0.0, float(nearest)])
         return torch.tensor(refs, device=ego_xs.device, dtype=torch.float32)
 
     def get_road_edges_batch(self, world_indices, ego_xs, ego_ys) -> torch.Tensor:
