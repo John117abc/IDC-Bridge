@@ -48,7 +48,7 @@ def train(args):
         root=args.data_dir,
         batch_size=args.num_worlds,
         dataset_size=args.num_worlds,  # 或者更大，比如 100
-        sample_with_replacement=True,  # 改成 True
+        sample_with_replacement=False,  # 每轮从全量数据中不重复采样
         shuffle=True,
         seed=args.seed
     )
@@ -113,8 +113,8 @@ def train(args):
 
     logger.info(f'训练开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={max_step}')
 
-    # 可视化：每 epoch 为前几个 world 画轨迹对比图
-    VIZ_WORLDS = list(range(min(6, args.num_worlds)))
+    # 可视化：每 epoch 为前 10 个 world 画轨迹对比图
+    VIZ_WORLDS = list(range(min(10, args.num_worlds)))
     viz_dir = os.path.join(args.file_dir, 'traj_plots')
     os.makedirs(viz_dir, exist_ok=True)
 
@@ -269,6 +269,6 @@ if __name__ == "__main__":
     parser.add_argument('--save-freq', type=int, default=5)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
     parser.add_argument('--load-model', type=bool, default=True)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260518/idc-waymo-v1.0_examples_153802_episode=65.pth")
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260519/idc-waymo-v1.0_examples_023425_episode=25.pth")
     args = parser.parse_args()
     train(args)

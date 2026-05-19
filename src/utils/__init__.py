@@ -1,7 +1,7 @@
 # src/utils/__init__.py
 from .logger import get_logger
 from .checkpoint import save_checkpoint,load_checkpoint
-from .config import load_config,load_config_json
+# from .config import load_config,load_config_json
 from .env import setup_code_environment
 from .common import normalize_Kinematics_obs,get_project_root,RunningNormalizer,normalize_idc_scenario_relative,average_idc_list,unpack_idc_numpy
 from .draw import Plotter
@@ -16,10 +16,10 @@ from .visualr_recorder import VisualRecorder
 
 __all__ = ['get_logger',
            'save_checkpoint',
-           'load_config',
+        #    'load_config',
            'setup_code_environment',
            'normalize_Kinematics_obs',
-           'load_config_json',
+        #    'load_config_json',
            'load_checkpoint',
            'Plotter',
            'get_project_root',
