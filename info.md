@@ -552,3 +552,193 @@ if abs(states[w][0]) > 5000 or abs(states[w][1]) > 5000:
 | `[TELEPORT]` | idc-train.py | WARNING | abs(x\|y) > 1e5 |
 | `[NaN]` | 各方法 | WARNING | tensor 含 NaN |
 | `回合 X/Y, 步数 Z/91` | idc-train.py | INFO(10步)/DEBUG | 每步 |
+
+---
+
+## 26. f_pred_batch 参考点时间索引 off-by-one（致命 bug）
+
+**现象**：修复 issue 17-25 后 tracking-only 训练 400+ epoch，直道跟踪仍很差，弯道完全无法跟随。
+
+**根因**：`f_pred_batch:228` 动力学把自车推进一步（step N→N+1），但参考点查询仍用旧索引 `temporal_idx`（step N）：
+
+```python
+temporal_idx = states[:, ...]         # step N
+temporal_next = temporal_idx + 1      # step N+1
+ego_next = self.dynamics(ego, action) # 自车从 N → N+1
+
+# BUG: 用了旧索引
+refs = get_ref_states_batch(..., temporal_indices=temporal_idx)  # ← 应该是 temporal_next
+```
+
+**直道上的后果**（v=10 m/s, dt=0.1s, 每步 1m）：
+
+```
+dx = ref_x[step N] - ego_x[step N+1] = -1.0m  ← 参考点在车后
+delta_phi = atan2(0, -1) - theta ≈ ±π rad    ← 180° 方向反了
+heading_err² ≈ π² ≈ 9.87
+utility contribution = 0.3 × 9.87 ≈ 2.96      ← 每步的巨大虚假惩罚
+```
+
+对比正常追踪 pos_err=1m 时仅有 `0.3 × 1 = 0.3`，heading 惩罚是 pos 的 10 倍且方向反了。
+
+**修复**：`temporal_indices=temporal_idx` → `temporal_indices=temporal_next`（一行改动）。
+
+**影响**：这是训练 400+ epoch 无收敛的**首要原因**。heading error 信号与实际跟踪目标相反，梯度冲突导致 Actor 无法收敛。
+
+---
+
+## 27. delta_phi 从 bearing error 改为 true heading error
+
+**现象**：弯道上即使完美追踪也有非零 "heading error"。
+
+**根因**：原 `delta_phi = atan2(dy, dx) - ego_theta` 是 bearing error（自车指向参考点的方向 − 自车方向），不是 heading error。弯道上参考点的方向和当前位置路径切向不同 → 虚假惩罚。
+
+**修复**（2 处）：
+
+| 文件 | 位置 | 改动 |
+|------|------|------|
+| `idc_state_builder.py` | 454 | `atan2(dy,dx) - ego[4]` → `ref_state[4] - ego_state[4]` |
+| `idc_agent.py` | 264 | `atan2(dy,dx) - theta_next` → `refs[:,4] - theta_next` |
+
+改后 `delta_phi = ref_heading - ego_theta`（真正航向对齐误差）。
+
+---
+
+## 28. Wheelbase 硬编码 4.0m vs GPUDrive 真实车长
+
+**现象**：直道改善后，弯道仍转向不足。
+
+**根因**：GPUDrive `forwardKinematics` 转弯公式 `w = v*cos(β)*tan(δ) / size.length`，其中 `size.length` 取自 Waymo 真实车辆长度（~4.3-5.2m）。IDC `KinematicBicycleModel` 硬编码 `L=4.0m`。
+
+| 参数 | IDC 模型 | GPUDrive 实际 | 偏差 |
+|------|---------|-------------|------|
+| 有效 Wheelbase | 4.0 m | 4.3-5.2 m | +7-30% |
+| 转弯速率（同 δ） | v·tan(δ)/4.0 | v·tan(δ)/5.0 | **模型高估 25%** |
+
+Agent 在训练中认为自己能转过某弯，但真实环境转不过去。
+
+**修复**：`kinematic_bicycle.py:35` `L: float = 4.0` → `5.0`。
+
+---
+
+## 29. Steering 最大值 0.4 → 0.6 rad
+
+**根因**：GPUDrive C++ 对 steering **没有硬上限**（`forwardKinematics` 不做 clamp），±0.4 rad 完全是 IDC 自己加的。以 L=5.0m 计算：R_min = 5.0/tan(0.4) ≈ 11.8m，覆盖不了城市交叉口急弯（常见 5-8m）。
+
+**修复**（3 处）：
+
+| 文件 | 行 | 改动 |
+|------|-----|------|
+| `idc_agent.py` | 124, 217 | `* 0.4` → `* 0.6` |
+| `action_mapper.py` | 14 | `steer_range=(-0.6, 0.6)` |
+
+转弯半径从 ~9.5m（L=4.0, δ=0.4）→ ~6.8m（L=5.0, δ=0.6）。
+
+---
+
+## 30. 候选路径索引：步级随机 → episode 级固定
+
+**现象**：3 条候选 Bezier 路径（3.75m 侧向偏移），每步随机选一条 → 相邻步参考点侧向跳动 7.5m → 追踪信号严重污染。
+
+**修复**：`idc-train.py:152-163`，每个 episode 开始时为每个 world 随机选一个 pid ∈ {0,1,2}，整个 episode 内不变。跨 episode 重新随机，保留数据多样性。
+
+---
+
+## 31. 动态道路宽度（从 GPUDrive 读取替代硬编码 3.75m）
+
+**根因**：硬编码 `lane_width=3.75` 不适用于窄路/宽路，offset 路径可能跑出道路边界。
+
+**修复**：`idc_state_builder.py:50-77`，从 `map_observation_tensor[:,:,3]`（`segment_width`）读取每个 world 的实际车道宽度。invalid（≤0/NaN）时 fallback 到 3.75。
+
+---
+
+## 32. 前瞻参考点 — State 维度 50 → 54
+
+**根因**：原 Agent 对前方弯道"蒙眼"——只知道当前误差（`delta_p`, `delta_phi`, `delta_v`），不知道 10 步后有 90° 弯道。弯道跟踪差的关键原因是缺乏路径预览信息。
+
+**新增 ref_error 布局 (7 dims)**：
+
+| 索引 | 含义 | 计算方式 |
+|------|------|---------|
+| [0] | `delta_p(t)` | 当前横向位置误差（带符号） |
+| [1] | `delta_phi(t)` | 当前航向误差 |
+| [2] | `delta_v(t)` | 当前速度误差 |
+| [3] | `lat_l1` | t+3 横向误差（纯 lateral = `dy·cos(rh) - dx·sin(rh)`） |
+| [4] | `dphi_l1` | t+3 航向误差 |
+| [5] | `lat_l2` | t+6 横向误差 |
+| [6] | `dphi_l2` | t+6 航向误差 |
+
+**关键设计**：
+- 前瞻横向误差用纯 cross product（`dy·cos(rh) - dx·sin(rh)`），避免直道上因前瞻距离大而误报大误差
+- 前瞻索引 clamp 到 `num_pts-1`，终点处多个前瞻汇聚到同一点，自然退化
+- 前瞻权重 `lookahead_pos_weight=0.05, lookahead_heading_weight=0.05`，比当前误差（0.3）小 6 倍，作为辅助梯度
+- 不加速度前瞻（速度 profile 已按时序给）
+
+**涉及文件**：
+| 文件 | 行 | 改动 |
+|------|-----|------|
+| `idc_agent.py` | 36 | `DIM_REF_ERROR = 3 → 7` |
+| `idc_agent.py` | 61-62 | 新增前瞻权重 |
+| `idc_agent.py` | 270-286 | `f_pred_batch` 查询 t+3、t+6 参考点 |
+| `idc_agent.py` | 412-413 | `utility_batch` 加入前瞻成本 |
+| `idc_state_builder.py` | 249-264 | 初始 state 构建加入前瞻误差 |
+
+**State 布局（54 维）**：
+
+| 区间 | 维度 | 内容 |
+|------|------|------|
+| [0:6] | 6 | ego: x, y, v_lon, v_lat, phi, omega |
+| [6:38] | 32 | others: 8 cars × 4 (x, y, phi, v) |
+| [38:46] | 8 | validity mask |
+| [46:53] | 7 | ref_error（见上表） |
+| [53:54] | 1 | temporal index |
+
+---
+
+## 33. 噪声衰减扩展到 tracking_only 模式
+
+**现象**：tracking_only 模式下 `noise_std=0.1` 永不衰减 → 环境执行始终带噪声 → 策略永远不干净 → 直线蛇形（画龙）。
+
+**修复**：`idc_agent.py:344` 去掉 `if not self.tracking_only:` 守卫，所有模式统一衰减 `σ × 0.98 / PIM`，最低 0.03。
+
+---
+
+## 当前关键参数速查
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| state dim | **54** | ego(6) + others(32) + validity(8) + ref_error(7) + temporal(1) |
+| ref_error | `[dp, dphi, dv, lat(t+3), dphi(t+3), lat(t+6), dphi(t+6)]` | 当前 + 前瞻 |
+| `pos_err_weight` | 0.3 | 位置误差权重 |
+| `speed_err_weight` | 0.04 | 速度误差权重 |
+| `heading_err_weight` | 0.3 | 朝向误差权重 |
+| `steer_cost_weight` | 0.3 | 转向控制代价 |
+| `acc_cost_weight` | 0.005 | 加速控制代价 |
+| `lookahead_pos_weight` | 0.05 | 前瞻位置误差权重 |
+| `lookahead_heading_weight` | 0.05 | 前瞻航向误差权重 |
+| `D_veh_safe` | 2.0 | 双圆心碰撞阈值 |
+| `D_road_safe` | 2.0 | 道路安全距离 |
+| `HALF_L` | 2.25 | 半车长 |
+| `HALF_W` | 1.0 | 半车宽 |
+| `noise_std` | 0.1（tracking）/ 0.15（正常）→ 0.03（×0.98/PIM） | 探索噪声（所有模式统一衰减） |
+| `lr_actor` | 8e-5 | Actor 学习率 |
+| `lr_critic` | 3e-4 | Critic 学习率 |
+| `dt` | 0.1 | 时间步长（秒） |
+| `horizon` | 12 | 推演步数 |
+| `batch_size` | 512 | PEV/PIM 采样数 |
+| `num_worlds` | 200 | 环境世界数 |
+| `max_penalty` (ρ 上限) | 10 | 最大惩罚系数 |
+| `amplifier_c` | 1.015 | ρ 每次 PIM 放大倍率 |
+| `pim_interval` | 30 | PEV 步数到 PIM |
+| `clamp` utility 单步 | **-5000/+5000** | 不截断正常跟踪梯度 |
+| `clamp` f_pred 位置 | **已删除** | 坏 world 由训练脚本过滤 |
+| 动力学速度 clamp | ±30 m/s | 安全网 |
+| Wheelbase L | **5.0 m** | 匹配 Waymo 实车 |
+| Steering range | **±0.6 rad**（~34.4°） | min 转弯半径 ~6.8m |
+| Actor acc bias | 0.05（tanh 后约 0.075 m/s²） | 防刹停 |
+| f_pred 通道映射 | raw_steer×0.6→rad, raw_acc×1.5/3.0→m/s², stack([acc,steer]) | 与 select_action 一致 |
+| delta_phi | **`ref_heading - ego_theta`** | 真正航向对齐误差 |
+| 道路 penalty | `relu(edge_dist - 2.0)` 线性 | 始终有梯度 |
+| 坏世界过滤 | 阶段1 预训练路径检查 + 每步 ego 检查 | 异常值不进 buffer |
+| 候选路径选择 | **episode 级别固定** | 消除步间跳变 |
+| 道路宽度 | **动态读取 segment_width** | invalid 时 fallback 3.75 |

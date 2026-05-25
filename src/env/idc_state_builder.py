@@ -246,6 +246,23 @@ class GPUDriveObservationBuilder:
             ref = np.array([rx, ry, rs, 0.0, rh, 0.0], dtype=np.float32)
             ref_err = self._calc_ref_error(ego, ref)
 
+            # 前瞻参考点（t+3, t+6），给 Actor 前方弯道信息
+            num_pts = len(path['pos'])
+            t_l1 = min(t + 3, num_pts - 1)
+            t_l2 = min(t + 6, num_pts - 1)
+            lx1, ly1 = float(path['pos'][t_l1, 0]), float(path['pos'][t_l1, 1])
+            lh1 = float(path['heading'][t_l1])
+            lat1 = (ly1 - y) * math.cos(lh1) - (lx1 - x) * math.sin(lh1)
+            dphi_l1 = lh1 - ego[4]
+            dphi_l1 = math.atan2(math.sin(dphi_l1), math.cos(dphi_l1))
+            lx2, ly2 = float(path['pos'][t_l2, 0]), float(path['pos'][t_l2, 1])
+            lh2 = float(path['heading'][t_l2])
+            lat2 = (ly2 - y) * math.cos(lh2) - (lx2 - x) * math.sin(lh2)
+            dphi_l2 = lh2 - ego[4]
+            dphi_l2 = math.atan2(math.sin(dphi_l2), math.cos(dphi_l2))
+            lookahead_err = np.array([lat1, dphi_l1, lat2, dphi_l2], dtype=np.float32)
+            ref_err = np.concatenate([ref_err, lookahead_err])
+
             # 诊断大偏离: pos_err > 100m 时打印 ego/ref 坐标和路径索引
             if abs(ref_err[0]) > 100.0:
                 logger.debug(f'[LARGE-ERR] world_{w} step={self.step_counter[w]} pos_err={ref_err[0]:.1f}m '

@@ -33,7 +33,7 @@ class DiscreteIDCAgent:
         self.DIM_EGO = 6                  # [x, y, v_lon, v_lat, phi, omega] (车体坐标系)
         self.DIM_OTHERS = 32               # 8 车 × 4 (x, y, phi, v_lon)
         self.DIM_VALIDITY = 8             # 8 车 validity mask: 1=真实车 0=padding
-        self.DIM_REF_ERROR = 3            # [delta_p, delta_phi, delta_v]
+        self.DIM_REF_ERROR = 7            # [dp, dphi, dv, lat(t+3), dphi(t+3), lat(t+6), dphi(t+6)]
         self.DIM_TEMPORAL = 1             # 时序索引，避免空间最近点跳变
         self.TOTAL_STATE_DIM = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR + self.DIM_TEMPORAL
         self.DIM_ROAD = 80
@@ -58,6 +58,8 @@ class DiscreteIDCAgent:
         self.heading_err_weight = 0.3
         self.steer_cost_weight = 0.3
         self.acc_cost_weight = 0.005
+        self.lookahead_pos_weight = 0.05
+        self.lookahead_heading_weight = 0.05
 
         # GEP 惩罚
         self.rho = args.init_penalty
@@ -264,8 +266,24 @@ class DiscreteIDCAgent:
         
         ego_speed = torch.hypot(ego_next_formatted[:, 2], ego_next_formatted[:, 3])
         delta_v = ego_speed - refs[:, 2]
-        
-        ref_error_tensors = torch.stack([delta_p, delta_phi, delta_v], dim=-1)
+
+        # 6. 前瞻参考点：给 Actor 前方弯道信息（t+3, t+6）
+        tl1 = torch.clamp(temporal_next + 3, max=89)
+        tl2 = torch.clamp(temporal_next + 6, max=89)
+        refs_l1 = self.state_builder.get_ref_states_batch(
+            w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
+            temporal_indices=tl1)
+        refs_l2 = self.state_builder.get_ref_states_batch(
+            w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
+            temporal_indices=tl2)
+        lat_l1 = (refs_l1[:, 1] - y_next) * torch.cos(refs_l1[:, 4]) - (refs_l1[:, 0] - x_next) * torch.sin(refs_l1[:, 4])
+        dphi_l1 = refs_l1[:, 4] - theta_next
+        dphi_l1 = torch.atan2(torch.sin(dphi_l1), torch.cos(dphi_l1))
+        lat_l2 = (refs_l2[:, 1] - y_next) * torch.cos(refs_l2[:, 4]) - (refs_l2[:, 0] - x_next) * torch.sin(refs_l2[:, 4])
+        dphi_l2 = refs_l2[:, 4] - theta_next
+        dphi_l2 = torch.atan2(torch.sin(dphi_l2), torch.cos(dphi_l2))
+
+        ref_error_tensors = torch.stack([delta_p, delta_phi, delta_v, lat_l1, dphi_l1, lat_l2, dphi_l2], dim=-1)
         
         # 组合并返回最终状态
         next_states = []
@@ -390,7 +408,9 @@ class DiscreteIDCAgent:
              + (0.0 if self.fix_speed else self.speed_err_weight) * speed_err ** 2
              + (0.0 if self.fix_heading else self.heading_err_weight) * heading_err ** 2
              + self.steer_cost_weight * steer_cost
-             + self.acc_cost_weight * acc_cost)
+             + self.acc_cost_weight * acc_cost
+             + self.lookahead_pos_weight * (s[:, ref_start + 3] ** 2 + s[:, ref_start + 5] ** 2)
+             + self.lookahead_heading_weight * (s[:, ref_start + 4] ** 2 + s[:, ref_start + 6] ** 2))
 
         # 诊断：每次调用自动抓 pos_err 最大的样本
         max_idx = pos_err.argmax().item()
