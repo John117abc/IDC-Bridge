@@ -100,6 +100,19 @@ def evaluate(args):
 
     builder.generate_candidate_paths(ego_indices, num_paths=3)
 
+    # 阶段1：路径坐标异常检测
+    bad_worlds = set()
+    logger.info('Pre-eval world filter: checking path coordinates...')
+    for w in range(args.num_worlds):
+        a = ego_indices[w]
+        for pid in range(3):
+            pos = builder.candidate_paths[w][a][pid]['pos']
+            if np.max(np.abs(pos[:, 0])) > 5000 or np.max(np.abs(pos[:, 1])) > 5000:
+                bad_worlds.add(w)
+                logger.warning(f'[FILTER-path] world_{w} path_{pid} max|pos|=({np.max(np.abs(pos[:,0])):.0f},{np.max(np.abs(pos[:,1])):.0f})')
+                break
+    logger.info(f'[FILTER] {len(bad_worlds)}/{args.num_worlds} worlds excluded (path anomaly)')
+
     # 5. 初始化 agent
     agent = DiscreteIDCAgent(env, args, args.device, builder,ego_indices)
 
@@ -124,7 +137,8 @@ def evaluate(args):
         builder.clear_cache()
 
         viz_list = [TrajectoryVisualizer(builder, w, ego_indices[w])
-                    for w in range(args.num_worlds)]
+                    for w in range(args.num_worlds) if w not in bad_worlds]
+        VIZ_WORLDS = [w for w in range(args.num_worlds) if w not in bad_worlds]
 
         for step in range(max_step):
             logger.info(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
@@ -133,13 +147,26 @@ def evaluate(args):
             path_indices = [0 for _ in range(args.num_worlds)]
             states = builder.get_idc_observations_batch(
                 ego_indices, path_indices=path_indices)
+
+            # 阶段2：每步剔除 ego 坐标异常 world
+            ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
+            for w in range(args.num_worlds):
+                if w in bad_worlds:
+                    continue
+                if abs(states[w][0]) > 5000 or abs(states[w][1]) > 5000:
+                    bad_worlds.add(w)
+                    logger.warning(f'[FILTER-ego] world_{w} step={step} ego=({states[w][0]:.0f},{states[w][1]:.0f})')
+
             for w in range(args.num_worlds):
                 builder.increment_step(w)
 
-            # 记录自车位置
+            # 记录自车位置（跳过坏 world）
             positions = builder.get_ego_positions_batch(ego_indices)
-            for i in range(args.num_worlds):
-                viz_list[i].record_step(positions[i, 0], positions[i, 1])
+            for i, w in enumerate(VIZ_WORLDS):
+                if w in bad_worlds:
+                    continue
+                if i < len(viz_list):
+                    viz_list[i].record_step(positions[w, 0], positions[w, 1])
 
             # 确定性的动作选择（不添加探索噪声）
             actions = agent.select_action(states, deterministic=True)
@@ -149,8 +176,16 @@ def evaluate(args):
 
             logger.debug(f'环境交互完成')
 
-            # 记录帧
-            recorder.record(env, epoch, step)
+            # 记录帧（跳过坏 world）
+            good_envs = [w for w in range(args.num_worlds) if w not in bad_worlds]
+            if step % recorder.fps == 0 and good_envs:
+                imgs = env.vis.plot_simulator_state(
+                    env_indices=good_envs,
+                    time_steps=[epoch] * len(good_envs),
+                    zoom_radius=70,
+                )
+                for i, w in enumerate(good_envs):
+                    recorder.frames[f"env_{w}"].append(img_from_fig(imgs[i]))
 
         for viz in viz_list:
             if len(viz.actual_x) > 0:
@@ -183,7 +218,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=20)
     parser.add_argument('--save-freq', type=int, default=1)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
-    parser.add_argument('--load-model', type=bool, default=False)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260521/idc-waymo-v1.0_examples_000302_episode=465.pth")
+    parser.add_argument('--load-model', type=bool, default=True)
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260525/idc-waymo-v1.0_examples_135820_episode=155.pth")
     args = parser.parse_args()
     evaluate(args)

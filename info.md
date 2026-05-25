@@ -715,7 +715,9 @@ Agent 在训练中认为自己能转过某弯，但真实环境转不过去。
 | `dt` | 0.1 | 时间步长（秒） |
 | `horizon` | 20 | 推演步数 |
 | `batch_size` | 512 | PEV/PIM 采样数 |
-| `num_worlds` | 200 | 环境世界数 |
+| `num_worlds` | 200（A4000 16GB）/ 300（32GB+） | 并行训练世界数 |
+| `dataset_size` | **0 = 自动检测 data_dir 文件数** | 重采样候选池大小 |
+| `max_bad_worlds` | 100 | 坏世界数触发重采样阈值 |
 | `max_penalty` (ρ 上限) | 10 | 最大惩罚系数 |
 | `amplifier_c` | 1.015 | ρ 每次 PIM 放大倍率 |
 | `pim_interval` | 30 | PEV 步数到 PIM |
@@ -732,12 +734,91 @@ Agent 在训练中认为自己能转过某弯，但真实环境转不过去。
 | 候选路径选择 | **episode 级别固定** | 消除步间跳变 |
 | 道路宽度 | **动态读取 segment_width** | invalid 时 fallback 3.75 |
 | rho 模式 | `--init-penalty 0` = 纯追踪, `≥1.0` = 含 penalty | 替代旧的 `--tracking-only` flag |
+| 世界重采样 | **坏世界 > `--max-bad-worlds` 时自动触发** | 从全量池随机抽取新世界 |
+| 数据池大小 | **`--dataset-size` 自动检测 data_dir 下 tfrecord 文件数** | 0=自动, 手动指定可覆盖 |
 
 ---
 
-## 34. 统一框架 + 3 点前瞻 + 道路预览（大版本）
+## 35. history_loss 重复积累导致损失图横坐标错误
 
-**改动**：去掉 `tracking_only` 分支，用 `rho=0` 控制追踪模式；前瞻从 2 点扩展到 3 点（t+3/t+6/t+9），每点加入道路边界距离；道路边界距离预计算 + GPU ref_tensor 消除 Python 循环瓶颈。
+**现象**：LossPlotter 画的 epoch 聚合图横坐标是 save 次数而非 epoch 数，step 图存在重复数据点。
+
+**根因**：
+- `history_loss = []` 在 epoch 循环外初始化，每 epoch append 后从不重置 → 累积所有 epoch 数据
+- `agent.save()` 每次 save 时把**完整累积列表** append 到 `self.history_loss` → 数据反复嵌套
+- `save_freq=5` 时，`self.history_loss` = `[[epoch1-5数据], [epoch1-10数据], ...]` → epoch 6-10 重复了 epoch 1-5
+
+**修复**（3 处）：
+
+| 文件 | 改动 |
+|------|------|
+| `idc-train.py` | `history_loss = []` 移到 epoch 循环内 → 每 epoch 独立 `epoch_history` |
+| `idc-train.py` | epoch 结束：`agent.history_loss.append(epoch_history.copy())` |
+| `idc_agent.py` | `save()` 中删除 `self.history_loss.append(save_info.get(...))` |
+
+修复后 `self.history_loss = [[epoch1], [epoch2], ...]`，横坐标正确，无重复数据。
+
+---
+
+## 36. 评估脚本缺少世界过滤
+
+**现象**：评估导出的 GIF 图像中部分车辆瞬移/飞出路外，画面不正常。
+
+**根因**：`idc-eval.py` 没有任何世界过滤逻辑，而 `idc-train.py` 有两级过滤（路径坐标 + ego 坐标）。
+
+**修复**（`idc-eval.py`）：
+
+| 位置 | 改动 |
+|------|------|
+| `generate_candidate_paths` 后 | 阶段 1：路径坐标异常检测 → `bad_worlds` |
+| 每步 `get_idc_observations_batch` 后 | 阶段 2：ego 坐标检查，异常追加到 `bad_worlds` |
+| viz/recording | `viz_list` 只建好世界，位置记录和 GIF 帧跳过 `bad_worlds` |
+
+---
+
+## 37. 世界重采样：过滤后自动补新世界
+
+**现象**：初始 200 个世界中 ~5% 路径异常 + 每 epoch ~1% ego 跳变 → 训练中好世界越来越少 → 过拟合剩余世界。
+
+**方案**：当好世界数低于阈值时，从全量数据池随机抽取新世界替换。
+
+### 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--num-worlds` | 200 | 并行训练世界数（A4000 16GB 建议 200，32GB 可 300） |
+| `--dataset-size` | 0（自动） | 全量候选池大小，0=检测 `data_dir` 下 tfrecord 文件数 |
+| `--max-bad-worlds` | 100 | 坏世界数超过此值时触发重采样 |
+
+### 流程
+
+```
+初始化：从全量池随机加载 200 个世界，过滤 → bad_worlds
+
+每 epoch 5 步一次：[DIAG-ref] good_worlds=195/200
+
+每 epoch 结束：
+  if len(bad_worlds) > 100:
+    → random.sample(全量池, 200)
+    → env.swap_data_batch()  # 换入新世界
+    → 重建 builder expert 数据 + 候选路径
+    → 阶段 1 过滤
+    → agent.update_ego_indices() + clear_buffer()
+    → 下一 epoch 用新世界开始
+```
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `idc-train.py` | 新增 `glob`/`random` 导入，CLI 参数，`all_files` 列表，`resample_worlds()` 函数（~45 行），epoch 结束触发 |
+| `idc_agent.py` | 新增 `update_ego_indices()` + `clear_buffer()` |
+
+### 注意
+
+- swap 时 buffer 必须清空（旧 state 的 world_idx 映射到旧世界，temporal 不连续）
+- buffer 容量 100,000 → 半分钟内填满，不影响训练连续性
+- 默认 200 worlds ~11GB VRAM，300 worlds ~16.5GB → A4000 16GB 用 200
 
 ### State 布局（59 维）
 

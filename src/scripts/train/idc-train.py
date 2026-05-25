@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import json
 import os
+import glob
+import random
 # 导入智能体
 
 
@@ -44,11 +46,18 @@ def train(args):
     print("Data root:", args.data_dir)
     print("Files found:", os.listdir(args.data_dir))
     
+    # 自动检测全量数据池大小
+    total_files = len([f for f in os.listdir(args.data_dir) if f.startswith('tfrecord')])
+    dataset_size = args.dataset_size if args.dataset_size > 0 else total_files
+    if dataset_size < args.num_worlds * 2:
+        dataset_size = args.num_worlds * 2  # 最少保持 2x 的候选池
+    logger.info(f'数据池: {dataset_size} 个文件, 训练时随机抽取 {args.num_worlds} 个世界')
+    
     # 1. 数据加载器
     data_loader = SceneDataLoader(
         root=args.data_dir,
         batch_size=args.num_worlds,
-        dataset_size=args.num_worlds,  # 或者更大，比如 100
+        dataset_size=dataset_size,
         sample_with_replacement=False,  # 每轮从全量数据中不重复采样
         shuffle=True,
         seed=args.seed
@@ -77,6 +86,12 @@ def train(args):
         device=args.device,
         action_type="continuous",
     )
+
+    # 加载全量文件列表（供后续重采样用）
+    all_files = sorted(glob.glob(os.path.join(args.data_dir, "tfrecord*")))
+    all_files = all_files[:dataset_size]
+    random.Random(args.seed).shuffle(all_files)
+    logger.info(f'全量文件池: {len(all_files)} 个')
 
     # 初始化记录器
     recorder = VisualRecorder(
@@ -117,9 +132,6 @@ def train(args):
     viz_dir = os.path.join(args.file_dir, 'traj_plots')
     os.makedirs(viz_dir, exist_ok=True)
 
-    # 历史损失
-    history_loss = []
-
     # --- 预训练世界过滤 ---
     bad_worlds = set()
 
@@ -136,6 +148,54 @@ def train(args):
 
     logger.info(f'[FILTER] {len(bad_worlds)}/{args.num_worlds} worlds excluded (path anomaly)')
 
+    # --- 世界重采样函数 ---
+    def resample_worlds(bad_worlds_set, ego_idx_list):
+        logger.info(f'[RESAMPLE] Triggered: {len(bad_worlds_set)}/{args.num_worlds} bad worlds. Reloading...')
+        
+        # 0. 主动释放旧显存，防止 swap 期间新旧数据叠加 OOM
+        for attr in ['ref_tensor', 'expert_pos', 'expert_vel', 'expert_heading', 'candidate_paths', '_road_cache']:
+            if hasattr(builder, attr):
+                delattr(builder, attr)
+        torch.cuda.empty_cache()
+        
+        # 1. 抽取不重复的新世界
+        batch_files = random.sample(all_files, args.num_worlds)
+        env.swap_data_batch(data_batch=batch_files)
+        
+        # 2. 更新 ego_indices
+        new_ego = []
+        for w in range(args.num_worlds):
+            ctrl = env.cont_agent_mask[w].nonzero(as_tuple=True)[0]
+            new_ego.append(ctrl[0].item() if len(ctrl) > 0 else 0)
+        
+        # 3. 重建 builder 数据
+        builder._setup_expert_data()
+        builder.clear_cache()
+        builder.generate_candidate_paths(new_ego, num_paths=3)
+        
+        # 4. 阶段 1 路径坐标过滤
+        bad_worlds_set.clear()
+        for w in range(args.num_worlds):
+            a = new_ego[w]
+            for pid in range(builder.num_candidate_paths):
+                pos = builder.candidate_paths[w][a][pid]['pos']
+                if np.max(np.abs(pos[:, 0])) > 5000 or np.max(np.abs(pos[:, 1])) > 5000:
+                    bad_worlds_set.add(w)
+                    break
+        
+        # 5. 重置环境
+        env.reset()
+        for w in range(args.num_worlds):
+            builder.reset_world_step(w, 0)
+        builder.clear_cache()
+        
+        # 6. 更新 agent + 清 buffer
+        agent.update_ego_indices(new_ego)
+        agent.clear_buffer()
+        
+        logger.info(f'[RESAMPLE] complete: {len(bad_worlds_set)} bad, {args.num_worlds - len(bad_worlds_set)} good')
+        return new_ego
+
     # 6. 训练循环
     for epoch in range(epochs):
         epoch += current_epoch
@@ -143,6 +203,9 @@ def train(args):
         for w in range(args.num_worlds):
             builder.reset_world_step(w, 0)
         builder.clear_cache()
+
+        # 每个 epoch 独立记录损失
+        epoch_history = []
 
         # 可视化：每 epoch 从当前未拉黑世界中选前 10 个画轨迹
         VIZ_WORLDS = [w for w in range(args.num_worlds) if w not in bad_worlds][:10]
@@ -191,7 +254,8 @@ def train(args):
                     dp, dphi, dv = abs(s[ref_start]), abs(s[ref_start+1]), abs(s[ref_start+2])
                     if dp > max_dp:
                         max_dp, max_w = dp, w
-                logger.info(f'[DIAG-ref] max pos_err={max_dp:.2f}m @world_{max_w}')
+                logger.info(f'[DIAG-ref] max pos_err={max_dp:.2f}m @world_{max_w} '
+                            f'good_worlds={args.num_worlds - len(bad_worlds)}/{args.num_worlds}')
 
             for w in range(args.num_worlds):
                 if w in bad_worlds:
@@ -262,7 +326,7 @@ def train(args):
                 # 打印损失
                 if actor_loss is not None:
                     logger.info(f'Critic Loss: {critic_loss:.4f}, Actor Loss: {actor_loss ==None and "N/A" or f"{actor_loss:.4f}" }, Penalty Coefficient (rho): {agent.rho:.4f}')
-                    history_loss.append((critic_loss, actor_loss, agent.rho))
+                    epoch_history.append((critic_loss, actor_loss, agent.rho))
 
             # 记录帧
             # recorder.record(env, epoch, step)
@@ -274,6 +338,9 @@ def train(args):
             # infos = env.get_infos()
         
         agent.globe_eps += 1  # 每个 epoch 结束后增加全局回合数
+
+        # 保存本 epoch 损失记录
+        agent.history_loss.append(epoch_history.copy())
         
         logger.info(f'开始保存轨迹图像')
         for viz in viz_list:
@@ -282,10 +349,14 @@ def train(args):
 
         # 保存模型
         save_info = {
-                'history_loss':history_loss,
                 'env_name': 'examples',
         }
         agent.save(save_info=save_info)
+
+        # === 坏世界超过阈值时触发世界重采样 ===
+        if len(bad_worlds) > args.max_bad_worlds:
+            logger.warning(f'[RESAMPLE] bad={len(bad_worlds)}/{args.num_worlds}, good<{args.num_worlds - args.max_bad_worlds}, triggering resample...')
+            ego_indices = resample_worlds(bad_worlds, ego_indices)
 
     # 每个环境的帧保存为单独的 GIF
     # recorder.save_all_gifs()
@@ -296,7 +367,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir', type=str, required=True)
-    parser.add_argument('--num-worlds', type=int, default=200)
+    parser.add_argument('--num-worlds', type=int, default=150)
     parser.add_argument('--max-agents', type=int, default=1)
     parser.add_argument('--max-steps', type=int, default=90)
     parser.add_argument('--epochs', type=int, default=300)
@@ -312,6 +383,10 @@ if __name__ == "__main__":
     parser.add_argument('--max-penalty', type=float, default=10.0)
     parser.add_argument('--amplifier-c', type=float, default=1.015)
     parser.add_argument('--pim-interval', type=int, default=30)
+    parser.add_argument('--dataset-size', type=int, default=0,
+                        help='全量数据池大小，0=自动检测 data_dir 下的 tfrecord 文件数')
+    parser.add_argument('--max-bad-worlds', type=int, default=100,
+                        help='坏世界数超过此值时触发世界重采样')
     parser.add_argument('--fix-speed', action='store_true', default=False,
                         help='[诊断] speed_err恒为0，排除速度干扰')
     parser.add_argument('--fix-heading', action='store_true', default=False,
@@ -322,6 +397,6 @@ if __name__ == "__main__":
     parser.add_argument('--save-freq', type=int, default=5)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
     parser.add_argument('--load-model', type=bool, default=False)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260519/idc-waymo-v1.0_examples_150035_episode=50.pth")
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260525/idc-waymo-v1.0_examples_161136_episode=225.pth")
     args = parser.parse_args()
     train(args)

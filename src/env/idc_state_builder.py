@@ -56,10 +56,9 @@ class GPUDriveObservationBuilder:
             self.candidate_paths[w] = {}
 
             sp = self.expert_pos[w, a, 0].cpu().numpy()
-            ep = self.expert_pos[w, a, -1].cpu().numpy()
-            sh = float(self.expert_heading[w, a, 0].item())
-            eh = float(self.expert_heading[w, a, -1].item())
-            expert_spd = self.expert_vel[w, a].norm(dim=-1).cpu().numpy()
+            expert_pos_w = self.expert_pos[w, a].cpu().numpy()              # [91, 2]
+            expert_h_w = self.expert_heading[w, a].squeeze(-1).cpu().numpy()  # [91]
+            expert_spd_w = self.expert_vel[w, a].norm(dim=-1).cpu().numpy()      # [91]
 
             # 从道路图中提取该 world 的实际车道宽度
             world_road = road_tensor[w]
@@ -77,8 +76,22 @@ class GPUDriveObservationBuilder:
                 offsets = [-dynamic_width, 0.0, dynamic_width]
 
             for offset in offsets:
-                path = self._make_bezier_path(
-                    sp, sh, ep, eh, offset, expert_spd, num_points)
+                if abs(offset) < 1e-6:
+                    pos = expert_pos_w.copy()
+                else:
+                    pos = np.zeros((num_points, 2), dtype=np.float32)
+                    for j in range(num_points):
+                        h = float(expert_h_w[j])
+                        lx = -math.sin(h)
+                        ly = math.cos(h)
+                        pos[j, 0] = float(expert_pos_w[j, 0]) + offset * lx
+                        pos[j, 1] = float(expert_pos_w[j, 1]) + offset * ly
+
+                path = {
+                    'pos': pos.astype(np.float32),
+                    'heading': expert_h_w.astype(np.float32),
+                    'speed': expert_spd_w.astype(np.float32),
+                }
                 # 预计算每个路径点到最近道路边界的距离（一次性 O(N*M) → 后续 O(1) 查表）
                 road_dists = np.zeros(num_points, dtype=np.float32)
                 for j in range(num_points):
@@ -126,42 +139,116 @@ class GPUDriveObservationBuilder:
         self._last_nearest = {}
         self._last_ego = {}
 
-    def _make_bezier_path(self, p0, h0, p3, h3,
-                           lateral_offset, expert_speeds, num_points):
-        dx = p3[0] - p0[0]
-        dy = p3[1] - p0[1]
-        dist = float(np.hypot(dx, dy))
-        if dist < 1e-6:
-            dist = 1.0
+    def _make_multi_bezier_path(self, p0, h0, p3, h3,
+                                 lateral_offset, expert_speeds, num_points):
+        """
+        多段 Cubic Bezier：固定段长 ≤ 25m，动态段数。
+        中间锚点通过起终点航向线性插值（不依赖道路图）。
+        横向偏移应用于全部锚点。
+        """
+        SEGMENT_LENGTH = 25.0
 
-        tx, ty = dx / dist, dy / dist
-        px, py = -ty, tx
+        dx_total = p3[0] - p0[0]
+        dy_total = p3[1] - p0[1]
+        total_dist = float(np.hypot(dx_total, dy_total))
+        if total_dist < 1e-6:
+            total_dist = 1.0
 
-        s = np.array([p0[0] + lateral_offset * px,
-                       p0[1] + lateral_offset * py], dtype=np.float32)
-        e = np.array([p3[0] + lateral_offset * px,
-                       p3[1] + lateral_offset * py], dtype=np.float32)
+        # Guard: GPUDrive 坐标异常世界（起终点 > 5km），返回退化路径供后续过滤
+        if total_dist > 5000:
+            bt = np.tile(np.array([[p0[0], p0[1]]], dtype=np.float32), (num_points, 1))
+            headings = np.full(num_points, h0, dtype=np.float32)
+            speeds = np.asarray(expert_speeds, dtype=np.float32)
+            return {'pos': bt, 'heading': headings, 'speed': speeds}
 
-        d = dist / 3.0
-        P0 = s
-        P1 = s + np.array([d * np.cos(h0), d * np.sin(h0)], dtype=np.float32)
-        P2 = e - np.array([d * np.cos(h3), d * np.sin(h3)], dtype=np.float32)
-        P3 = e
+        num_segments = max(2, int(np.ceil(total_dist / SEGMENT_LENGTH)))
 
-        t_vals = np.linspace(0, 1, num_points)
+        # 垂向及航向：圆弧插值（起终点航向隐含道路曲率）
+        tx, ty = dx_total / total_dist, dy_total / total_dist
+        px, py = -ty, tx  # 左垂向（用于 lateral offset）
+        dh = h3 - h0
+        dh = (dh + np.pi) % (2 * np.pi) - np.pi
+
+        # 锚点阵列 [num_segments+1, 2/1]
+        ap = np.zeros((num_segments + 1, 2), dtype=np.float32)
+        ah = np.zeros(num_segments + 1, dtype=np.float32)
+        seg_lens = np.zeros(num_segments, dtype=np.float32)
+
+        abs_dh = abs(dh)
+        if abs_dh < 0.01:  # 近似直路 → 直线锚点
+            for i in range(num_segments + 1):
+                t = i / num_segments
+                ap[i, 0] = p0[0] + t * dx_total + lateral_offset * px
+                ap[i, 1] = p0[1] + t * dy_total + lateral_offset * py
+                ah[i] = h0 + t * dh
+        else:  # 弯道 → 圆弧锚点
+            sign_dh = 1.0 if dh > 0 else -1.0
+            R = total_dist / (2.0 * math.sin(abs_dh / 2.0))
+            # 圆心：从弦中点沿垂向偏移
+            chord_mid = np.array([(p0[0] + p3[0]) / 2.0, (p0[1] + p3[1]) / 2.0])
+            chord_dir = np.array([dx_total, dy_total]) / total_dist
+            perp = np.array([-chord_dir[1], chord_dir[0]])
+            d_center = R * math.cos(abs_dh / 2.0)  # 弦中点到圆心的垂向距离
+            cx = chord_mid[0] + sign_dh * d_center * perp[0]
+            cy = chord_mid[1] + sign_dh * d_center * perp[1]
+            # 起终点在圆弧上的极角
+            ang_start = math.atan2(p0[1] - cy, p0[0] - cx)
+            ang_end = ang_start + dh  # 保证沿正确的转动方向
+            for i in range(num_segments + 1):
+                t = i / num_segments
+                ang_i = ang_start + t * dh
+                ap[i, 0] = cx + R * math.cos(ang_i) + lateral_offset * px
+                ap[i, 1] = cy + R * math.sin(ang_i) + lateral_offset * py
+                ah[i] = ang_i + sign_dh * math.pi / 2.0
+
+        for i in range(num_segments):
+            seg_lens[i] = float(np.hypot(ap[i+1, 0] - ap[i, 0], ap[i+1, 1] - ap[i, 1])) or 1e-6
+        total_seg = seg_lens.sum()
+
+        # 按段长比例分配采样点数（含锚点重叠）
+        n_gen_total = num_points + num_segments - 1
+        seg_pts = np.zeros(num_segments, dtype=np.int32)
+        allocated = 0
+        for i in range(num_segments - 1):
+            seg_pts[i] = max(2, int(round((n_gen_total - 2 * num_segments) * seg_lens[i] / total_seg)))
+            allocated += seg_pts[i]
+        seg_pts[-1] = n_gen_total - allocated
+
+        # 逐段生成 + 去重叠拼接
         bt = np.zeros((num_points, 2), dtype=np.float32)
-        for i, t in enumerate(t_vals):
-            bt[i] = ((1 - t) ** 3 * P0 + 3 * (1 - t) ** 2 * t * P1
-                     + 3 * (1 - t) * t ** 2 * P2 + t ** 3 * P3)
+        idx = 0
+        for i in range(num_segments):
+            P0, P3 = ap[i], ap[i + 1]
+            sd = max(float(np.hypot(P3[0] - P0[0], P3[1] - P0[1])), 1e-6)
+            dd = sd / 3.0
+            P1 = P0 + np.array([dd * np.cos(ah[i]),     dd * np.sin(ah[i])],     dtype=np.float32)
+            P2 = P3 - np.array([dd * np.cos(ah[i + 1]), dd * np.sin(ah[i + 1])], dtype=np.float32)
 
+            n = seg_pts[i]
+            seg_vals = np.linspace(0, 1, n)
+            seg_arr = np.zeros((n, 2), dtype=np.float32)
+            for j, tv in enumerate(seg_vals):
+                mt = 1.0 - tv
+                seg_arr[j] = (mt**3) * P0 + 3 * (mt**2) * tv * P1 + 3 * mt * (tv**2) * P2 + (tv**3) * P3
+
+            start = 1 if i > 0 else 0            # 跳过与前一段重合的第一个点
+            take = seg_arr[start:]
+            n_write = len(take)
+            bt[idx:idx + n_write] = take
+            idx += n_write
+
+        # 若需要补齐，复用最后一点
+        if idx < num_points:
+            pad = np.tile(bt[idx - 1:idx], (num_points - idx, 1))
+            bt[idx:] = pad
+
+        # 差分求 heading
         headings = np.zeros(num_points, dtype=np.float32)
         for i in range(num_points - 1):
             headings[i] = np.arctan2(bt[i + 1, 1] - bt[i, 1],
-                                     bt[i + 1, 0] - bt[i, 0])
+                                      bt[i + 1, 0] - bt[i, 0])
         headings[-1] = headings[-2]
 
-        # 直接用专家的时变速度（第 i 步参考速度 = 专家在第 i 步的实际速度）
-        # 红绿灯路口专家速度降到 0，参考速度也会跟停
         speeds = np.asarray(expert_speeds, dtype=np.float32)
         return {'pos': bt, 'heading': headings, 'speed': speeds}
 

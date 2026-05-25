@@ -503,6 +503,11 @@ class DiscreteIDCAgent:
 
         return critic_loss, actor_loss
         
+    def update_ego_indices(self, new_ego_indices):
+        self.ego_indices = new_ego_indices
+
+    def clear_buffer(self):
+        self.buffer = PERBuffer(capacity=100000, min_start_train=self.args.batch_size)
 
     def save(self, save_info: Dict[str, Any]) -> None:
         # 满足回合数才会保存模型
@@ -510,8 +515,6 @@ class DiscreteIDCAgent:
             logger.info(f'保存模型: globe_eps={self.globe_eps}, global_step={self.global_step}')
             model = {'actor': self.actor, 'critic': self.critic}
             optimizer = {'actor_optim': self.actor_optimizer, 'critic_optim': self.critic_optimizer}
-            # 先加载历史损失数据，如果有的话
-            self.history_loss.append(save_info.get('history_loss', []).copy())
             extra_info = {
                 'config': self.args,
                 'global_step': self.global_step,
