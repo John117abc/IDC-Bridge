@@ -79,9 +79,33 @@ class GPUDriveObservationBuilder:
             for offset in offsets:
                 path = self._make_bezier_path(
                     sp, sh, ep, eh, offset, expert_spd, num_points)
+                # 预计算每个路径点到最近道路边界的距离（一次性 O(N*M) → 后续 O(1) 查表）
+                road_dists = np.zeros(num_points, dtype=np.float32)
+                for j in range(num_points):
+                    road_dists[j] = self._road_dist_point(
+                        world_road, float(path['pos'][j, 0]), float(path['pos'][j, 1]))
+                path['road_dist'] = road_dists
                 paths.append(path)
 
             self.candidate_paths[w][a] = paths
+
+        # 构建 GPU ref_tensor 供 rollout 零 Python 循环索引
+        # [num_worlds, 1, num_paths, num_points, 5]: pos_x, pos_y, speed, heading, road_dist
+        num_worlds = self.num_worlds
+        num_paths = self.num_candidate_paths
+        num_points = 91
+        ref_data = np.zeros((num_worlds, 1, num_paths, num_points, 5), dtype=np.float32)
+        for w in range(num_worlds):
+            a = ego_indices[w]
+            for p in range(num_paths):
+                path = self.candidate_paths[w][a][p]
+                n = len(path['pos'])
+                ref_data[w, 0, p, :n, 0] = path['pos'][:, 0]
+                ref_data[w, 0, p, :n, 1] = path['pos'][:, 1]
+                ref_data[w, 0, p, :n, 2] = path['speed'][:]
+                ref_data[w, 0, p, :n, 3] = path['heading'][:]
+                ref_data[w, 0, p, :n, 4] = path['road_dist'][:]
+        self.ref_tensor = torch.from_numpy(ref_data).to(self.expert_pos.device)
 
         # 诊断: 打印候选路径坐标范围，确认与 ego 坐标系对齐
         for w in range(min(self.num_worlds, 3)):
@@ -246,21 +270,36 @@ class GPUDriveObservationBuilder:
             ref = np.array([rx, ry, rs, 0.0, rh, 0.0], dtype=np.float32)
             ref_err = self._calc_ref_error(ego, ref)
 
-            # 前瞻参考点（t+3, t+6），给 Actor 前方弯道信息
+            # 前瞻参考点（t+3, t+6, t+9），给 Actor 前方弯道/道路信息
             num_pts = len(path['pos'])
             t_l1 = min(t + 3, num_pts - 1)
             t_l2 = min(t + 6, num_pts - 1)
+            t_l3 = min(t + 9, num_pts - 1)
+
             lx1, ly1 = float(path['pos'][t_l1, 0]), float(path['pos'][t_l1, 1])
             lh1 = float(path['heading'][t_l1])
             lat1 = (ly1 - y) * math.cos(lh1) - (lx1 - x) * math.sin(lh1)
             dphi_l1 = lh1 - ego[4]
             dphi_l1 = math.atan2(math.sin(dphi_l1), math.cos(dphi_l1))
+            road1 = path['road_dist'][t_l1]
+
             lx2, ly2 = float(path['pos'][t_l2, 0]), float(path['pos'][t_l2, 1])
             lh2 = float(path['heading'][t_l2])
             lat2 = (ly2 - y) * math.cos(lh2) - (lx2 - x) * math.sin(lh2)
             dphi_l2 = lh2 - ego[4]
             dphi_l2 = math.atan2(math.sin(dphi_l2), math.cos(dphi_l2))
-            lookahead_err = np.array([lat1, dphi_l1, lat2, dphi_l2], dtype=np.float32)
+            road2 = path['road_dist'][t_l2]
+
+            lx3, ly3 = float(path['pos'][t_l3, 0]), float(path['pos'][t_l3, 1])
+            lh3_ = float(path['heading'][t_l3])
+            lat3 = (ly3 - y) * math.cos(lh3_) - (lx3 - x) * math.sin(lh3_)
+            dphi_l3 = lh3_ - ego[4]
+            dphi_l3 = math.atan2(math.sin(dphi_l3), math.cos(dphi_l3))
+            road3 = path['road_dist'][t_l3]
+
+            lookahead_err = np.array([lat1, dphi_l1, road1,
+                                       lat2, dphi_l2, road2,
+                                       lat3, dphi_l3, road3], dtype=np.float32)
             ref_err = np.concatenate([ref_err, lookahead_err])
 
             # 诊断大偏离: pos_err > 100m 时打印 ego/ref 坐标和路径索引
@@ -434,44 +473,37 @@ class GPUDriveObservationBuilder:
         
         return nearest_idx, (ref_x, ref_y, ref_heading, ref_speed)
 
-    def get_ref_state(self, world_idx: int, agent_idx: int, ego_x: float, ego_y: float) -> np.ndarray:
-        """
-        基于最近点返回参考状态 [ref_x, ref_y, ref_v_lon, ref_v_lat, ref_heading, 0] (车体坐标系)
-        默认使用候选路径 0（中心路径）。
-        """
-        _, (ref_x, ref_y, ref_heading, ref_speed) = self._nearest_on_candidate(
-            world_idx, agent_idx, 0, ego_x, ego_y)
-        return np.array([ref_x, ref_y, ref_speed, 0.0, ref_heading, 0.0], dtype=np.float32)
+    @staticmethod
+    def _road_dist_point(road_tensor_world, qx, qy):
+        """查询点到最近道路边界点的距离（纯函数，可复用）"""
+        mask = road_tensor_world[:, 6] == 1  # TYPE_IDX=6, ROADLINE_TYPE=1
+        line_pts = road_tensor_world[mask]
+        if len(line_pts) == 0:
+            return 999.0
+        dx = line_pts[:, 0] - qx
+        dy = line_pts[:, 1] - qy
+        nearest = int(np.argmin(dx * dx + dy * dy))
+        return float(math.hypot(dx[nearest], dy[nearest]))
 
-    def _nearest_on_candidate(self, world_idx, agent_idx, path_idx, ego_x, ego_y):
-        """在指定候选路径上找最近参考点，太远时回退到路径终点"""
-        path = self.candidate_paths[world_idx][agent_idx][path_idx]
-        pos = path['pos']
-        dx = pos[:, 0] - ego_x
-        dy = pos[:, 1] - ego_y
-        dist_sq = dx * dx + dy * dy
-        nearest = int(np.argmin(dist_sq))
-        path_len = float(np.hypot(pos[-1, 0] - pos[0, 0], pos[-1, 1] - pos[0, 1]))
-        min_dist = float(np.sqrt(dist_sq[nearest]))
-        if min_dist > max(path_len * 3, 100.0):  # 距离远超路径长度 → argmin 无意义
-            nearest = len(pos) - 1  # 回退到路径终点（车在前进方向）
-
-        # 诊断：最近点跳变检测
-        key = (world_idx, agent_idx)
-        prev = self._last_nearest.get(key, nearest)
-        if abs(nearest - prev) > 10:
-            logger.warning(f'[NEAREST-JUMP] world_{world_idx} path_{path_idx} '
-                           f'nearest={prev}->{nearest} ego=({ego_x:.1f},{ego_y:.1f})')
-        self._last_nearest[key] = nearest
-        return nearest, (float(pos[nearest, 0]), float(pos[nearest, 1]),
-                         float(path['heading'][nearest]),
-                         float(path['speed'][nearest]))
-
-    def get_ref_state_from_path(self, world_idx, agent_idx, path_idx,
-                                  ego_x, ego_y):
-        _, (rx, ry, rh, rs) = self._nearest_on_candidate(
-            world_idx, agent_idx, path_idx, ego_x, ego_y)
-        return np.array([rx, ry, rs, 0.0, rh, 0.0], dtype=np.float32)
+    def get_road_dist_batch(self, world_indices, temporal_indices,
+                             ego_indices_map, path_indices, device) -> torch.Tensor:
+        """批量查询预计算的道路边界距离 [batch]"""
+        if hasattr(self, 'ref_tensor'):
+            w_tensor = torch.tensor(list(world_indices), device=self.ref_tensor.device, dtype=torch.long)
+            p_tensor = torch.tensor(list(path_indices), device=self.ref_tensor.device, dtype=torch.long)
+            t_tensor = temporal_indices.long().clamp(0, self.ref_tensor.shape[3] - 1).to(self.ref_tensor.device)
+            return self.ref_tensor[w_tensor, 0, p_tensor, t_tensor, 4].to(device)
+        # CPU 回退
+        dists = []
+        for i in range(len(world_indices)):
+            w = world_indices[i]
+            a = ego_indices_map[w]
+            pid = path_indices[i]
+            t = int(temporal_indices[i])
+            path = self.candidate_paths[w][a][pid]
+            t = max(0, min(t, len(path['road_dist']) - 1))
+            dists.append(float(path['road_dist'][t]))
+        return torch.tensor(dists, device=device, dtype=torch.float32)
 
     @staticmethod
     def _calc_ref_error(ego_state: np.ndarray, ref_state: np.ndarray) -> np.ndarray:
@@ -488,14 +520,24 @@ class GPUDriveObservationBuilder:
         return np.array([delta_p, delta_phi, delta_v], dtype=np.float32)
 
     def get_ref_states_batch(self, world_indices, ego_xs, ego_ys,
-                              ego_indices_map: list,
-                              path_indices=None,
-                              temporal_indices=None) -> torch.Tensor:
+                               ego_indices_map: list,
+                               path_indices=None,
+                               temporal_indices=None) -> torch.Tensor:
         """
         批量获取参考状态，返回 [batch, 7] tensor。
         列：[rx, ry, rs, 0, rh, 0, nearest_idx]
-        当 temporal_indices 传入时，直接用时序索引替代空间最近点搜索。
+        当 temporal_indices 传入时，优先走 GPU tensor 索引（零 Python 循环）。
         """
+        if temporal_indices is not None and path_indices is not None and hasattr(self, 'ref_tensor'):
+            # GPU 快速路径：tensor 索引替代 Python 循环
+            w_tensor = torch.tensor(list(world_indices), device=self.ref_tensor.device, dtype=torch.long)
+            p_tensor = torch.tensor(list(path_indices), device=self.ref_tensor.device, dtype=torch.long)
+            t_tensor = temporal_indices.long().clamp(0, self.ref_tensor.shape[3] - 1).to(self.ref_tensor.device)
+            vals = self.ref_tensor[w_tensor, 0, p_tensor, t_tensor]
+            rx, ry, rs, rh, rd = vals[:, 0], vals[:, 1], vals[:, 2], vals[:, 3], vals[:, 4]
+            return torch.stack([rx, ry, rs, torch.zeros_like(rx), rh, torch.zeros_like(rx), t_tensor.float()], dim=-1)
+
+        # CPU 回退路径
         refs = []
         for i in range(len(world_indices)):
             w = world_indices[i]

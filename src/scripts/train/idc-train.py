@@ -228,7 +228,10 @@ def train(args):
                     ref_spd0 = builder.candidate_paths[w][a][pid]['speed'][0]
                     # utility 分解
                     ego = np.array([float(states[i][j]) for j in range(6)])
-                    ref = builder.get_ref_state_from_path(w, a, pid, ego[0], ego[1])
+                    path = builder.candidate_paths[w][a][pid]
+                    rx, ry = float(path['pos'][0, 0]), float(path['pos'][0, 1])
+                    rh, rs = float(path['heading'][0]), float(path['speed'][0])
+                    ref = np.array([rx, ry, rs, 0.0, rh, 0.0], dtype=np.float32)
                     pos_err = np.hypot(ego[0] - ref[0], ego[1] - ref[1])
                     heading_err = ego[4] - ref[4]
                     speed_err = np.hypot(ego[2], ego[3]) - ref[2]
@@ -304,12 +307,11 @@ if __name__ == "__main__":
     parser.add_argument('--hidden-dim', type=int, default=256)
     parser.add_argument('--lr-actor', type=float, default=8e-5)
     parser.add_argument('--lr-critic', type=float, default=3e-4)
-    parser.add_argument('--init-penalty', type=float, default=1.0)
+    parser.add_argument('--init-penalty', type=float, default=0.0,
+                        help='初始 ρ，0=纯追踪模式')
     parser.add_argument('--max-penalty', type=float, default=10.0)
     parser.add_argument('--amplifier-c', type=float, default=1.015)
     parser.add_argument('--pim-interval', type=int, default=30)
-    parser.add_argument('--tracking-only', action='store_true', default=False,
-                        help='纯跟踪诊断模式: 无penalty/无噪声/ρ固定为0')
     parser.add_argument('--fix-speed', action='store_true', default=False,
                         help='[诊断] speed_err恒为0，排除速度干扰')
     parser.add_argument('--fix-heading', action='store_true', default=False,

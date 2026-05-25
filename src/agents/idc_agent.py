@@ -33,7 +33,7 @@ class DiscreteIDCAgent:
         self.DIM_EGO = 6                  # [x, y, v_lon, v_lat, phi, omega] (车体坐标系)
         self.DIM_OTHERS = 32               # 8 车 × 4 (x, y, phi, v_lon)
         self.DIM_VALIDITY = 8             # 8 车 validity mask: 1=真实车 0=padding
-        self.DIM_REF_ERROR = 7            # [dp, dphi, dv, lat(t+3), dphi(t+3), lat(t+6), dphi(t+6)]
+        self.DIM_REF_ERROR = 12           # [dp, dphi, dv, lat+lphi+lroad ×3 for t+3, t+6, t+9]
         self.DIM_TEMPORAL = 1             # 时序索引，避免空间最近点跳变
         self.TOTAL_STATE_DIM = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR + self.DIM_TEMPORAL
         self.DIM_ROAD = 80
@@ -85,8 +85,7 @@ class DiscreteIDCAgent:
 
         # 回合数
         # 探索噪声
-        self.tracking_only = getattr(args, 'tracking_only', False)
-        self.noise_std = 0.1 if self.tracking_only else 0.15
+        self.noise_std = 0.1
         self.noise_decay_rate = 0.98
         self.noise_std_min = 0.03
 
@@ -267,23 +266,39 @@ class DiscreteIDCAgent:
         ego_speed = torch.hypot(ego_next_formatted[:, 2], ego_next_formatted[:, 3])
         delta_v = ego_speed - refs[:, 2]
 
-        # 6. 前瞻参考点：给 Actor 前方弯道信息（t+3, t+6）
+        # 6. 前瞻参考点：给 Actor 前方弯道/道路信息（t+3, t+6, t+9）
         tl1 = torch.clamp(temporal_next + 3, max=89)
         tl2 = torch.clamp(temporal_next + 6, max=89)
+        tl3 = torch.clamp(temporal_next + 9, max=89)
         refs_l1 = self.state_builder.get_ref_states_batch(
             w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
             temporal_indices=tl1)
         refs_l2 = self.state_builder.get_ref_states_batch(
             w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
             temporal_indices=tl2)
+        refs_l3 = self.state_builder.get_ref_states_batch(
+            w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
+            temporal_indices=tl3)
+
         lat_l1 = (refs_l1[:, 1] - y_next) * torch.cos(refs_l1[:, 4]) - (refs_l1[:, 0] - x_next) * torch.sin(refs_l1[:, 4])
         dphi_l1 = refs_l1[:, 4] - theta_next
         dphi_l1 = torch.atan2(torch.sin(dphi_l1), torch.cos(dphi_l1))
+        road_l1 = self.state_builder.get_road_dist_batch(w_i, tl1, self.ego_indices, p_i, x_next.device)
+
         lat_l2 = (refs_l2[:, 1] - y_next) * torch.cos(refs_l2[:, 4]) - (refs_l2[:, 0] - x_next) * torch.sin(refs_l2[:, 4])
         dphi_l2 = refs_l2[:, 4] - theta_next
         dphi_l2 = torch.atan2(torch.sin(dphi_l2), torch.cos(dphi_l2))
+        road_l2 = self.state_builder.get_road_dist_batch(w_i, tl2, self.ego_indices, p_i, x_next.device)
 
-        ref_error_tensors = torch.stack([delta_p, delta_phi, delta_v, lat_l1, dphi_l1, lat_l2, dphi_l2], dim=-1)
+        lat_l3 = (refs_l3[:, 1] - y_next) * torch.cos(refs_l3[:, 4]) - (refs_l3[:, 0] - x_next) * torch.sin(refs_l3[:, 4])
+        dphi_l3 = refs_l3[:, 4] - theta_next
+        dphi_l3 = torch.atan2(torch.sin(dphi_l3), torch.cos(dphi_l3))
+        road_l3 = self.state_builder.get_road_dist_batch(w_i, tl3, self.ego_indices, p_i, x_next.device)
+
+        ref_error_tensors = torch.stack([delta_p, delta_phi, delta_v,
+                                          lat_l1, dphi_l1, road_l1,
+                                          lat_l2, dphi_l2, road_l2,
+                                          lat_l3, dphi_l3, road_l3], dim=-1)
         
         # 组合并返回最终状态
         next_states = []
@@ -296,7 +311,6 @@ class DiscreteIDCAgent:
     def tensor_to_state_tensor(self, ego_tensor, others_tensor, validity_tensor, ref_error_tensor, temporal_idx):
         """组合状态张量"""
         return torch.cat([ego_tensor, others_tensor.view(-1), validity_tensor, ref_error_tensor, temporal_idx.view(-1)], dim=-1)
-
 
     def update_critic(self, states, world_indices, path_indices=None):
         logger.debug(f'更新 Critic: states batch size={states.shape[0]}')
@@ -332,28 +346,30 @@ class DiscreteIDCAgent:
     def update_actor(self, states, w_i, p_i=None):
         total_cost = torch.zeros(states.shape[0], device=self.device)
         s = states
+        ref_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
         for t in range(self.horizon):
             u = self.actor(s)
             s = self.f_pred_batch(s, u, w_i, p_i)
             l = self.utility_batch(s, u, w_i, p_i)
+            if t == 0:
+                logger.info(f'[LA-DIAG] l1(lat={s[0, ref_start+3]:.2f} dphi={s[0, ref_start+4]:.3f} road={s[0, ref_start+5]:.1f}) '
+                            f'l2(lat={s[0, ref_start+6]:.2f} dphi={s[0, ref_start+7]:.3f} road={s[0, ref_start+8]:.1f}) '
+                            f'l3(lat={s[0, ref_start+9]:.2f} dphi={s[0, ref_start+10]:.3f} road={s[0, ref_start+11]:.1f}) '
+                            f'delta_p={s[0, ref_start]:.2f} delta_phi={s[0, ref_start+1]:.3f}')
             l = torch.clamp(l, -5000.0, 5000.0)
-            if self.tracking_only:
-                p = torch.zeros_like(l)  # penalty 归零
-            else:
-                p = self.penalty_batch(s, w_i)
-                if t == 0:
-                    logger.debug(f'[DIAG-pen] raw penalty min={p.min().item():.2f} max={p.max().item():.2f} '
-                                f'mean={p.mean().item():.2f}  (rho={self.rho:.4f})')
+            p = self.penalty_batch(s, w_i)
+            if t == 0:
+                logger.debug(f'[DIAG-pen] raw penalty min={p.min().item():.2f} max={p.max().item():.2f} '
+                            f'mean={p.mean().item():.2f}  (rho={self.rho:.4f})')
             total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
 
         actor_loss = total_cost.mean()
 
-        # 衰减探索噪声 (tracking_only 模式下跳过)
-        if not self.tracking_only:
-            old_std = self.noise_std
-            self.noise_std = max(self.noise_std_min, self.noise_std * self.noise_decay_rate)
-            if abs(old_std - self.noise_std) > 1e-4:
-                logger.debug(f'[DIAG-noise] decay {old_std:.4f} -> {self.noise_std:.4f}')
+        # 衰减探索噪声（所有模式统一衰减）
+        old_std = self.noise_std
+        self.noise_std = max(self.noise_std_min, self.noise_std * self.noise_decay_rate)
+        if abs(old_std - self.noise_std) > 1e-4:
+            logger.debug(f'[DIAG-noise] decay {old_std:.4f} -> {self.noise_std:.4f}')
 
         # 保存权重副本，用于 NaN 回滚
         backup = {name: param.clone() for name, param in self.actor.named_parameters()}
@@ -409,8 +425,8 @@ class DiscreteIDCAgent:
              + (0.0 if self.fix_heading else self.heading_err_weight) * heading_err ** 2
              + self.steer_cost_weight * steer_cost
              + self.acc_cost_weight * acc_cost
-             + self.lookahead_pos_weight * (s[:, ref_start + 3] ** 2 + s[:, ref_start + 5] ** 2)
-             + self.lookahead_heading_weight * (s[:, ref_start + 4] ** 2 + s[:, ref_start + 6] ** 2))
+             + self.lookahead_pos_weight * (s[:, ref_start + 3] ** 2 + s[:, ref_start + 6] ** 2 + s[:, ref_start + 9] ** 2)
+             + self.lookahead_heading_weight * (s[:, ref_start + 4] ** 2 + s[:, ref_start + 7] ** 2 + s[:, ref_start + 10] ** 2))
 
         # 诊断：每次调用自动抓 pos_err 最大的样本
         max_idx = pos_err.argmax().item()
@@ -481,8 +497,7 @@ class DiscreteIDCAgent:
         actor_loss = None
         if self.pev_step >= self.pim_interval:
             self.pev_step = 0
-            if not self.tracking_only:
-                self.rho = min(self.rho * self.amplifier_c, self.max_penalty)
+            self.rho = min(self.rho * self.amplifier_c, self.max_penalty)
             self.gep_iteration += 1
             actor_loss = self.update_actor(states_tensor, word_indexs, path_indices)
 

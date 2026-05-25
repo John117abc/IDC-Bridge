@@ -707,24 +707,13 @@ Agent 在训练中认为自己能转过某弯，但真实环境转不过去。
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| state dim | **54** | ego(6) + others(32) + validity(8) + ref_error(7) + temporal(1) |
-| ref_error | `[dp, dphi, dv, lat(t+3), dphi(t+3), lat(t+6), dphi(t+6)]` | 当前 + 前瞻 |
-| `pos_err_weight` | 0.3 | 位置误差权重 |
-| `speed_err_weight` | 0.04 | 速度误差权重 |
-| `heading_err_weight` | 0.3 | 朝向误差权重 |
-| `steer_cost_weight` | 0.3 | 转向控制代价 |
-| `acc_cost_weight` | 0.005 | 加速控制代价 |
-| `lookahead_pos_weight` | 0.05 | 前瞻位置误差权重 |
-| `lookahead_heading_weight` | 0.05 | 前瞻航向误差权重 |
-| `D_veh_safe` | 2.0 | 双圆心碰撞阈值 |
-| `D_road_safe` | 2.0 | 道路安全距离 |
-| `HALF_L` | 2.25 | 半车长 |
-| `HALF_W` | 1.0 | 半车宽 |
-| `noise_std` | 0.1（tracking）/ 0.15（正常）→ 0.03（×0.98/PIM） | 探索噪声（所有模式统一衰减） |
+| state dim | **59** | ego(6) + others(32) + validity(8) + ref_error(12) + temporal(1) |
+| ref_error | `[dp, dphi, dv, lat+road×3 at t+3/6/9]` | 当前 + 前瞻 3 点（含道路边界预览） |
+| `noise_std` | 0.1 → 0.03（×0.98/PIM） | 探索噪声（统一衰减，不区分模式） |
 | `lr_actor` | 8e-5 | Actor 学习率 |
 | `lr_critic` | 3e-4 | Critic 学习率 |
 | `dt` | 0.1 | 时间步长（秒） |
-| `horizon` | 12 | 推演步数 |
+| `horizon` | 20 | 推演步数 |
 | `batch_size` | 512 | PEV/PIM 采样数 |
 | `num_worlds` | 200 | 环境世界数 |
 | `max_penalty` (ρ 上限) | 10 | 最大惩罚系数 |
@@ -742,3 +731,88 @@ Agent 在训练中认为自己能转过某弯，但真实环境转不过去。
 | 坏世界过滤 | 阶段1 预训练路径检查 + 每步 ego 检查 | 异常值不进 buffer |
 | 候选路径选择 | **episode 级别固定** | 消除步间跳变 |
 | 道路宽度 | **动态读取 segment_width** | invalid 时 fallback 3.75 |
+| rho 模式 | `--init-penalty 0` = 纯追踪, `≥1.0` = 含 penalty | 替代旧的 `--tracking-only` flag |
+
+---
+
+## 34. 统一框架 + 3 点前瞻 + 道路预览（大版本）
+
+**改动**：去掉 `tracking_only` 分支，用 `rho=0` 控制追踪模式；前瞻从 2 点扩展到 3 点（t+3/t+6/t+9），每点加入道路边界距离；道路边界距离预计算 + GPU ref_tensor 消除 Python 循环瓶颈。
+
+### State 布局（59 维）
+
+| 区间 | 维度 | 内容 |
+|------|------|------|
+| [0:6] | 6 | ego |
+| [6:38] | 32 | others |
+| [38:46] | 8 | validity |
+| [46:58] | 12 | ref_error: `[dp, dphi, dv, lat+tphi+troad ×3 at t+3/6/9]` |
+| [58:59] | 1 | temporal |
+
+### ref_error 细节（12 维）
+
+| 索引 | 含义 | utility | penalty |
+|------|------|:---:|:---:|
+| [0] | `delta_p` 当前横向误差 | ✓ | — |
+| [1] | `delta_phi` 当前航向误差 | ✓ | — |
+| [2] | `delta_v` 当前速度误差 | ✓ | — |
+| [3-5] | t+3: lat / dphi / road_dist | lat+dphi ✓ | 仅 state |
+| [6-8] | t+6: lat / dphi / road_dist | lat+dphi ✓ | 仅 state |
+| [9-11] | t+9: lat / dphi / road_dist | lat+dphi ✓ | 仅 state |
+
+**road_dist 语义**：参考路径上方道路边界距离（路径属性，不受自车偏航影响）。penalty 仍用 `get_road_edges_batch` 实时计算自车位置的道路距离，两者独立。
+
+### 统一框架改动
+
+| 改动 | 说明 |
+|------|------|
+| 移除 `self.tracking_only` | 不再有 tracking/full 模式分支 |
+| `if tracking_only: p = zeros` → 移除 | penalty 由 `self.rho * p` 控制，rho=0 时自然归零 |
+| `if not tracking_only: noise_decay` → 移除 | 所有模式统一衰减 σ×0.98/PIM |
+| `if not tracking_only: rho *= c` → 移除 | rho 始终放大，rho=0 时保持 0 |
+| CLI: `--init-penalty 0` 替代 `--tracking-only` | 追踪模式：rho=0；正常：rho=1.0 |
+
+### 性能优化：road_dist 预计算 + GPU ref_tensor
+
+**问题**：每次 `f_pred_batch` 调用 `_road_dist_batch` 做 O(N) 最近邻搜索 → 每 rollout 3 万次搜索 → 训练极慢。
+
+**修复分两步**：
+
+**Step 1 — 预计算 road_dist**：`generate_candidate_paths` 中一次性算好 91×3 点的 road_dist，存入 `path['road_dist']`，后续 O(1) 查表。
+
+**Step 2 — GPU ref_tensor**：初始化时构建 `self.ref_tensor` [num_worlds, 1, num_paths, 91, 5]，存 pos_x/pos_y/speed/heading/road_dist，放在 GPU。`get_ref_states_batch` 和 `get_road_dist_batch` 新增 GPU fast path，用 `ref_tensor[w, a, p, t]` 单次 tensor 索引替代 Python 循环。
+
+| 接口 | 改前 | 改后 |
+|------|------|------|
+| `get_ref_states_batch` ×4 | 4×512 Python 浮点转换 + `torch.tensor` | 4 次 GPU tensor 索引 |
+| `get_road_dist_batch` ×3 | O(N) 最近邻搜索 ×3 | 0 次（归入 ref_tensor 索引） |
+| **每步总 Python→C 往返** | ~4000 次 | **~0 次** |
+
+### 相关文件改动汇总
+
+| 文件 | 方法/位置 | 改动 |
+|------|----------|------|
+| `idc_agent.py` | `__init__` | `DIM_REF_ERROR=12`, 移除 `tracking_only`, `noise_std=0.1` |
+| `idc_agent.py` | `f_pred_batch` | 3 前瞻点 + `get_road_dist_batch`（GPU 路径） |
+| `idc_agent.py` | `utility_batch` | 3 点 lat+dphi 成本，road 不入 utility |
+| `idc_agent.py` | `update_actor` | 移除 tracking_only 分支 |
+| `idc_agent.py` | `update` | 移除 rho 放大的 tracking_only 守卫 |
+| `idc_state_builder.py` | `generate_candidate_paths` | road_dist 预计算 + 构建 `ref_tensor` |
+| `idc_state_builder.py` | `get_ref_states_batch` | GPU fast path（当 temporal_indices 传入时） |
+| `idc_state_builder.py` | `get_road_dist_batch` | GPU fast path（`ref_tensor[..., 4]`） |
+| `idc_state_builder.py` | `get_idc_observations_batch` | 3 前瞻点 road_dist 直接查 `path['road_dist']` |
+| `idc_state_builder.py` | 新增 `_road_dist_point` | @staticmethod 道路距离纯函数 |
+| `idc_state_builder.py` | 删除 `_road_edge_dist` | 被 `_road_dist_point` + 预计算替代 |
+| `idc_agent.py` | 删除 `_road_dist_batch` | 被 builder 的 `get_road_dist_batch` 替代 |
+| `idc-train.py` | CLI args | 删除 `--tracking-only`, `--init-penalty` 默认 0 |
+| `idc-train.py` | DIAG-init | 修复 `get_ref_state_from_path` bug（直接读 candidate_paths） |
+
+### 训练命令
+
+```bash
+# 纯追踪（rho=0）:
+python src/scripts/train/idc-train.py --init-penalty 0 --data-dir <path>
+
+# 正常训练（rho=1.0）:
+python src/scripts/train/idc-train.py --init-penalty 1.0 --data-dir <path>
+```
