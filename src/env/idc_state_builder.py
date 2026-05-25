@@ -47,6 +47,10 @@ class GPUDriveObservationBuilder:
         self.candidate_paths = {}
         self.num_candidate_paths = num_paths
 
+        # 动态获取每个 world 的道路宽度（从 map_observation 的 segment_width）
+        road_tensor = self.sim.map_observation_tensor().to_torch().cpu().numpy()
+        WIDTH_IDX = 3
+
         for w in range(self.num_worlds):
             a = ego_indices[w]
             self.candidate_paths[w] = {}
@@ -55,13 +59,22 @@ class GPUDriveObservationBuilder:
             ep = self.expert_pos[w, a, -1].cpu().numpy()
             sh = float(self.expert_heading[w, a, 0].item())
             eh = float(self.expert_heading[w, a, -1].item())
-            # 专家时变速度（每步一个标量），红绿灯路口专家速度会降到 0
             expert_spd = self.expert_vel[w, a].norm(dim=-1).cpu().numpy()
+
+            # 从道路图中提取该 world 的实际车道宽度
+            world_road = road_tensor[w]
+            dx = world_road[:, 0] - sp[0]
+            dy = world_road[:, 1] - sp[1]
+            nearest = int(np.argmin(dx * dx + dy * dy))
+            dynamic_width = float(world_road[nearest, WIDTH_IDX])
+            if dynamic_width <= 0.0 or not np.isfinite(dynamic_width):
+                dynamic_width = lane_width  # fallback
+            logger.debug(f'[LANE-WIDTH] world_{w} width={dynamic_width:.2f}m')
 
             paths = []
             offsets = [0.0]
             if num_paths >= 3:
-                offsets = [-lane_width, 0.0, lane_width]
+                offsets = [-dynamic_width, 0.0, dynamic_width]
 
             for offset in offsets:
                 path = self._make_bezier_path(
@@ -451,7 +464,7 @@ class GPUDriveObservationBuilder:
         cross = dy * math.cos(ref_state[4]) - dx * math.sin(ref_state[4])
         delta_p *= math.copysign(1.0, cross)
 
-        delta_phi = math.atan2(dy, dx) - ego_state[4]
+        delta_phi = ref_state[4] - ego_state[4]
         delta_phi = math.atan2(math.sin(delta_phi), math.cos(delta_phi))
 
         delta_v = math.hypot(ego_state[2], ego_state[3]) - ref_state[2]

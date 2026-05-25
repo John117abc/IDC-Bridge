@@ -11,7 +11,7 @@ class DiscreteActionMapper:
     并支持反向查表（用于前向预测时从连续量找到最近的离散动作）。
     """
     def __init__(self, steer_bins=13, accel_bins=7,
-                 steer_range=(-0.4, 0.4), accel_range=(-3.0, 1.5)):
+                 steer_range=(-0.6, 0.6), accel_range=(-3.0, 1.5)):
         self.steer_bins = steer_bins
         self.accel_bins = accel_bins
         self.steer_edges = torch.linspace(steer_range[0], steer_range[1], steer_bins)

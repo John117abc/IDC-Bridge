@@ -32,7 +32,7 @@ class KinematicBicycleModel(nn.Module):
     def __init__(
         self,
         dt: float = 0.1,
-        L: float = 4.0,
+        L: float = 5.0,
         lr_ratio: float = 0.5,
         v_max: float = 30.0,
     ):

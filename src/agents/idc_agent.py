@@ -120,8 +120,8 @@ class DiscreteIDCAgent:
                 norm_action = norm_action + noise
                 norm_action = torch.clamp(norm_action, -1.0, 1.0)
 
-            # 转向映射：[-1,1] → [-0.4,0.4] rad
-            delta_phy = norm_action[..., 0] * 0.4
+            # 转向映射：[-1,1] → [-0.6,0.6] rad
+            delta_phy = norm_action[..., 0] * 0.6
 
             # 加速度映射：分段线性，norm=0 时输出 0（默认滑行），范围保持 [-3.0, 1.5]
             a_phy = torch.where(
@@ -214,7 +214,7 @@ class DiscreteIDCAgent:
         temporal_next = (temporal_idx + 1).long()
         
         # 1. 动力学推演（将Actor原始输出映射为物理量，与select_action保持一致）
-        delta_phy = actions[..., 0] * 0.4  # 转向：[-1,1] → [-0.4, 0.4] rad
+        delta_phy = actions[..., 0] * 0.6  # 转向：[-1,1] → [-0.6, 0.6] rad
         a_phy = torch.where(actions[..., 1] >= 0,
                             actions[..., 1] * 1.5,
                             actions[..., 1] * 3.0)  # 加速度：[-1,1] → [-3.0, 1.5] m/s²
@@ -259,7 +259,7 @@ class DiscreteIDCAgent:
                                f'ego=({x_next[i].item():.1f},{y_next[i].item():.1f}) '
                                f'ref=({ref_x[i].item():.1f},{ref_y[i].item():.1f})')
 
-        delta_phi = torch.atan2(dy, dx) - theta_next
+        delta_phi = refs[:, 4] - theta_next
         delta_phi = torch.atan2(torch.sin(delta_phi), torch.cos(delta_phi))
         
         ego_speed = torch.hypot(ego_next_formatted[:, 2], ego_next_formatted[:, 3])

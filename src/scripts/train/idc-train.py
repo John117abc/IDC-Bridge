@@ -149,16 +149,18 @@ def train(args):
         viz_list = [TrajectoryVisualizer(builder, w, ego_indices[w])
                     for w in VIZ_WORLDS]
 
+        # 候选路径索引：每个 episode 固定，避免步间跳变
+        episode_path_indices = [np.random.randint(builder.num_candidate_paths)
+                                for _ in range(args.num_worlds)]
+
         for step in range(max_step):
             if step % 10 == 0:
                 logger.info(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
             else:
                 logger.debug(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
 
-            path_indices = [np.random.randint(builder.num_candidate_paths)
-                           for _ in range(args.num_worlds)]
             states = builder.get_idc_observations_batch(ego_indices,
-                                                        path_indices=path_indices)
+                                                        path_indices=episode_path_indices)
 
             # [诊断] 每步剔除 ego 坐标异常 world，同时打印 delta_p 判断是否为误杀
             ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
@@ -194,7 +196,7 @@ def train(args):
             for w in range(args.num_worlds):
                 if w in bad_worlds:
                     continue
-                agent.buffer.handle_new_experience((states[w], w, path_indices[w]))
+                agent.buffer.handle_new_experience((states[w], w, episode_path_indices[w]))
                 builder.increment_step(w)
 
             # 记录可视化世界的自车位置
@@ -222,7 +224,7 @@ def train(args):
                     racc = norm_2d[i, 0, 1].item()
                     w = i
                     a = ego_indices[w]
-                    pid = path_indices[w]
+                    pid = episode_path_indices[w]
                     ref_spd0 = builder.candidate_paths[w][a][pid]['speed'][0]
                     # utility 分解
                     ego = np.array([float(states[i][j]) for j in range(6)])
