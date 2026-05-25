@@ -225,7 +225,7 @@ class DiscreteIDCAgent:
         # 2. 参考点查询（用时序索引替代空间最近点，消除跳变）
         refs = self.state_builder.get_ref_states_batch(
             w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
-            temporal_indices=temporal_idx)
+            temporal_indices=temporal_next)
         ref_x, ref_y = refs[:, 0], refs[:, 1]
 
         # 3. 直接使用动力学输出（坏world已由训练脚本过滤，不再需要clamp）

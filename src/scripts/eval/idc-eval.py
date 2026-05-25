@@ -184,6 +184,6 @@ if __name__ == "__main__":
     parser.add_argument('--save-freq', type=int, default=1)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
     parser.add_argument('--load-model', type=bool, default=False)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260519/idc-waymo-v1.0_examples_142229_episode=40.pth")
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260521/idc-waymo-v1.0_examples_000302_episode=465.pth")
     args = parser.parse_args()
     evaluate(args)

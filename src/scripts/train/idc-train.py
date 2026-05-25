@@ -317,7 +317,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=5)
     parser.add_argument('--save-freq', type=int, default=5)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
-    parser.add_argument('--load-model', type=bool, default=True)
+    parser.add_argument('--load-model', type=bool, default=False)
     parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260519/idc-waymo-v1.0_examples_150035_episode=50.pth")
     args = parser.parse_args()
     train(args)
