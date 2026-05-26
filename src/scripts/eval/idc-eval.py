@@ -119,6 +119,10 @@ def evaluate(args):
     # 加载模型
     logger.info(f'正在加载模型: {args.model_path}')
     agent.load(args.model_path)
+    # CLI 参数可覆盖 checkpoint 中的 rho/max_penalty
+    agent.rho = args.init_penalty
+    agent.max_penalty = args.max_penalty
+    logger.info(f'评估模式: rho={agent.rho}, max_penalty={agent.max_penalty}')
 
     # 生成损失曲线图
     logger.info('正在生成损失曲线图...')

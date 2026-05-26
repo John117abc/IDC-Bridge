@@ -370,7 +370,7 @@ if __name__ == "__main__":
     parser.add_argument('--num-worlds', type=int, default=150)
     parser.add_argument('--max-agents', type=int, default=1)
     parser.add_argument('--max-steps', type=int, default=90)
-    parser.add_argument('--epochs', type=int, default=300)
+    parser.add_argument('--epochs', type=int, default=600)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--dt', type=float, default=0.1)
     parser.add_argument('--horizon', type=int, default=20)
@@ -378,7 +378,7 @@ if __name__ == "__main__":
     parser.add_argument('--hidden-dim', type=int, default=256)
     parser.add_argument('--lr-actor', type=float, default=8e-5)
     parser.add_argument('--lr-critic', type=float, default=3e-4)
-    parser.add_argument('--init-penalty', type=float, default=0.0,
+    parser.add_argument('--init-penalty', type=float, default=1.0,
                         help='初始 ρ，0=纯追踪模式')
     parser.add_argument('--max-penalty', type=float, default=10.0)
     parser.add_argument('--amplifier-c', type=float, default=1.015)
@@ -396,7 +396,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=5)
     parser.add_argument('--save-freq', type=int, default=5)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
-    parser.add_argument('--load-model', type=bool, default=False)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260525/idc-waymo-v1.0_examples_161136_episode=225.pth")
+    parser.add_argument('--load-model', type=bool, default=True)
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260526/track_350_eps.pth")
     args = parser.parse_args()
     train(args)

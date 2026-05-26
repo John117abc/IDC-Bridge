@@ -548,7 +548,7 @@ class DiscreteIDCAgent:
         self.globe_eps = checkpoint['globe_eps']
         self.history_loss = checkpoint['history']
         self.global_step = checkpoint['global_step']
-        self.rho = checkpoint['rho']
+        self.rho = checkpoint['rho'] == 0.0 and self.args.init_penalty or checkpoint['rho']
         self.gep_iteration = checkpoint['gep_iteration']
         return checkpoint
         

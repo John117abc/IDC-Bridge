@@ -897,3 +897,130 @@ python src/scripts/train/idc-train.py --init-penalty 0 --data-dir <path>
 # 正常训练（rho=1.0）:
 python src/scripts/train/idc-train.py --init-penalty 1.0 --data-dir <path>
 ```
+
+---
+
+## 38. Bezier 弧线偏离 → Expert 轨迹替代
+
+**现象**：Bezier 参考路径在弯道上产生 1-3m 弧线偏差，车辆 tracking 差、参考路径"开出路外"。
+
+**根因**：Cubic Bezier 仅约束起终点航向，中间 80m 自由发挥。起终点航向差异越大，弧线偏离越严重。
+
+**尝试过的方案**：
+
+| 方案 | 效果 | 结果 |
+|------|------|------|
+| 多段 Bezier（直线锚点） | 直线锚点在弯道外，弧线反而更大 | ✗ 放弃 |
+| 多段 Bezier（圆弧锚点） | 数学正确但 Bezier 在急弯处会跨过道路边界 | ✗ 放弃 |
+
+**最终方案**：训练时直接用 expert 轨迹（零偏差），Bezier 保留供 CARLA 迁移。
+
+### 实现
+
+`generate_candidate_paths` 中路径生成：
+
+```
+pid=1（中心线）: expert_pos 直接复制 91 点
+pid=0（左偏移）: expert_pos 每点沿左垂向偏移 -lane_width
+pid=2（右偏移）: expert_pos 每点沿右垂向偏移 +lane_width
+
+heading → expert_heading 直接复制
+speed → expert_vel 直接复制
+road_dist → 预计算不变
+```
+
+`_make_multi_bezier_path` 代码保留（不调用），CARLA 迁移时启用。
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `idc_state_builder.py:54-103` | `generate_candidate_paths` 中 Bezier → expert 逐点偏移 |
+| `idc_state_builder.py:129-226` | `_make_multi_bezier_path` 保留（不删） |
+
+---
+
+## 39. 评估脚本支持 rho 参数覆盖
+
+**问题**：`agent.load()` 会从 checkpoint 恢复 `self.rho`，无法在评估时用 CLI 覆盖。
+
+**修复**：`idc-eval.py` 中 `agent.load()` 后新增：
+
+```python
+agent.rho = args.init_penalty
+agent.max_penalty = args.max_penalty
+```
+
+现在可以：
+
+```bash
+# 纯追踪评估
+python idc-eval.py --init-penalty 0 --model-path ...
+
+# 含 penalty 评估
+python idc-eval.py --init-penalty 1.0 --max-penalty 10.0 --model-path ...
+```
+
+---
+
+## 40. 世界重采样 OOM 修复
+
+**现象**：`swap_data_batch` 时 CUDA OOM（CUDA_ERROR_OUT_OF_MEMORY）。
+
+**根因**：swap 前 builder 持有旧世界的 `ref_tensor`、`expert_pos/vel/heading` 等 GPU 张量。`sim.set_maps()` 加载新世界时新旧数据叠加 → 双倍显存 → OOM。
+
+**修复**：`resample_worlds` 开头主动释放：
+
+```python
+for attr in ['ref_tensor', 'expert_pos', 'expert_vel', 'expert_heading', 'candidate_paths', '_road_cache']:
+    if hasattr(builder, attr):
+        delattr(builder, attr)
+torch.cuda.empty_cache()
+```
+
+然后 `_setup_expert_data()` + `generate_candidate_paths()` 重建新数据。
+
+---
+
+## 41. GPUDrive 坐标异常确认
+
+**现象**：训练中每 epoch 过滤 50+ 世界，远远超过预期的 1-2/ep。
+
+**诊断**：检查 `[FILTER-ego]` 日志，所有被过滤世界的 ego 坐标均为 `(-11000, -11000)`。这是 GPUDrive 模拟器的已知缺陷——某些场景在 episode 中触发坐标跳变。
+
+**结论**：不是 IDC 代码问题，是世界重采样阈值方案正确运行的表现。`bad_worlds` 统计和 threshold 机制正常工作。
+
+---
+
+## 42. Road type 语义澄清
+
+**现象**：可视化图中 road_line（灰色）看起来像车道边缘，road_edge（棕色）像中心线。
+
+**GPUDrive 原始 type 映射**：
+
+| Type 值 | 名称 | 含义 |
+|:---:|------|------|
+| 1 | road_line | 车道标线（虚线/实线） |
+| 2 | road_edge | 道路边界（路沿/中间带） |
+| 3 | lane_center | 车道中心线 |
+
+当前代码 `_road_dist_point` 使用 `type=1`（road_line = 车道标线），计算"到最近车道标线的距离"。
+
+| 模块 | type=1 效果 | type=2 效果 |
+|------|-----------|-----------|
+| road_dist（前瞻状态） | 到最近车道标线距离 | 到道路边界距离 |
+| road_violation（penalty） | 偏离标线 > 2m 触发 | 偏离边界 > 2m 触发 |
+
+**结论**：tracking-only 阶段（rho=0）无影响。penalty 阶段（rho>0）时再讨论是否切换 type。
+
+---
+
+## 43. eval 脚本 CLI 更新
+
+评估脚本 `idc-eval.py` CLI 已支持：
+
+```bash
+--init-penalty 0        # 纯追踪评估
+--init-penalty 1.0      # 含 penalty 评估
+--max-penalty 10.0      # ρ 上限
+```
