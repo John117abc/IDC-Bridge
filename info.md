@@ -734,8 +734,12 @@ Agent 在训练中认为自己能转过某弯，但真实环境转不过去。
 | 候选路径选择 | **episode 级别固定** | 消除步间跳变 |
 | 道路宽度 | **动态读取 segment_width** | invalid 时 fallback 3.75 |
 | rho 模式 | `--init-penalty 0` = 纯追踪, `≥1.0` = 含 penalty | 替代旧的 `--tracking-only` flag |
-| 世界重采样 | **坏世界 > `--max-bad-worlds` 时自动触发** | 从全量池随机抽取新世界 |
-| 数据池大小 | **`--dataset-size` 自动检测 data_dir 下 tfrecord 文件数** | 0=自动, 手动指定可覆盖 |
+| 世界重采样 | **坏世界 > `--max-bad-worlds` 时自动触发** | 从密集池随机抽取新世界 |
+| 数据池大小 | **`--dataset-size` 0 = 自动检测** | 重采样候选池 |
+| 参考路径 pos/heading | **expert** | 精确道路中心线 |
+| 参考路径 speed | **`_curvature_speed` 曲率限速** | v_max=20m/s, a_lat=2.5m/s² |
+| 密度缓存 | **`--min-partner-density 2.0`** | 随机抽样 2000 文件，30 秒生成 |
+| 稠密池 | **`--dense-sample-size 500`** | resample 优先从此池采样 |
 
 ---
 
@@ -1024,3 +1028,80 @@ torch.cuda.empty_cache()
 --init-penalty 1.0      # 含 penalty 评估
 --max-penalty 10.0      # ρ 上限
 ```
+
+---
+
+## 44. 路径生成终版 + 密度采样 + 统一框架（大清理）
+
+**日期**：2026-05-26
+
+**目标**：统一默认路径生成方式为 expert pos/heading + 曲率限速，删除废弃代码，加入密度缓存降低避障场景稀疏问题。
+
+### 路径生成：Expert + Curvature Speed（唯一默认）
+
+删除 3 个废弃方法，统一默认：
+
+| 删除 | 原因 |
+|------|------|
+| `_make_bezier_path`（单段 Bezier） | 弧线偏差 ~1.5m |
+| `_make_multi_bezier_path`（多段 Bezier） | 圆弧锚点方案也放弃了 |
+| `_make_spline_path`（lane_center spline） | spline 在交叉口 road ID 断裂 |
+
+保留 `_curvature_speed`（曲率限速）：
+
+```
+v[i] = min(20, sqrt(2.5 / (|κ[i]| + 1e-6)))
+v_max = 20 m/s (72 km/h), a_lat_max = 2.5 m/s²
+```
+
+3 条候选路径（pid 0/1/2）：
+```
+pos    → expert_pos + lateral_offset（逐点垂向偏移）
+heading → expert_heading（直接复制）
+speed  → _curvature_speed(pos)（纯静态，消除避障减速信号）
+```
+
+删除 `--use-road-spline` CLI flag，net 净删除 ~175 行。
+
+### 密度缓存 + 稠密世界采样
+
+**问题**：Waymo 数据稀疏场景多，penalty 训练时触发信号不足。
+
+**方案**：从全量池随机抽样 2000 文件计算 partner density，缓存到 JSON。
+
+```python
+# 密度检测单次 ~30 秒
+probe_files = random.sample(all_files, 2000)
+for each batch in probe_files:
+    valid partner count → density_cache[file] = avg_count
+
+# 训练中 resample 时优先稠密池
+dense_files = sorted by density[:dense_sample_size]
+batch = random.sample(dense_files, num_worlds)  # 稠密池够大时
+```
+
+| CLI 参数 | 默认 | 说明 |
+|------|--------|------|
+| `--min-partner-density` | 2.0 | 平均周车数阈值 |
+| `--dense-sample-size` | 500 | 稠密候选池大小 |
+
+缓存独立于 checkpoint，依赖不变可复用。
+
+### 其他本次改动
+
+| 改动 | 说明 |
+|------|------|
+| 路径生成简化 | 无分支、无 CLI flag、统一默认 |
+| eval CLI rho 覆盖 | `agent.load()` 后 `agent.rho = args.init_penalty` |
+| 密度缓存用主 env | 不再创建第二个 GPUDriveTorchEnv（避免 setCudaHeapSize 冲突） |
+| `os.listdir` 删除 | 70k 文件列表不再打印到 stdout |
+
+### 删除的废弃方法清单
+
+| 方法 | 文件 | 行 |
+|------|------|-----|
+| `_make_bezier_path` | idc_state_builder.py | ~37 |
+| `_make_multi_bezier_path` | idc_state_builder.py | ~110 |
+| `_make_spline_path` | idc_state_builder.py | ~77 |
+| `_road_edge_dist` | idc_state_builder.py | ~13 |
+| `_road_dist_batch` | idc_agent.py | 3 |

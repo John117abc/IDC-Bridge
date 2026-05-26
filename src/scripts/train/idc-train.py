@@ -44,8 +44,7 @@ def extend_action_to_3d(actions_2d):
 def train(args):
     
     print("Data root:", args.data_dir)
-    print("Files found:", os.listdir(args.data_dir))
-    
+
     # 自动检测全量数据池大小
     total_files = len([f for f in os.listdir(args.data_dir) if f.startswith('tfrecord')])
     dataset_size = args.dataset_size if args.dataset_size > 0 else total_files
@@ -92,6 +91,51 @@ def train(args):
     all_files = all_files[:dataset_size]
     random.Random(args.seed).shuffle(all_files)
     logger.info(f'全量文件池: {len(all_files)} 个')
+
+    # ================================================
+    # 世界密度缓存：筛选高密度场景供 penalty 训练
+    # ================================================
+    density_cache_file = os.path.join(args.file_dir, "world_density.json")
+    density_cache = {}
+    if os.path.exists(density_cache_file):
+        with open(density_cache_file, 'r') as f:
+            density_cache = json.load(f)
+        logger.info(f'密度缓存已加载: {len(density_cache)} 个世界')
+    else:
+        probe_size = min(2000, len(all_files))
+        probe_files = random.sample(all_files, probe_size)
+        logger.info(f'正在计算世界密度缓存（随机抽样 {probe_size}/{len(all_files)} 个文件，约 30 秒）...')
+        first_batch = list(env.data_batch)
+        batch_size = args.num_worlds
+        for batch_start in range(0, probe_size, batch_size):
+            batch_end = min(batch_start + batch_size, probe_size)
+            batch = probe_files[batch_start:batch_end]
+            if len(batch) < batch_size:
+                batch = batch + [probe_files[0]] * (batch_size - len(batch))
+            env.swap_data_batch(data_batch=batch)
+            env.reset()
+            p_np = env.sim.partner_observations_tensor().to_torch().cpu().numpy()
+            for w in range(batch_size):
+                fidx = batch_start + w
+                if fidx < probe_size:
+                    p = p_np[w, 0]
+                    valid = (p[:, 0] != 0.0) | (p[:, 1] != 0.0) | (p[:, 2] != 0.0)
+                    density_cache[probe_files[fidx]] = float(valid.sum())
+            torch.cuda.empty_cache()
+        # 恢复初始批次
+        env.swap_data_batch(data_batch=first_batch)
+        env.reset()
+        torch.cuda.empty_cache()
+        with open(density_cache_file, 'w') as f:
+            json.dump(density_cache, f)
+        logger.info(f'密度缓存已保存: {len(density_cache)} 个世界')
+
+    # 构建稠密世界候选池
+    dense_files = sorted([f for f, d in density_cache.items()
+                          if d >= args.min_partner_density],
+                         key=lambda f: density_cache[f], reverse=True)
+    dense_files = dense_files[:args.dense_sample_size]
+    logger.info(f'稠密世界池: {len(dense_files)} 个 (density >= {args.min_partner_density})')
 
     # 初始化记录器
     recorder = VisualRecorder(
@@ -158,8 +202,9 @@ def train(args):
                 delattr(builder, attr)
         torch.cuda.empty_cache()
         
-        # 1. 抽取不重复的新世界
-        batch_files = random.sample(all_files, args.num_worlds)
+        # 1. 抽取新世界（优先稠密池）
+        candidate_pool = dense_files if len(dense_files) >= args.num_worlds * 2 else all_files
+        batch_files = random.sample(candidate_pool, args.num_worlds)
         env.swap_data_batch(data_batch=batch_files)
         
         # 2. 更新 ego_indices
@@ -380,13 +425,17 @@ if __name__ == "__main__":
     parser.add_argument('--lr-critic', type=float, default=3e-4)
     parser.add_argument('--init-penalty', type=float, default=1.0,
                         help='初始 ρ，0=纯追踪模式')
-    parser.add_argument('--max-penalty', type=float, default=10.0)
+    parser.add_argument('--max-penalty', type=float, default=20.0)
     parser.add_argument('--amplifier-c', type=float, default=1.015)
     parser.add_argument('--pim-interval', type=int, default=30)
     parser.add_argument('--dataset-size', type=int, default=0,
                         help='全量数据池大小，0=自动检测 data_dir 下的 tfrecord 文件数')
-    parser.add_argument('--max-bad-worlds', type=int, default=100,
+    parser.add_argument('--max-bad-worlds', type=int, default=50,
                         help='坏世界数超过此值时触发世界重采样')
+    parser.add_argument('--min-partner-density', type=float, default=2.0,
+                        help='稠密世界筛选阈值：平均周车数低于此值的世界不进入候选池')
+    parser.add_argument('--dense-sample-size', type=int, default=500,
+                        help='稠密世界候选池大小')
     parser.add_argument('--fix-speed', action='store_true', default=False,
                         help='[诊断] speed_err恒为0，排除速度干扰')
     parser.add_argument('--fix-heading', action='store_true', default=False,
@@ -397,6 +446,6 @@ if __name__ == "__main__":
     parser.add_argument('--save-freq', type=int, default=5)
     parser.add_argument('--file-dir', type=str, default="/workspace/data")
     parser.add_argument('--load-model', type=bool, default=True)
-    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260526/track_350_eps.pth")
+    parser.add_argument('--model-path', type=str, default="/workspace/data/checkpoints/20260526/idc-waymo-v1.0_examples_152154_episode=5.pth")
     args = parser.parse_args()
     train(args)
