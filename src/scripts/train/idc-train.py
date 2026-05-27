@@ -15,11 +15,12 @@ from env.world_manager import WorldManager
 from env.idc_state_builder import GPUDriveObservationBuilder
 from agents.idc_agent import DiscreteIDCAgent
 from utils import get_logger, VisualRecorder, TrajectoryVisualizer
+from utils.config import build_config
 
 logger = get_logger('idc-agent')
 
 
-def _diag_init_step(args, agent, builder, ego_indices, episode_path_indices,
+def _diag_init_step(config, agent, builder, ego_indices, episode_path_indices,
                     states, actions, step):
     if step != 0:
         return
@@ -54,73 +55,74 @@ def _diag_init_step(args, agent, builder, ego_indices, episode_path_indices,
         )
 
 
-def train(args):
-    print("Data root:", args.data_dir)
+def train(config):
+    print("Data root:", config.data_dir)
 
-    total_files = len([f for f in os.listdir(args.data_dir) if f.startswith('tfrecord')])
-    dataset_size = args.dataset_size if args.dataset_size > 0 else total_files
-    if dataset_size < args.num_worlds * 2:
-        dataset_size = args.num_worlds * 2
-    logger.info(f'数据池: {dataset_size} 个文件, 训练时随机抽取 {args.num_worlds} 个世界')
+    total_files = len([f for f in os.listdir(config.data_dir) if f.startswith('tfrecord')])
+    dataset_size = config.dataset_size if config.dataset_size > 0 else total_files
+    if dataset_size < config.num_worlds * 2:
+        dataset_size = config.num_worlds * 2
+    logger.info(f'数据池: {dataset_size} 个文件, 训练时随机抽取 {config.num_worlds} 个世界')
 
     data_loader = SceneDataLoader(
-        root=args.data_dir,
-        batch_size=args.num_worlds,
+        root=config.data_dir,
+        batch_size=config.num_worlds,
         dataset_size=dataset_size,
         sample_with_replacement=False,
         shuffle=True,
-        seed=args.seed,
+        seed=config.seed,
     )
 
     env_config = get_env_config()
     env = GPUDriveTorchEnv(
         config=env_config,
         data_loader=data_loader,
-        max_cont_agents=args.max_agents,
-        device=args.device,
+        max_cont_agents=config.max_agents,
+        device=config.device,
         action_type="continuous",
     )
 
-    all_files = sorted(glob.glob(os.path.join(args.data_dir, "tfrecord*")))
+    all_files = sorted(glob.glob(os.path.join(config.data_dir, "tfrecord*")))
     all_files = all_files[:dataset_size]
-    random.Random(args.seed).shuffle(all_files)
+    random.Random(config.seed).shuffle(all_files)
     logger.info(f'全量文件池: {len(all_files)} 个')
 
+    gif_enabled = getattr(config, 'gif_enabled', False)
     recorder = VisualRecorder(
-        num_worlds=args.num_worlds,
-        save_dir="/workspace/data/gifs",
-        fps=5,
+        num_worlds=config.num_worlds,
+        save_dir=config.gif_save_dir,
+        fps=config.gif_fps,
     )
 
     scenes = load_scenes(env)
     builder = GPUDriveObservationBuilder(env, scenes)
     max_step = builder.EXPERT_TRAJ_LEN if builder.EXPERT_TRAJ_LEN is not None else 91
 
-    ego_indices = get_ego_indices(env, args.num_worlds)
+    ego_indices = get_ego_indices(env, config.num_worlds)
     builder.generate_candidate_paths(ego_indices, num_paths=3)
 
-    agent = DiscreteIDCAgent(env, args, args.device, builder, ego_indices)
+    agent = DiscreteIDCAgent(env, config, config.device, builder, ego_indices)
 
-    wm = WorldManager(env, builder, agent, all_files, args, logger)
+    wm = WorldManager(env, builder, agent, all_files, config, logger)
     wm.filter_initial(ego_indices)
 
-    epochs = args.epochs
+    epochs = config.epochs
     current_epoch = 0
-    if args.load_model:
-        logger.info(f'正在加载模型: {args.model_path}')
-        agent.load(args.model_path)
+    if config.load_model and config.model_path:
+        logger.info(f'正在加载模型: {config.model_path}')
+        agent.load(config.model_path)
         current_epoch = agent.globe_eps
         epochs -= current_epoch
 
-    logger.info(f'训练开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={max_step}')
+    logger.info(f'训练开始: epochs={config.epochs}, num_worlds={config.num_worlds}, max_steps={max_step}')
 
-    viz_dir = os.path.join(args.file_dir, 'traj_plots')
+    viz_dir = os.path.join(config.file_dir, 'traj_plots')
     os.makedirs(viz_dir, exist_ok=True)
 
     for epoch in range(epochs):
         epoch += current_epoch
         obs = env.reset()
-        for w in range(args.num_worlds):
+        for w in range(config.num_worlds):
             builder.reset_world_step(w, 0)
         builder.clear_cache()
 
@@ -131,27 +133,27 @@ def train(args):
                     for w in VIZ_WORLDS]
 
         episode_path_indices = [np.random.randint(builder.num_candidate_paths)
-                                for _ in range(args.num_worlds)]
+                                for _ in range(config.num_worlds)]
 
         for step in range(max_step):
             if step % 10 == 0:
-                logger.info(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
+                logger.info(f'回合 {epoch+1}/{config.epochs}, 步数 {step+1}/{max_step}')
             else:
-                logger.debug(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
+                logger.debug(f'回合 {epoch+1}/{config.epochs}, 步数 {step+1}/{max_step}')
 
             states = builder.get_idc_observations_batch(ego_indices,
                                                         path_indices=episode_path_indices)
 
             wm.filter_per_step(states, step)
 
-            if args.no_sign:
+            if config.no_sign:
                 ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
-                for w in range(args.num_worlds):
+                for w in range(config.num_worlds):
                     if w in wm.bad_worlds:
                         continue
                     states[w][ref_start] = abs(states[w][ref_start])
 
-            for w in range(args.num_worlds):
+            for w in range(config.num_worlds):
                 if w in wm.bad_worlds:
                     continue
                 agent.buffer.handle_new_experience((states[w], w, episode_path_indices[w]))
@@ -166,7 +168,7 @@ def train(args):
             logger.debug(f'状态构建完成，开始选择动作')
             actions = agent.select_action(states)
 
-            _diag_init_step(args, agent, builder, ego_indices, episode_path_indices,
+            _diag_init_step(config, agent, builder, ego_indices, episode_path_indices,
                             states, actions, step)
 
             actions = extend_action_to_3d(actions)
@@ -175,7 +177,7 @@ def train(args):
 
             if step % 5 == 0:
                 abs_np = builder.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
-                for w in range(args.num_worlds):
+                for w in range(config.num_worlds):
                     a = ego_indices[w]
                     x, y = float(abs_np[w, a, 0]), float(abs_np[w, a, 1])
                     if abs(x) > 1e5 or abs(y) > 1e5:
@@ -207,8 +209,8 @@ def train(args):
 
         if wm.should_resample():
             logger.warning(
-                f'[RESAMPLE] bad={len(wm.bad_worlds)}/{args.num_worlds}, '
-                f'good<{args.num_worlds - args.max_bad_worlds}, triggering resample...'
+                f'[RESAMPLE] bad={len(wm.bad_worlds)}/{config.num_worlds}, '
+                f'good<{config.num_worlds - config.max_bad_worlds}, triggering resample...'
             )
             ego_indices = wm.resample()
 
@@ -217,43 +219,59 @@ def train(args):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data-dir', type=str, required=True)
-    parser.add_argument('--num-worlds', type=int, default=150)
-    parser.add_argument('--max-agents', type=int, default=1)
-    parser.add_argument('--max-steps', type=int, default=90)
-    parser.add_argument('--epochs', type=int, default=600)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--dt', type=float, default=0.1)
-    parser.add_argument('--horizon', type=int, default=20)
-    parser.add_argument('--batch-size', type=int, default=512)
-    parser.add_argument('--hidden-dim', type=int, default=256)
-    parser.add_argument('--lr-actor', type=float, default=8e-5)
-    parser.add_argument('--lr-critic', type=float, default=3e-4)
-    parser.add_argument('--init-penalty', type=float, default=1.0,
+    parser = argparse.ArgumentParser(
+        description='IDC-Bridge 训练脚本。所有默认值从 YAML 配置文件读取，CLI 参数可覆盖。')
+    parser.add_argument('--config', type=str, default='configs/train.yaml',
+                        help='YAML 配置文件路径')
+    parser.add_argument('--data-dir', type=str, required=True,
+                        help='Waymo tfrecord 数据目录')
+    parser.add_argument('--num-worlds', type=int, default=None)
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--init-penalty', type=float, default=None,
                         help='初始 ρ，0=纯追踪模式')
-    parser.add_argument('--max-penalty', type=float, default=20.0)
-    parser.add_argument('--amplifier-c', type=float, default=1.015)
-    parser.add_argument('--pim-interval', type=int, default=30)
-    parser.add_argument('--dataset-size', type=int, default=0,
-                        help='全量数据池大小，0=自动检测 data_dir 下的 tfrecord 文件数')
-    parser.add_argument('--max-bad-worlds', type=int, default=100,
-                        help='坏世界数超过此值时触发世界重采样')
-    parser.add_argument('--min-partner-density', type=float, default=2.0,
-                        help='稠密世界筛选阈值：平均周车数低于此值的世界不进入候选池')
-    parser.add_argument('--dense-sample-size', type=int, default=500,
-                        help='稠密世界候选池大小')
-    parser.add_argument('--fix-speed', action='store_true', default=False,
-                        help='[诊断] speed_err恒为0，排除速度干扰')
-    parser.add_argument('--fix-heading', action='store_true', default=False,
-                        help='[诊断] heading_err恒为0，排除朝向干扰')
-    parser.add_argument('--no-sign', action='store_true', default=False,
-                        help='[诊断] delta_p不去符号，排除符号翻转问题')
-    parser.add_argument('--seed', type=int, default=5)
-    parser.add_argument('--save-freq', type=int, default=5)
-    parser.add_argument('--file-dir', type=str, default="/workspace/data")
-    parser.add_argument('--load-model', type=bool, default=True)
-    parser.add_argument('--model-path', type=str,
-                        default="/workspace/data/checkpoints/20260526/idc-waymo-v1.0_examples_153857_episode=15.pth")
+    parser.add_argument('--max-penalty', type=float, default=None)
+    parser.add_argument('--amplifier-c', type=float, default=None)
+    parser.add_argument('--lr-actor', type=float, default=None)
+    parser.add_argument('--lr-critic', type=float, default=None)
+    parser.add_argument('--dataset-size', type=int, default=None)
+    parser.add_argument('--max-bad-worlds', type=int, default=None)
+    parser.add_argument('--min-partner-density', type=float, default=None)
+    parser.add_argument('--dense-sample-size', type=int, default=None)
+    parser.add_argument('--file-dir', type=str, default=None)
+    parser.add_argument('--load-model', dest='load_model', action='store_true', default=None)
+    parser.add_argument('--no-load', dest='load_model', action='store_false')
+    parser.add_argument('--model-path', type=str, default=None)
+    parser.add_argument('--save-freq', type=int, default=None)
+    parser.add_argument('--fix-speed', action='store_true', default=None)
+    parser.add_argument('--fix-heading', action='store_true', default=None)
+    parser.add_argument('--no-sign', action='store_true', default=None)
     args = parser.parse_args()
-    train(args)
+
+    # 加载 YAML 配置并用 CLI 覆盖
+    cli_overrides = {
+        'data_dir': args.data_dir,
+        'num_worlds': args.num_worlds,
+        'epochs': args.epochs,
+        'seed': args.seed,
+        'device': args.device,
+        'init_penalty': args.init_penalty,
+        'max_penalty': args.max_penalty,
+        'amplifier_c': args.amplifier_c,
+        'lr_actor': args.lr_actor,
+        'lr_critic': args.lr_critic,
+        'dataset_size': args.dataset_size,
+        'max_bad_worlds': args.max_bad_worlds,
+        'min_partner_density': args.min_partner_density,
+        'dense_sample_size': args.dense_sample_size,
+        'file_dir': args.file_dir,
+        'load_model': args.load_model,
+        'model_path': args.model_path,
+        'save_freq': args.save_freq,
+        'fix_speed': args.fix_speed,
+        'fix_heading': args.fix_heading,
+        'no_sign': args.no_sign,
+    }
+    config = build_config(args.config, cli_overrides)
+    train(config)

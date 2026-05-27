@@ -20,79 +20,83 @@ logger = get_logger('idc-agent')
 # IDC Agent
 # ==============================================
 class DiscreteIDCAgent:
-    def __init__(self, env, args, device,state_builder,ego_indices):
-        self.args = args
+    def __init__(self, env, config, device, state_builder, ego_indices):
+        self.config = config
         self.env = env
         self.device = device
         self.num_worlds = env.num_worlds
         self.max_agents = env.max_cont_agents
-        self.state_builder = state_builder  # 传入状态构建器实例
-        self.ego_indices = ego_indices  # 每个世界中自车的索引列表
+        self.state_builder = state_builder
+        self.ego_indices = ego_indices
 
         # IDC 维度定义
-        self.DIM_EGO = 6                  # [x, y, v_lon, v_lat, phi, omega] (车体坐标系)
-        self.DIM_OTHERS = 32               # 8 车 × 4 (x, y, phi, v_lon)
-        self.DIM_VALIDITY = 8             # 8 车 validity mask: 1=真实车 0=padding
-        self.DIM_REF_ERROR = 12           # [dp, dphi, dv, lat+lphi+lroad ×3 for t+3, t+6, t+9]
-        self.DIM_TEMPORAL = 1             # 时序索引，避免空间最近点跳变
+        self.DIM_EGO = 6
+        self.DIM_OTHERS = 32
+        self.DIM_VALIDITY = 8
+        self.DIM_REF_ERROR = 12
+        self.DIM_TEMPORAL = 1
         self.TOTAL_STATE_DIM = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR + self.DIM_TEMPORAL
         self.DIM_ROAD = 80
 
         # 超参
-        self.dt = args.dt
-        self.horizon = args.horizon
-        self.batch_size = args.batch_size
+        self.dt = config.dt
+        self.horizon = config.horizon
+        self.batch_size = config.batch_size
 
         # 网络
-        self.actor = ContinuousActor(self.TOTAL_STATE_DIM, args.hidden_dim).to(device)
-        self.critic = ContinuousCritic(self.TOTAL_STATE_DIM, args.hidden_dim).to(device)
-        self.dynamics = KinematicBicycleModel(dt=self.dt)
+        self.actor = ContinuousActor(self.TOTAL_STATE_DIM, config.hidden_dim).to(device)
+        self.critic = ContinuousCritic(self.TOTAL_STATE_DIM, config.hidden_dim).to(device)
+        self.dynamics = KinematicBicycleModel(
+            dt=self.dt,
+            L=config.wheelbase,
+            lr_ratio=config.lr_ratio,
+            v_max=config.v_max,
+        )
 
         # 优化器
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=args.lr_actor)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args.lr_critic)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config.lr_actor)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.lr_critic)
 
         # IDC 成本权重
-        self.pos_err_weight = 0.3
-        self.speed_err_weight = 0.04
-        self.heading_err_weight = 0.3
-        self.steer_cost_weight = 0.3
-        self.acc_cost_weight = 0.005
-        self.lookahead_pos_weight = 0.05
-        self.lookahead_heading_weight = 0.05
+        self.pos_err_weight = config.pos_err_weight
+        self.speed_err_weight = config.speed_err_weight
+        self.heading_err_weight = config.heading_err_weight
+        self.steer_cost_weight = config.steer_cost_weight
+        self.acc_cost_weight = config.acc_cost_weight
+        self.lookahead_pos_weight = config.lookahead_pos_weight
+        self.lookahead_heading_weight = config.lookahead_heading_weight
 
         # GEP 惩罚
-        self.rho = args.init_penalty
-        self.max_penalty = args.max_penalty
-        self.amplifier_c = args.amplifier_c
-        self.gamma = 0.99
+        self.rho = config.init_penalty
+        self.max_penalty = config.max_penalty
+        self.amplifier_c = config.amplifier_c
+        self.gamma = config.gamma
         self.pev_step = 0
-        self.pim_interval = args.pim_interval
+        self.pim_interval = config.pim_interval
 
         # 安全距离
-        self.D_veh_safe = 2.0    # 两车圆心威胁距离: 并排邻车道 ~3.75m 不受罚
-        self.D_road_safe = 2.0
-        self.HALF_L = 2.25
-        self.HALF_W = 1.0
+        self.D_veh_safe = config.D_veh_safe
+        self.D_road_safe = config.D_road_safe
+        self.HALF_L = config.half_length
+        self.HALF_W = config.half_width
 
         # 缓冲区
-        self.buffer = PERBuffer(capacity=100000, min_start_train=args.batch_size)
+        self.buffer = PERBuffer(capacity=config.buffer_capacity, min_start_train=config.batch_size)
         self.global_step = 1
         self.gep_iteration = 0
 
-        # 道路状态缓存，键为 world_idx
+        # 道路状态缓存
         self.road_states = [None] * self.num_worlds
 
-        # 回合数
         # 探索噪声
-        self.noise_std = 0.1
-        self.noise_decay_rate = 0.98
-        self.noise_std_min = 0.03
+        self.noise_std = config.noise_std
+        self.noise_decay_rate = config.noise_decay_rate
+        self.noise_std_min = config.noise_std_min
 
         # 诊断开关
-        self.fix_speed = getattr(args, 'fix_speed', False)
-        self.fix_heading = getattr(args, 'fix_heading', False)
-        self.no_sign = getattr(args, 'no_sign', False)
+        self.fix_speed = getattr(config, 'fix_speed', False)
+        self.fix_heading = getattr(config, 'fix_heading', False)
+        self.no_sign = getattr(config, 'no_sign', False)
 
         # 回合数
         self.globe_eps = 0
@@ -347,6 +351,7 @@ class DiscreteIDCAgent:
         total_cost = torch.zeros(states.shape[0], device=self.device)
         s = states
         ref_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
+        max_penalty = 0.0
         for t in range(self.horizon):
             u = self.actor(s)
             s = self.f_pred_batch(s, u, w_i, p_i)
@@ -358,12 +363,15 @@ class DiscreteIDCAgent:
                             f'delta_p={s[0, ref_start]:.2f} delta_phi={s[0, ref_start+1]:.3f}')
             l = torch.clamp(l, -5000.0, 5000.0)
             p = self.penalty_batch(s, w_i)
+            p = torch.clamp(p, max=100.0)
+            max_penalty = max(max_penalty, p.max().item())
             if t == 0:
                 logger.debug(f'[DIAG-pen] raw penalty min={p.min().item():.2f} max={p.max().item():.2f} '
                             f'mean={p.mean().item():.2f}  (rho={self.rho:.4f})')
             total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
 
         actor_loss = total_cost.mean()
+        has_violation = max_penalty > 0.01
 
         # 衰减探索噪声（所有模式统一衰减）
         old_std = self.noise_std
@@ -393,9 +401,10 @@ class DiscreteIDCAgent:
             self.pev_step = max(0, self.pev_step - 1)
             self.gep_iteration = max(0, self.gep_iteration - 1)
             self.rho = self.rho / self.amplifier_c
-            actor_loss = torch.tensor(float('nan'))
+            actor_loss = float('nan')
+            has_violation = False
 
-        return actor_loss.detach().item() if not has_nan else float('nan')
+        return actor_loss.detach().item() if not has_nan else float('nan'), has_violation
 
     def utility_batch(self, s, u, w_i, p_i=None):
         """
@@ -493,13 +502,15 @@ class DiscreteIDCAgent:
         critic_loss = self.update_critic(states_tensor, word_indexs, path_indices)
         self.pev_step += 1
 
-        # PIM: 积累足够 PEV 步后才更新 actor 并放大 ρ
+        # PIM: 积累足够 PEV 步后才更新 actor，仅在检测到 violation 时放大 ρ
         actor_loss = None
         if self.pev_step >= self.pim_interval:
             self.pev_step = 0
-            self.rho = min(self.rho * self.amplifier_c, self.max_penalty)
-            self.gep_iteration += 1
-            actor_loss = self.update_actor(states_tensor, word_indexs, path_indices)
+            actor_loss, has_violation = self.update_actor(states_tensor, word_indexs, path_indices)
+            if has_violation:
+                self.rho = min(self.rho * self.amplifier_c, self.max_penalty)
+                self.gep_iteration += 1
+                logger.info(f'[GEP] violation detected, rho={self.rho:.4f} gep_iter={self.gep_iteration}')
 
         return critic_loss, actor_loss
         
@@ -507,31 +518,29 @@ class DiscreteIDCAgent:
         self.ego_indices = new_ego_indices
 
     def clear_buffer(self):
-        self.buffer = PERBuffer(capacity=100000, min_start_train=self.args.batch_size)
+        self.buffer = PERBuffer(capacity=self.config.buffer_capacity, min_start_train=self.config.batch_size)
 
     def save(self, save_info: Dict[str, Any]) -> None:
-        # 满足回合数才会保存模型
-        if self.globe_eps % self.args.save_freq == 0:
+        if self.globe_eps % self.config.save_freq == 0:
             logger.info(f'保存模型: globe_eps={self.globe_eps}, global_step={self.global_step}')
             model = {'actor': self.actor, 'critic': self.critic}
             optimizer = {'actor_optim': self.actor_optimizer, 'critic_optim': self.critic_optimizer}
             extra_info = {
-                'config': self.args,
+                'config': self.config,
                 'global_step': self.global_step,
                 'history': self.history_loss,
                 'globe_eps': self.globe_eps,
                 'state_dim': self.TOTAL_STATE_DIM,
                 'rho': self.rho,
                 'gep_iteration': self.gep_iteration,
-                
             }
             metrics = {'episode': extra_info['globe_eps']}
-            save_checkpoint(model=model, 
-                            model_name='idc-waymo-v1.0', 
+            save_checkpoint(model=model,
+                            model_name='idc-waymo-v1.0',
                             optimizer=optimizer,
-                            file_dir=self.args.file_dir,
+                            file_dir=self.config.file_dir,
                             env_name=save_info.get('env_name', 'unknown_env'),
-                            extra_info=extra_info, 
+                            extra_info=extra_info,
                             metrics=metrics)
     
 
@@ -548,7 +557,7 @@ class DiscreteIDCAgent:
         self.globe_eps = checkpoint['globe_eps']
         self.history_loss = checkpoint['history']
         self.global_step = checkpoint['global_step']
-        self.rho = checkpoint['rho'] == 0.0 and self.args.init_penalty or checkpoint['rho']
+        self.rho = checkpoint['rho'] == 0.0 and self.config.init_penalty or checkpoint['rho']
         self.gep_iteration = checkpoint['gep_iteration']
         return checkpoint
         

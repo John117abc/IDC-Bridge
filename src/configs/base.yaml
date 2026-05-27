@@ -1,0 +1,56 @@
+# ============================================================
+# IDC-Bridge 基础配置文件（train/eval 共用）
+# 各训练/评估文件通过 _base: "base.yaml" 继承并覆盖差异项
+# ============================================================
+
+# ---- 训练超参 ----
+training:
+  dt: 0.1
+  horizon: 20
+  batch_size: 512
+  hidden_dim: 256
+  lr_actor: 8.0e-5
+  lr_critic: 3.0e-4
+  pim_interval: 30
+  gamma: 0.99
+  buffer_capacity: 100000
+
+# ---- Agent 参数 ----
+agent:
+  pos_err_weight: 0.3
+  speed_err_weight: 0.04
+  heading_err_weight: 0.3
+  steer_cost_weight: 0.3
+  acc_cost_weight: 0.005
+  lookahead_pos_weight: 0.05
+  lookahead_heading_weight: 0.05
+  noise_std: 0.1
+  noise_decay_rate: 0.98
+  noise_std_min: 0.03
+  init_penalty: 0.0
+  max_penalty: 10.0
+  amplifier_c: 1.005
+  D_veh_safe: 2.0
+  D_road_safe: 2.0
+  half_length: 2.25
+  half_width: 1.0
+
+# ---- 车辆动力学 ----
+dynamics:
+  wheelbase: 5.0
+  lr_ratio: 0.5
+  v_max: 30.0
+
+# ---- 世界管理 ----
+world:
+  min_partner_density: 2.0
+  dense_sample_size: 500
+  max_bad_worlds: 100
+  filter_threshold: 200
+  dataset_size: 0
+
+# ---- 诊断开关 ----
+diag:
+  fix_speed: false
+  fix_heading: false
+  no_sign: false

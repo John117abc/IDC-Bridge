@@ -8,17 +8,18 @@ class ContinuousActor(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),  # 加层归一化，稳定输出
+            nn.LayerNorm(hidden_dim),
             nn.ELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ELU(),
             nn.Linear(hidden_dim, 2),
-            nn.Tanh()
         )
+        nn.init.constant_(self.net[-1].bias[0], 0.05)
+        self.tanh = nn.Tanh()
 
     def forward(self, x):
-        return self.net(x)
+        return self.tanh(self.net(x))
 
 
 

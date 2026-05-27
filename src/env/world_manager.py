@@ -19,6 +19,8 @@ class WorldManager:
         self.bad_worlds = set()
         self.ego_indices = None
 
+        self.filter_threshold = getattr(args, 'filter_threshold', 200)
+
         if compute_density:
             self.density_cache = self._load_or_compute_density_cache()
             self.dense_files = sorted(
@@ -84,7 +86,7 @@ class WorldManager:
             a = ego_indices[w]
             for pid in range(self.builder.num_candidate_paths):
                 pos = self.builder.candidate_paths[w][a][pid]['pos']
-                if np.max(np.abs(pos[:, 0])) > 5000 or np.max(np.abs(pos[:, 1])) > 5000:
+                if np.max(np.abs(pos[:, 0])) > self.filter_threshold or np.max(np.abs(pos[:, 1])) > self.filter_threshold:
                     self.bad_worlds.add(w)
                     self.logger.warning(
                         f'[FILTER-path] world_{w} path_{pid} '
@@ -100,7 +102,7 @@ class WorldManager:
         for w in range(self.num_worlds):
             if w in self.bad_worlds:
                 continue
-            if abs(states[w][0]) > 5000 or abs(states[w][1]) > 5000:
+            if abs(states[w][0]) > self.filter_threshold or abs(states[w][1]) > self.filter_threshold:
                 self.bad_worlds.add(w)
                 dp = abs(states[w][ref_start])
                 self.logger.warning(
@@ -138,7 +140,7 @@ class WorldManager:
 
         candidate_pool = (
             self.dense_files
-            if len(self.dense_files) >= self.num_worlds * 2
+            if self.agent.rho > 0 and len(self.dense_files) >= self.num_worlds * 2
             else self.all_files
         )
         batch_files = random.sample(candidate_pool, self.num_worlds)
@@ -158,7 +160,7 @@ class WorldManager:
             a = new_ego[w]
             for pid in range(self.builder.num_candidate_paths):
                 pos = self.builder.candidate_paths[w][a][pid]['pos']
-                if np.max(np.abs(pos[:, 0])) > 5000 or np.max(np.abs(pos[:, 1])) > 5000:
+                if np.max(np.abs(pos[:, 0])) > self.filter_threshold or np.max(np.abs(pos[:, 1])) > self.filter_threshold:
                     self.bad_worlds.add(w)
                     break
 

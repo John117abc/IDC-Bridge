@@ -18,80 +18,128 @@ Actor/Critic 为两个独立 MLP（LayerNorm + ELU），动作空间为加速度
 1. **网络结构**：Actor/Critic 独立网络，无共享参数（原论文共享 latent embed）
 2. **训练架构**：单线程主循环替代 30 个异步 learner
 3. **环境**：Nocturne → GPUDrive（Waymo 数据）
-4. **候选参考路径**：3 条 Cubic Bezier 路径（左/中/右 lateral offset），每 episode 固定选一条。道路宽度从 GPUDrive 动态读取
+4. **候选参考路径**：3 条 expert pos + 曲率限速路径（左/中/右 lateral offset），每 episode 固定选一条。道路宽度从 GPUDrive 动态读取
 5. **碰撞模型**：前后双圆模型替代单圆
 6. **状态空间**：59 维，含当前误差 + 3 个前瞻点（t+3/t+6/t+9）的横向/航向/道路边界预览
 7. **性能优化**：批量 tensor 操作 + GPU `ref_tensor` 预索引，消除 rollout 中的 Python 循环瓶颈
 8. **统一框架**：`rho=0` 即纯追踪诊断模式，`rho>0` 即含 collision/road penalty，无需额外 flag
+9. **YAML 配置**：所有参数从 `configs/default.yaml` 读取，CLI 仅需指定覆盖项
+10. **条件 penalty 放大**：仅在 rollout 中检测到碰撞/越界违规时才放大 ρ，防止噪声梯度污染
 
 ## 快速开始
 
 ### 安装
 
 ```bash
-pip install gpudrive torch numpy matplotlib
+pip install gpudrive torch numpy matplotlib pyyaml
+```
+
+### 配置文件
+
+所有参数集中在 `configs/default.yaml`，按 `env`/`training`/`agent`/`dynamics`/`world`/`paths`/`diag` 分组。CLI 参数仅用于覆盖 YAML 中的值。
+
+```bash
+# 查看完整配置
+cat configs/default.yaml
 ```
 
 ### 训练
 
 ```bash
-# 纯追踪诊断（rho=0，无碰撞/道路惩罚）
+# 纯追踪诊断（rho=0，无碰撞/道路惩罚）— 用全量数据池，不限稠密场景
 python src/scripts/train/idc-train.py \
     --data-dir /path/to/waymo/data \
-    --device cuda \
-    --num-worlds 200 \
+    --config configs/default.yaml \
     --init-penalty 0 \
-    --epochs 300 \
-    --file-dir /workspace/data
+    --epochs 300
 
-# 正常训练（含 penalty）
+# 正常 penalty 训练（使用 YAML 默认 rho=1.0, pim_interval=30）
+# resample 时优先从稠密场景池抽取
+python src/scripts/train/idc-train.py \
+    --data-dir /path/to/waymo/data
+
+# 覆盖 YAML 参数
 python src/scripts/train/idc-train.py \
     --data-dir /path/to/waymo/data \
-    --device cuda \
     --num-worlds 200 \
-    --init-penalty 1.0 \
-    --amplifier-c 1.015 \
-    --max-penalty 10.0 \
-    --epochs 300 \
-    --file-dir /workspace/data
+    --lr-actor 5e-5 \
+    --max-penalty 15.0
 ```
 
 ### 评估
 
 ```bash
-python src/scripts/train/idc-eval.py \
+python src/scripts/eval/idc-eval.py \
     --data-dir /path/to/waymo/data \
-    --model-path /workspace/data/checkpoints/.../idc-waymo-v1.0_xxx.pth \
-    --device cuda \
-    --num-worlds 10
+    --config configs/default.yaml \
+    --model-path /path/to/model.pth
 ```
 
 ### 关键 CLI 参数
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--num-worlds` | 200 | 并行仿真世界数（固定不换） |
-| `--horizon` | 20 | Rollout 推演步数 |
-| `--dt` | 0.1 | 动力学时间步长（秒） |
-| `--batch-size` | 512 | PEV/PIM 采样数 |
-| `--hidden-dim` | 256 | Actor/Critic 隐藏层维度 |
-| `--lr-actor` | 8e-5 | Actor 学习率 |
-| `--lr-critic` | 3e-4 | Critic 学习率 |
-| `--init-penalty` | 0 | 初始 ρ（0=纯追踪，1.0=含 penalty） |
-| `--max-penalty` | 10 | ρ 上限 |
-| `--amplifier-c` | 1.015 | ρ 每次 PIM 放大倍率 |
-| `--pim-interval` | 30 | PEV 步数后执行一次 PIM |
-| `--epochs` | 300 | 训练轮数 |
-| `--save-freq` | 10 | 每 N epoch 保存一次 checkpoint |
-| `--device` | cuda | 计算设备 |
-
-### 诊断/调试 flags
+CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 
 | 参数 | 说明 |
 |------|------|
-| `--fix-speed` | 速度误差归零（诊断用） |
-| `--fix-heading` | 航向误差归零（诊断用） |
-| `--no-sign` | delta_p 去符号（诊断用） |
+| `--config` | YAML 配置文件路径（默认 `configs/default.yaml`） |
+| `--data-dir` | Waymo tfrecord 数据目录（**必填**） |
+| `--model-path` | 模型 checkpoint 路径（评估必填） |
+| `--init-penalty` | 初始 ρ（0=纯追踪，1.0=含 penalty） |
+| `--num-worlds` | 并行仿真世界数 |
+| `--epochs` | 训练轮数 |
+| `--lr-actor` | Actor 学习率 |
+| `--lr-critic` | Critic 学习率 |
+| `--max-penalty` | ρ 上限 |
+| `--amplifier-c` | ρ 每次 PIM 放大倍率 |
+| `--device` | 计算设备（cuda/cpu） |
+| `--seed` | 随机种子 |
+
+### YAML 配置速查
+
+完整参数见 `configs/default.yaml`，关键分组：
+
+| 分组 | 包含参数 |
+|------|----------|
+| `env` | `num_worlds`, `max_agents`, `epochs`, `seed`, `device` |
+| `training` | `dt`, `horizon`, `batch_size`, `hidden_dim`, `lr_actor`, `lr_critic`, `pim_interval`, `gamma`, `buffer_capacity` |
+| `agent` | `pos_err_weight`, `heading_err_weight`, 等 7 个 cost weight；`noise_std`/`decay_rate`/`min`；`init_penalty`/`max_penalty`/`amplifier_c`；`D_veh_safe`/`D_road_safe`/`half_length`/`half_width` |
+| `dynamics` | `wheelbase`, `lr_ratio`, `v_max` |
+| `world` | `min_partner_density`, `dense_sample_size`, `max_bad_worlds`, `filter_threshold`, `dataset_size` |
+| `paths` | `file_dir`, `model_path`, `save_freq`, `load_model` |
+| `diag` | `fix_speed`, `fix_heading`, `no_sign` |
+| `viz` | `gif_enabled`, `gif_fps`, `gif_max_worlds`, `gif_save_dir`, `gif_world_selection`, `gif_view_mode`, `gif_zoom_radius` |
+| `viz` | `gif_enabled`, `gif_fps`, `gif_max_worlds`, `gif_save_dir`, `gif_world_selection`, `gif_view_mode`, `gif_zoom_radius` |
+
+### GIF 可视化
+
+评估脚本支持三种视图模式，通过 `viz` 配置控制：
+
+```bash
+# bird_2d —— 全局俯视图（默认）
+python idc-eval.py ... --gif-view-mode bird_2d --gif-zoom-radius 70
+
+# bird_3d —— 3D 透视投影
+python idc-eval.py ... --gif-view-mode bird_3d
+
+# agent_pov —— 自车局部视角（以 ego 为中心，obs_radius 范围）
+python idc-eval.py ... --gif-view-mode agent_pov
+
+# 关闭 GIF 加速评估
+python idc-eval.py ... --gif-enabled false
+
+# 随机录 5 个 world
+python idc-eval.py ... --gif-max-worlds 5 --gif-world-selection random
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `gif_enabled` | `true` | 是否生成 GIF（评估时关闭可提速） |
+| `gif_fps` | `5` | GIF 帧率 |
+| `gif_max_worlds` | `10` | 最多录制 world 数（0=全部） |
+| `gif_save_dir` | `/workspace/data/gifs` | GIF 输出目录 |
+| `gif_world_selection` | `first` | 录制 world 选择策略：`first`（前 N）/ `random`（随机 N） |
+| `gif_view_mode` | `bird_2d` | 视图模式：`bird_2d` / `bird_3d` / `agent_pov` |
+| `gif_zoom_radius` | `70` | 鸟瞰视图缩放半径
 
 ## State 布局（59 维）
 
@@ -107,23 +155,30 @@ python src/scripts/train/idc-eval.py \
 
 ```
 .
+├── configs/
+│   └── default.yaml                  # 47 参数完整配置
 ├── src/
-│   ├── agents/idc_agent.py          # 智能体：动作选择、滚动推演、GEP 循环
-│   ├── env/idc_state_builder.py     # 状态构建、Bezier 路径生成、参考点索引
+│   ├── agents/idc_agent.py           # 智能体：动作选择、滚动推演、GEP 循环
+│   ├── env/
+│   │   ├── __init__.py
+│   │   ├── env_utils.py              # 共享工具：extend_action_to_3d, get_env_config, load_scenes, get_ego_indices
+│   │   ├── world_manager.py          # WorldManager：密度缓存、世界过滤、重采样、DIAG 日志
+│   │   └── idc_state_builder.py      # 状态构建、expert 路径生成、曲率限速、参考点索引
 │   ├── models/
-│   │   ├── kinematic_bicycle.py     # 运动学自行车模型（L=5.0m，匹配 Waymo 实车）
+│   │   ├── kinematic_bicycle.py      # 运动学自行车模型（L=5.0m，匹配 Waymo 实车）
 │   │   └── continuous_actor_critic.py # Actor (LN+ELU×2+Tanh) / Critic (LN+ELU×2+Linear)
-│   ├── buffer/per_buffer.py         # 经验回放缓冲区
+│   ├── buffer/per_buffer.py          # 经验回放缓冲区
 │   ├── scripts/train/
-│   │   └── idc-train.py             # 训练入口
+│   │   └── idc-train.py              # 训练入口（精简 CLI，从 YAML 读配置）
 │   ├── scripts/eval/
-│   │   └── idc-eval.py              # 评估入口（确定性策略）
+│   │   └── idc-eval.py               # 评估入口（确定性策略，从 YAML 读配置）
 │   └── utils/
-│       ├── traj_visualizer.py       # 轨迹对比图
-│       ├── visualr_recorder.py      # GIF 录制
-│       └── action_mapper.py         # 离散动作映射（暂未使用）
-├── info.md                          # 完整开发记录（33 个 issue）
-├── config.yaml
+│       ├── config.py                 # YAML 配置加载 + CLI 合并
+│       ├── traj_visualizer.py        # 轨迹对比图
+│       ├── visualr_recorder.py       # GIF 录制
+│       └── ...
+├── info.md                           # 完整开发记录
+├── README.md
 └── requirements.txt
 ```
 

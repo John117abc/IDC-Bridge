@@ -1,0 +1,24 @@
+_base: "base.yaml"
+
+# ---- 环境配置 ----
+env:
+  num_worlds: 10
+  max_agents: 1
+  epochs: 1
+  seed: 20
+  device: "cuda"
+
+# ---- 路径 ----
+paths:
+  file_dir: "/workspace/data"
+  save_freq: 1
+
+# ---- 可视化/GIF 配置（评估默认开启） ----
+viz:
+  gif_enabled: true
+  gif_fps: 5
+  gif_max_worlds: 10
+  gif_save_dir: "/workspace/data/gifs"
+  gif_world_selection: "random"    # "first" | "random"
+  gif_view_mode: "agent_pov"     # "bird_2d" | "bird_3d" | "agent_pov"
+  gif_zoom_radius: 70

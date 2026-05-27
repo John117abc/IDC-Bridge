@@ -1105,3 +1105,116 @@ batch = random.sample(dense_files, num_worlds)  # 稠密池够大时
 | `_make_spline_path` | idc_state_builder.py | ~77 |
 | `_road_edge_dist` | idc_state_builder.py | ~13 |
 | `_road_dist_batch` | idc_agent.py | 3 |
+
+---
+
+## 45. NaN + 跟踪崩溃诊断与修复
+
+**日期**：2026-05-27
+
+**症状**：epoch 428 时 gep_iter=1297，rho=20（cap），actor_loss=1262，Actor 权重 NaN。82/150 worlds 被标记 bad（坐标偏离 >200m），max pos_err=31m，delta_phi≈1.090 rad（~62°）。
+
+**根因**：三条原因形成恶性循环：
+
+1. **rho 无条件放大**：每个 PIM 周期（每 30 PEV）无条件乘 amplifier_c，无论是否真有碰撞/越界。导致 rho 必然抵达 cap=20
+2. **Penalty 无上限**：单步 `road_violation` 可达数千（ego 偏离道路时 `edge_dist` 巨大），与 rho=20 相乘 → 单步 cost 可达 100k
+3. **梯度爆炸**：超高 penalty 梯度累积在 Adam 的二阶矩中，最终导致 NaN
+4. **Actor 初始偏置为零**：tanh 输出 ~0 → 初始动作≈无控制，ego 滑行偏离
+
+**修复（4 项）**：
+
+| 修改 | 文件 | 效果 |
+|------|------|------|
+| Actor 输出层 `bias[0]=0.05` | `continuous_actor_critic.py` | 初始动作偏轻加速，防静止滑行偏离 |
+| `rho` 仅在检测到 violation 时放大 | `idc_agent.py:update()` | 无碰撞/越界时 ρ 保持不变 |
+| `p = torch.clamp(p, max=100.0)` | `idc_agent.py:update_actor()` | 单步 penalty 上限，防极端偏离引爆梯度 |
+| 过滤阈值 5000→200 | `world_manager.py` | 坐标 200 已远超 GPUDrive ±100 边界，减小 marginal steeper penalty |
+
+**流程变更**：`update_actor()` 返回值从 `actor_loss` 改为 `(actor_loss, has_violation)`。`has_violation = max_penalty > 0.01`（rollout 中任意 step 有任何 penalty > 0.01 即判定有违规）。NaN 回滚仅在 `has_violation=True` 时递减 gep_iter/rho。
+
+---
+
+## 46. Resample 追踪模式使用全量池
+
+**日期**：2026-05-27
+
+**问题**：`--init-penalty 0` 纯追踪模式下，`WorldManager.resample()` 仍优先从 `dense_files`（稠密场景池）抽取，限制了道路类型多样性。
+
+**修复**：`world_manager.py:resample()` 增加 `agent.rho > 0` 判断：
+
+```python
+candidate_pool = dense_files if agent.rho > 0 and len(dense_files) >= num_worlds * 2 else all_files
+```
+
+rho=0 时自动走全量池，rho>0 时优先稠密池。无需额外 CLI flag。
+
+---
+
+## 47. YAML 配置系统
+
+**日期**：2026-05-27
+
+**目标**：将所有硬编码参数和 argparse 默认值迁移到 YAML 配置文件，CLI 仅保留覆盖项。
+
+**新增文件**：
+
+| 文件 | 说明 |
+|------|------|
+| `configs/default.yaml` | 47 个参数的完整默认配置，按 `env`/`training`/`agent`/`dynamics`/`world`/`paths`/`diag` 分组 |
+| `src/utils/config.py` | `build_config(path, overrides)` — YAML 加载 → 扁平化 → CLI 覆盖 → `SimpleNamespace` |
+
+**修改文件**：
+
+| 文件 | 变更 |
+|------|------|
+| `idc_agent.py` | `args → config`：所有硬编码值（cost weights、noise、safety distances、gamma、buffer_capacity）从 config 读取；`KinematicBicycleModel` 接收 `wheelbase/lr_ratio/v_max` |
+| `world_manager.py` | `filter_threshold` 从 `config.filter_threshold` 读取 |
+| `idc-train.py` | argparse 从 30 个参数精简到 20 个覆盖项，`train(args)` → `train(config)` |
+| `idc-eval.py` | 同上，`evaluate(args)` → `evaluate(config)` |
+
+**扁平化规则**：YAML 嵌套结构按层级展开，一级 key 丢弃，二/三级 key 作为最终 key：
+
+```yaml
+training:
+  dt: 0.1      → config.dt = 0.1
+agent:
+  noise:
+    std: 0.1   → config.noise_std = 0.1
+```
+
+**CLI 覆盖**：CLI `--key value` 中 value 非 None 时覆盖 YAML 对应值。
+
+---
+
+## 48. 代码重构：WorldManager + env_utils
+
+**日期**：2026-05-27
+
+**目标**：将 `idc-train.py` 中的密度缓存、世界过滤、重采样逻辑抽象为可复用的 `WorldManager` 类，train/eval 共用。
+
+**新增模块**：
+
+| 文件 | 行数 | 职责 |
+|------|------|------|
+| `src/env/__init__.py` | 10 | 导出 |
+| `src/env/env_utils.py` | 44 | `extend_action_to_3d`, `get_env_config`, `load_scenes`, `get_ego_indices` |
+| `src/env/world_manager.py` | 190 | `WorldManager`：密度缓存 + 过滤（路径/ego 异常）+ 重采样 + DIAG 日志 |
+
+**脚本精简**：
+
+| 脚本 | 之前 | 之后 | 减少 |
+|------|------|------|------|
+| `idc-train.py` | 451 行 | 当前（YAML + WorldManager） | ~57% |
+| `idc-eval.py` | 228 行 | 当前（YAML + WorldManager） | ~32% |
+
+**WorldManager API**：
+
+```python
+wm = WorldManager(env, builder, agent, all_files, args, logger, compute_density=True)
+wm.filter_initial(ego_indices)           # 阶段1：路径坐标异常过滤
+wm.filter_per_step(states, step)         # 阶段2：ego 坐标 + DIAG ref 误差
+wm.should_resample()                     # bad_worlds > max_bad_worlds?
+ego_indices = wm.resample()              # swap + 重建 + 过滤 + agent 更新
+wm.good_worlds                           # 未过滤的 world 列表
+wm.good_count                            # 存活 world 数量
+```

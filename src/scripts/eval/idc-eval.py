@@ -1,5 +1,6 @@
 import sys
 import os
+import random
 
 import numpy as np
 import torch
@@ -14,68 +15,114 @@ from env.world_manager import WorldManager
 from env.idc_state_builder import GPUDriveObservationBuilder
 from agents.idc_agent import DiscreteIDCAgent
 from utils import get_logger, VisualRecorder, TrajectoryVisualizer, LossPlotter
+from utils.config import build_config
 
 logger = get_logger('idc-agent')
 
 
-def evaluate(args):
-    print("Data root:", args.data_dir)
+def _record_gif_frame(env, recorder, config, epoch, step, ego_indices, wm, selected_worlds):
+    """根据 gif_view_mode 录制一帧到 recorder"""
+    view_mode = config.gif_view_mode
+    zoom = config.gif_zoom_radius
+
+    if view_mode == "agent_pov":
+        for w in selected_worlds:
+            if w in wm.bad_worlds:
+                continue
+            result = env.vis.plot_agent_observation(
+                agent_idx=ego_indices[w], env_idx=w)
+            fig = result[0] if isinstance(result, tuple) else result
+            if fig is not None:
+                recorder.frames[f"env_{w}"].append(img_from_fig(fig))
+    else:
+        if view_mode == "bird_3d":
+            env.vis.render_3d = True
+        imgs = env.vis.plot_simulator_state(
+            env_indices=selected_worlds,
+            time_steps=[epoch] * len(selected_worlds),
+            zoom_radius=zoom,
+        )
+        if view_mode == "bird_3d":
+            env.vis.render_3d = False
+        for i, w in enumerate(selected_worlds):
+            recorder.frames[f"env_{w}"].append(img_from_fig(imgs[i]))
+
+
+def _select_gif_worlds(config, good_envs):
+    """根据 gif_world_selection + gif_max_worlds 选出要录制的 world 列表"""
+    max_n = config.gif_max_worlds
+    if max_n == 0 or max_n >= len(good_envs):
+        return good_envs
+
+    if config.gif_world_selection == "random":
+        return random.sample(good_envs, max_n)
+    # "first": 前 N 个
+    return good_envs[:max_n]
+
+
+def evaluate(config):
+    print("Data root:", config.data_dir)
 
     data_loader = SceneDataLoader(
-        root=args.data_dir,
-        batch_size=args.num_worlds,
-        dataset_size=args.num_worlds,
+        root=config.data_dir,
+        batch_size=config.num_worlds,
+        dataset_size=config.num_worlds,
         sample_with_replacement=True,
         shuffle=True,
-        seed=args.seed,
+        seed=config.seed,
     )
 
     env_config = get_env_config()
     env = GPUDriveTorchEnv(
         config=env_config,
         data_loader=data_loader,
-        max_cont_agents=args.max_agents,
-        device=args.device,
+        max_cont_agents=config.max_agents,
+        device=config.device,
         action_type="continuous",
     )
 
+    gif_enabled = getattr(config, 'gif_enabled', True)
     recorder = VisualRecorder(
-        num_worlds=args.num_worlds,
-        save_dir="/workspace/data/gifs",
-        fps=5,
+        num_worlds=config.num_worlds,
+        save_dir=config.gif_save_dir,
+        fps=config.gif_fps,
     )
 
     scenes = load_scenes(env)
     builder = GPUDriveObservationBuilder(env, scenes)
     max_step = builder.EXPERT_TRAJ_LEN
 
-    ego_indices = get_ego_indices(env, args.num_worlds)
+    ego_indices = get_ego_indices(env, config.num_worlds)
     builder.generate_candidate_paths(ego_indices, num_paths=3)
 
-    agent = DiscreteIDCAgent(env, args, args.device, builder, ego_indices)
+    agent = DiscreteIDCAgent(env, config, config.device, builder, ego_indices)
 
-    # eval 不需要密度扫描，只加载已有缓存
     all_files = []
-    wm = WorldManager(env, builder, agent, all_files, args, logger, compute_density=False)
+    wm = WorldManager(env, builder, agent, all_files, config, logger, compute_density=False)
     wm.filter_initial(ego_indices)
 
-    logger.info(f'正在加载模型: {args.model_path}')
-    agent.load(args.model_path)
-    agent.rho = args.init_penalty
-    agent.max_penalty = args.max_penalty
+    logger.info(f'正在加载模型: {config.model_path}')
+    agent.load(config.model_path)
+    agent.rho = config.init_penalty
+    agent.max_penalty = config.max_penalty
     logger.info(f'评估模式: rho={agent.rho}, max_penalty={agent.max_penalty}')
 
     logger.info('正在生成损失曲线图...')
-    LossPlotter(agent.history_loss, f'{args.file_dir}/loss_img', 'idc-waymo-v1.0').plot_all()
+    LossPlotter(agent.history_loss, f'{config.file_dir}/loss_img', 'idc-waymo-v1.0').plot_all()
 
-    logger.info(f'评估开始: epochs={args.epochs}, num_worlds={args.num_worlds}, max_steps={max_step}')
+    logger.info(f'评估开始: epochs={config.epochs}, num_worlds={config.num_worlds}, max_steps={max_step}')
+    if gif_enabled:
+        logger.info(f'GIF: view={config.gif_view_mode} zoom={config.gif_zoom_radius} '
+                    f'fps={config.gif_fps} max_worlds={config.gif_max_worlds}')
+    else:
+        logger.info('GIF: disabled')
 
-    viz_dir = os.path.join(args.file_dir, 'eval_plots')
+    viz_dir = os.path.join(config.file_dir, 'eval_plots')
     os.makedirs(viz_dir, exist_ok=True)
 
-    for epoch in range(args.epochs):
+    for epoch in range(config.epochs):
         obs = env.reset()
-        for w in range(args.num_worlds):
+        for w in range(config.num_worlds):
             builder.reset_world_step(w, 0)
         builder.clear_cache()
 
@@ -83,15 +130,17 @@ def evaluate(args):
                     for w in wm.good_worlds]
         VIZ_WORLDS = list(wm.good_worlds)
 
-        for step in range(max_step):
-            logger.info(f'回合 {epoch+1}/{args.epochs}, 步数 {step+1}/{max_step}')
+        gif_worlds = _select_gif_worlds(config, VIZ_WORLDS)
 
-            path_indices = [0 for _ in range(args.num_worlds)]
+        for step in range(max_step):
+            logger.info(f'回合 {epoch+1}/{config.epochs}, 步数 {step+1}/{max_step}')
+
+            path_indices = [0 for _ in range(config.num_worlds)]
             states = builder.get_idc_observations_batch(ego_indices, path_indices=path_indices)
 
             wm.filter_per_step(states, step)
 
-            for w in range(args.num_worlds):
+            for w in range(config.num_worlds):
                 builder.increment_step(w)
 
             positions = builder.get_ego_positions_batch(ego_indices)
@@ -106,51 +155,69 @@ def evaluate(args):
             logger.debug(f'动作选择完成，开始环境交互，动作形状: {actions.shape}')
             env.step_dynamics(actions)
 
-            good_envs = [w for w in range(args.num_worlds) if w not in wm.bad_worlds]
-            if step % recorder.fps == 0 and good_envs:
-                imgs = env.vis.plot_simulator_state(
-                    env_indices=good_envs,
-                    time_steps=[epoch] * len(good_envs),
-                    zoom_radius=70,
-                )
-                for i, w in enumerate(good_envs):
-                    recorder.frames[f"env_{w}"].append(img_from_fig(imgs[i]))
+            if gif_enabled and step % recorder.fps == 0 and gif_worlds:
+                _record_gif_frame(env, recorder, config, epoch, step,
+                                  ego_indices, wm, gif_worlds)
 
         for viz in viz_list:
             if len(viz.actual_x) > 0:
                 viz.save_plot(viz_dir, epoch + 1)
 
-    recorder.save_all_gifs()
+    if gif_enabled:
+        recorder.save_all_gifs()
     logger.debug('评估完成')
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data-dir', type=str, required=True)
-    parser.add_argument('--num-worlds', type=int, default=10)
-    parser.add_argument('--max-agents', type=int, default=1)
-    parser.add_argument('--max-steps', type=int, default=90)
-    parser.add_argument('--epochs', type=int, default=1)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--dt', type=float, default=0.1)
-    parser.add_argument('--horizon', type=int, default=25)
-    parser.add_argument('--batch-size', type=int, default=256)
-    parser.add_argument('--hidden-dim', type=int, default=256)
-    parser.add_argument('--lr-actor', type=float, default=1e-5)
-    parser.add_argument('--lr-critic', type=float, default=3e-4)
-    parser.add_argument('--init-penalty', type=float, default=1.0)
-    parser.add_argument('--max-penalty', type=float, default=100.0)
-    parser.add_argument('--amplifier-c', type=float, default=1.005)
-    parser.add_argument('--pim-interval', type=int, default=200)
-    parser.add_argument('--max-bad-worlds', type=int, default=100)
-    parser.add_argument('--min-partner-density', type=float, default=2.0)
-    parser.add_argument('--dense-sample-size', type=int, default=500)
-    parser.add_argument('--seed', type=int, default=20)
-    parser.add_argument('--save-freq', type=int, default=1)
-    parser.add_argument('--file-dir', type=str, default="/workspace/data")
-    parser.add_argument('--load-model', type=bool, default=True)
-    parser.add_argument('--model-path', type=str,
-                        default="/workspace/data/checkpoints/20260525/idc-waymo-v1.0_examples_135820_episode=155.pth")
+    parser = argparse.ArgumentParser(
+        description='IDC-Bridge 评估脚本。所有默认值从 YAML 配置文件读取，CLI 参数可覆盖。')
+    parser.add_argument('--config', type=str, default='configs/eval.yaml',
+                        help='YAML 配置文件路径')
+    parser.add_argument('--data-dir', type=str, required=True,
+                        help='Waymo tfrecord 数据目录')
+    parser.add_argument('--model-path', type=str, required=True,
+                        help='模型 checkpoint 路径')
+    parser.add_argument('--num-worlds', type=int, default=None)
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--init-penalty', type=float, default=None)
+    parser.add_argument('--max-penalty', type=float, default=None)
+    parser.add_argument('--file-dir', type=str, default=None)
+    parser.add_argument('--gif-enabled', type=str, default=None,
+                        help='是否生成 GIF (true/false)')
+    parser.add_argument('--gif-view-mode', type=str, default=None,
+                        help='bird_2d / bird_3d / agent_pov')
+    parser.add_argument('--gif-max-worlds', type=int, default=None,
+                        help='最多录制 world 数 (0=全部)')
+    parser.add_argument('--gif-zoom-radius', type=int, default=None)
+    parser.add_argument('--gif-fps', type=int, default=None)
+    parser.add_argument('--gif-world-selection', type=str, default=None,
+                        help='first / random')
+
     args = parser.parse_args()
-    evaluate(args)
+
+    cli_overrides = {
+        'data_dir': args.data_dir,
+        'model_path': args.model_path,
+        'num_worlds': args.num_worlds,
+        'epochs': args.epochs,
+        'seed': args.seed,
+        'device': args.device,
+        'init_penalty': args.init_penalty,
+        'max_penalty': args.max_penalty,
+        'file_dir': args.file_dir,
+        'gif_enabled': args.gif_enabled,
+        'gif_view_mode': args.gif_view_mode,
+        'gif_max_worlds': args.gif_max_worlds,
+        'gif_zoom_radius': args.gif_zoom_radius,
+        'gif_fps': args.gif_fps,
+        'gif_world_selection': args.gif_world_selection,
+    }
+    config = build_config(args.config, cli_overrides)
+
+    if isinstance(config.gif_enabled, str):
+        config.gif_enabled = config.gif_enabled.lower() == 'true'
+
+    evaluate(config)
