@@ -43,11 +43,13 @@ dynamics:
 
 # ---- 世界管理 ----
 world:
-  min_partner_density: 2.0
+  min_partner_density: 0
+  max_partner_density: 30
   dense_sample_size: 500
   max_bad_worlds: 100
   filter_threshold: 200
   dataset_size: 0
+  density_cache_file: null
 
 # ---- 诊断开关 ----
 diag:

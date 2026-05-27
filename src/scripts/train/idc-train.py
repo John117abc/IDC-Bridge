@@ -238,7 +238,11 @@ if __name__ == "__main__":
     parser.add_argument('--dataset-size', type=int, default=None)
     parser.add_argument('--max-bad-worlds', type=int, default=None)
     parser.add_argument('--min-partner-density', type=float, default=None)
+    parser.add_argument('--max-partner-density', type=int, default=None,
+                        help='密度上限，min=0+max=30 表示全量')
     parser.add_argument('--dense-sample-size', type=int, default=None)
+    parser.add_argument('--density-cache-file', type=str, default=None,
+                        help='离线扫描的全量密度 JSON 路径')
     parser.add_argument('--file-dir', type=str, default=None)
     parser.add_argument('--load-model', dest='load_model', action='store_true', default=None)
     parser.add_argument('--no-load', dest='load_model', action='store_false')
@@ -264,7 +268,9 @@ if __name__ == "__main__":
         'dataset_size': args.dataset_size,
         'max_bad_worlds': args.max_bad_worlds,
         'min_partner_density': args.min_partner_density,
+        'max_partner_density': args.max_partner_density,
         'dense_sample_size': args.dense_sample_size,
+        'density_cache_file': args.density_cache_file,
         'file_dir': args.file_dir,
         'load_model': args.load_model,
         'model_path': args.model_path,

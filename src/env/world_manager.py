@@ -23,23 +23,25 @@ class WorldManager:
 
         if compute_density:
             self.density_cache = self._load_or_compute_density_cache()
-            self.dense_files = sorted(
-                [f for f, d in self.density_cache.items()
-                 if d >= args.min_partner_density],
-                key=lambda f: self.density_cache[f], reverse=True
-            )[:args.dense_sample_size]
-            self.logger.info(
-                f'稠密世界池: {len(self.dense_files)} 个 (density >= {args.min_partner_density})'
-            )
+            self.dense_files = self._build_dense_pool()
         else:
             self.density_cache = {}
             self.dense_files = []
 
     def _load_or_compute_density_cache(self):
+        density_file = getattr(self.args, 'density_cache_file', None)
+        if density_file and os.path.exists(density_file):
+            with open(density_file, 'r') as f:
+                data = json.load(f)
+            cache = data.get('files', data)
+            self.logger.info(f'密度缓存已加载: {len(cache)} 个世界 (from {density_file})')
+            return cache
+
         cache_file = os.path.join(self.args.file_dir, "world_density.json")
         if os.path.exists(cache_file):
             with open(cache_file, 'r') as f:
-                cache = json.load(f)
+                data = json.load(f)
+            cache = data.get('files', data)
             self.logger.info(f'密度缓存已加载: {len(cache)} 个世界')
             return cache
 
@@ -73,9 +75,31 @@ class WorldManager:
         torch.cuda.empty_cache()
 
         with open(cache_file, 'w') as f:
-            json.dump(cache, f)
+            json.dump({"files": cache}, f)
         self.logger.info(f'密度缓存已保存: {len(cache)} 个世界')
         return cache
+
+    def _build_dense_pool(self):
+        min_d = self.args.min_partner_density
+        max_d = getattr(self.args, 'max_partner_density', 30)
+        size = self.args.dense_sample_size
+
+        if max_d == 30 and min_d == 0 and size >= len(self.density_cache):
+            files = sorted(self.density_cache.keys(),
+                          key=lambda f: self.density_cache.get(f, 0), reverse=True)
+        else:
+            files = sorted(
+                [f for f, d in self.density_cache.items()
+                 if min_d <= d <= max_d],
+                key=lambda f: self.density_cache[f], reverse=True
+            )
+            if 0 < size < len(files):
+                files = files[:size]
+
+        self.logger.info(
+            f'世界候选池: {len(files)} 个 (density ∈ [{min_d}, {max_d}], cap={size if size > 0 else "无"})'
+        )
+        return files
 
     def filter_initial(self, ego_indices):
         self.ego_indices = ego_indices

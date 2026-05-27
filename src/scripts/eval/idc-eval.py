@@ -195,6 +195,10 @@ if __name__ == "__main__":
     parser.add_argument('--gif-fps', type=int, default=None)
     parser.add_argument('--gif-world-selection', type=str, default=None,
                         help='first / random')
+    parser.add_argument('--min-partner-density', type=float, default=None)
+    parser.add_argument('--max-partner-density', type=int, default=None)
+    parser.add_argument('--dense-sample-size', type=int, default=None)
+    parser.add_argument('--density-cache-file', type=str, default=None)
 
     args = parser.parse_args()
 
@@ -214,6 +218,10 @@ if __name__ == "__main__":
         'gif_zoom_radius': args.gif_zoom_radius,
         'gif_fps': args.gif_fps,
         'gif_world_selection': args.gif_world_selection,
+        'min_partner_density': args.min_partner_density,
+        'max_partner_density': args.max_partner_density,
+        'dense_sample_size': args.dense_sample_size,
+        'density_cache_file': args.density_cache_file,
     }
     config = build_config(args.config, cli_overrides)
 

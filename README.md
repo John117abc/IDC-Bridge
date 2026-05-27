@@ -23,8 +23,9 @@ Actor/Critic 为两个独立 MLP（LayerNorm + ELU），动作空间为加速度
 6. **状态空间**：59 维，含当前误差 + 3 个前瞻点（t+3/t+6/t+9）的横向/航向/道路边界预览
 7. **性能优化**：批量 tensor 操作 + GPU `ref_tensor` 预索引，消除 rollout 中的 Python 循环瓶颈
 8. **统一框架**：`rho=0` 即纯追踪诊断模式，`rho>0` 即含 collision/road penalty，无需额外 flag
-9. **YAML 配置**：所有参数从 `configs/default.yaml` 读取，CLI 仅需指定覆盖项
+9. **YAML 层级配置**：`base.yaml`（共享）→ `train.yaml`/`eval.yaml` 继承覆盖，CLI 仅需指定差异项
 10. **条件 penalty 放大**：仅在 rollout 中检测到碰撞/越界违规时才放大 ρ，防止噪声梯度污染
+11. **密度范围筛选**：离线扫描 Waymo 场景周车密度，训练/评估可按密度区间 `[min, max]` 选择世界
 
 ## 快速开始
 
@@ -36,12 +37,27 @@ pip install gpudrive torch numpy matplotlib pyyaml
 
 ### 配置文件
 
-所有参数集中在 `configs/default.yaml`，按 `env`/`training`/`agent`/`dynamics`/`world`/`paths`/`diag` 分组。CLI 参数仅用于覆盖 YAML 中的值。
+配置采用 **`_base` 继承机制**，共享参数放 `base.yaml`，train/eval 各自覆盖差异：
+
+```
+src/configs/
+├── base.yaml      # training/agent/dynamics/world/diag — 共享
+├── train.yaml     # _base: base.yaml + env(epochs=600)/paths/viz(gif=false)
+└── eval.yaml      # _base: base.yaml + env(epochs=1)/paths/viz(gif=true)
+```
 
 ```bash
-# 查看完整配置
-cat configs/default.yaml
+# 训练（自动用 train.yaml）
+python idc-train.py --data-dir /path/to/data
+
+# 评估（自动用 eval.yaml）
+python idc-eval.py --data-dir /path/to/data --model-path /path/to/model.pth
+
+# 手动指定
+python idc-train.py --config src/configs/train.yaml --data-dir /path/to/data
 ```
+
+CLI 参数仅覆盖 YAML 中的值，优先级：CLI > YAML > base。
 
 ### 训练
 
@@ -64,6 +80,12 @@ python src/scripts/train/idc-train.py \
     --num-worlds 200 \
     --lr-actor 5e-5 \
     --max-penalty 15.0
+
+# 按密度范围选择场景（需先离线扫描）
+python src/scripts/train/idc-train.py \
+    --data-dir /path/to/waymo/data \
+    --density-cache-file /workspace/data/density_full.json \
+    --min-partner-density 5 --max-partner-density 10
 ```
 
 ### 评估
@@ -71,9 +93,28 @@ python src/scripts/train/idc-train.py \
 ```bash
 python src/scripts/eval/idc-eval.py \
     --data-dir /path/to/waymo/data \
-    --config configs/default.yaml \
     --model-path /path/to/model.pth
 ```
+
+### 离线密度扫描
+
+训练前可预先扫描所有场景的周车密度，生成 JSON 缓存供训练/评估按密度区间选择：
+
+```bash
+# 全量扫描（~18 分钟）
+python src/scripts/utils/scan_density.py \
+    --data-dir /path/to/tfrecords \
+    --output /workspace/data/density_full.json \
+    --batch-size 150
+
+# 快速抽样（~30 秒）
+python src/scripts/utils/scan_density.py \
+    --data-dir /path/to/tfrecords \
+    --output /workspace/data/density_sample.json \
+    --batch-size 150 --sample 2000
+```
+
+输出 JSON 包含各文件的周车数量分布统计，配合 `--min-partner-density` / `--max-partner-density` 使用。
 
 ### 关键 CLI 参数
 
@@ -81,7 +122,7 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 
 | 参数 | 说明 |
 |------|------|
-| `--config` | YAML 配置文件路径（默认 `configs/default.yaml`） |
+| `--config` | YAML 配置文件路径（train 默认 `configs/train.yaml`，eval 默认 `configs/eval.yaml`） |
 | `--data-dir` | Waymo tfrecord 数据目录（**必填**） |
 | `--model-path` | 模型 checkpoint 路径（评估必填） |
 | `--init-penalty` | 初始 ρ（0=纯追踪，1.0=含 penalty） |
@@ -93,6 +134,10 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 | `--amplifier-c` | ρ 每次 PIM 放大倍率 |
 | `--device` | 计算设备（cuda/cpu） |
 | `--seed` | 随机种子 |
+| `--density-cache-file` | 离线扫描的全量密度 JSON |
+| `--min-partner-density` | 周车密度下限（含），0=不限 |
+| `--max-partner-density` | 周车密度上限（含），默认 30 |
+| `--dense-sample-size` | 候选池大小，0=不限 |
 
 ### YAML 配置速查
 
@@ -104,10 +149,18 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 | `training` | `dt`, `horizon`, `batch_size`, `hidden_dim`, `lr_actor`, `lr_critic`, `pim_interval`, `gamma`, `buffer_capacity` |
 | `agent` | `pos_err_weight`, `heading_err_weight`, 等 7 个 cost weight；`noise_std`/`decay_rate`/`min`；`init_penalty`/`max_penalty`/`amplifier_c`；`D_veh_safe`/`D_road_safe`/`half_length`/`half_width` |
 | `dynamics` | `wheelbase`, `lr_ratio`, `v_max` |
-| `world` | `min_partner_density`, `dense_sample_size`, `max_bad_worlds`, `filter_threshold`, `dataset_size` |
+| `world` | `min_partner_density`, `max_partner_density`, `dense_sample_size`, `max_bad_worlds`, `filter_threshold`, `dataset_size`, `density_cache_file` |
 | `paths` | `file_dir`, `model_path`, `save_freq`, `load_model` |
 | `diag` | `fix_speed`, `fix_heading`, `no_sign` |
 | `viz` | `gif_enabled`, `gif_fps`, `gif_max_worlds`, `gif_save_dir`, `gif_world_selection`, `gif_view_mode`, `gif_zoom_radius` |
+
+### 配置继承说明
+
+| 文件 | 说明 |
+|------|------|
+| `base.yaml` | 5 个共享分组（`training`/`agent`/`dynamics`/`world`/`diag`） |
+| `train.yaml` | `_base: base.yaml` + `env`(epochs=600) + `paths`(load_model=true) + `viz`(gif=false) |
+| `eval.yaml` | `_base: base.yaml` + `env`(epochs=1, num_worlds=10) + `paths` + `viz`(gif=true) |
 | `viz` | `gif_enabled`, `gif_fps`, `gif_max_worlds`, `gif_save_dir`, `gif_world_selection`, `gif_view_mode`, `gif_zoom_radius` |
 
 ### GIF 可视化
@@ -156,27 +209,29 @@ python idc-eval.py ... --gif-max-worlds 5 --gif-world-selection random
 ```
 .
 ├── configs/
-│   └── default.yaml                  # 47 参数完整配置
+│   ├── base.yaml              # 共享参数
+│   ├── train.yaml             # 训练覆盖
+│   └── eval.yaml              # 评估覆盖
 ├── src/
-│   ├── agents/idc_agent.py           # 智能体：动作选择、滚动推演、GEP 循环
+│   ├── agents/idc_agent.py
 │   ├── env/
-│   │   ├── __init__.py
-│   │   ├── env_utils.py              # 共享工具：extend_action_to_3d, get_env_config, load_scenes, get_ego_indices
-│   │   ├── world_manager.py          # WorldManager：密度缓存、世界过滤、重采样、DIAG 日志
-│   │   └── idc_state_builder.py      # 状态构建、expert 路径生成、曲率限速、参考点索引
+│   │   ├── env_utils.py
+│   │   ├── world_manager.py
+│   │   └── idc_state_builder.py
 │   ├── models/
-│   │   ├── kinematic_bicycle.py      # 运动学自行车模型（L=5.0m，匹配 Waymo 实车）
-│   │   └── continuous_actor_critic.py # Actor (LN+ELU×2+Tanh) / Critic (LN+ELU×2+Linear)
-│   ├── buffer/per_buffer.py          # 经验回放缓冲区
-│   ├── scripts/train/
-│   │   └── idc-train.py              # 训练入口（精简 CLI，从 YAML 读配置）
-│   ├── scripts/eval/
-│   │   └── idc-eval.py               # 评估入口（确定性策略，从 YAML 读配置）
+│   │   ├── kinematic_bicycle.py
+│   │   └── continuous_actor_critic.py
+│   ├── buffer/per_buffer.py
+│   ├── scripts/
+│   │   ├── train/idc-train.py
+│   │   ├── eval/idc-eval.py
+│   │   └── utils/scan_density.py   # 离线密度扫描
 │   └── utils/
-│       ├── config.py                 # YAML 配置加载 + CLI 合并
-│       ├── traj_visualizer.py        # 轨迹对比图
-│       ├── visualr_recorder.py       # GIF 录制
+│       ├── config.py               # YAML _base 继承 + CLI 合并
+│       ├── traj_visualizer.py
 │       └── ...
+├── info.md
+└── README.md
 ├── info.md                           # 完整开发记录
 ├── README.md
 └── requirements.txt
