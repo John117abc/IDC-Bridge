@@ -85,7 +85,7 @@ def evaluate(config):
     recorder = VisualRecorder(
         num_worlds=config.num_worlds,
         save_dir=config.gif_save_dir,
-        fps=config.gif_fps,
+        fps=config.gif_record_interval,
     )
 
     scenes = load_scenes(env)
@@ -113,7 +113,8 @@ def evaluate(config):
     logger.info(f'评估开始: epochs={config.epochs}, num_worlds={config.num_worlds}, max_steps={max_step}')
     if gif_enabled:
         logger.info(f'GIF: view={config.gif_view_mode} zoom={config.gif_zoom_radius} '
-                    f'fps={config.gif_fps} max_worlds={config.gif_max_worlds}')
+                    f'playback={config.gif_fps}fps interval={config.gif_record_interval} '
+                    f'max_worlds={config.gif_max_worlds}')
     else:
         logger.info('GIF: disabled')
 
@@ -164,7 +165,7 @@ def evaluate(config):
                 viz.save_plot(viz_dir, epoch + 1)
 
     if gif_enabled:
-        recorder.save_all_gifs()
+        recorder.save_all_gifs(custom_fps=config.gif_fps)
     logger.debug('评估完成')
 
 
@@ -192,7 +193,10 @@ if __name__ == "__main__":
     parser.add_argument('--gif-max-worlds', type=int, default=None,
                         help='最多录制 world 数 (0=全部)')
     parser.add_argument('--gif-zoom-radius', type=int, default=None)
-    parser.add_argument('--gif-fps', type=int, default=None)
+    parser.add_argument('--gif-fps', type=int, default=None,
+                        help='GIF 播放速度（帧/秒）')
+    parser.add_argument('--gif-record-interval', type=int, default=None,
+                        help='每隔 N 个 env step 录一帧')
     parser.add_argument('--gif-world-selection', type=str, default=None,
                         help='first / random')
     parser.add_argument('--min-partner-density', type=float, default=None)
@@ -217,6 +221,7 @@ if __name__ == "__main__":
         'gif_max_worlds': args.gif_max_worlds,
         'gif_zoom_radius': args.gif_zoom_radius,
         'gif_fps': args.gif_fps,
+        'gif_record_interval': args.gif_record_interval,
         'gif_world_selection': args.gif_world_selection,
         'min_partner_density': args.min_partner_density,
         'max_partner_density': args.max_partner_density,

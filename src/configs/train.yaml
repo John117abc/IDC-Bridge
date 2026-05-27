@@ -4,7 +4,7 @@ _base: "base.yaml"
 env:
   num_worlds: 150
   max_agents: 1
-  epochs: 600
+  epochs: 900
   seed: 5
   device: "cuda"
 
@@ -18,7 +18,8 @@ paths:
 # ---- 可视化/GIF 配置（训练默认关闭） ----
 viz:
   gif_enabled: false
-  gif_fps: 5
+  gif_fps: 15
+  gif_record_interval: 2
   gif_max_worlds: 10
   gif_save_dir: "/workspace/data/gifs"
   gif_world_selection: "first"     # "first" | "random"

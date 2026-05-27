@@ -27,7 +27,7 @@ agent:
   noise_std: 0.1
   noise_decay_rate: 0.98
   noise_std_min: 0.03
-  init_penalty: 0.0
+  init_penalty: 1.0
   max_penalty: 10.0
   amplifier_c: 1.005
   D_veh_safe: 2.0
@@ -43,13 +43,13 @@ dynamics:
 
 # ---- 世界管理 ----
 world:
-  min_partner_density: 0
-  max_partner_density: 30
+  min_partner_density: 20
+  max_partner_density: 99
   dense_sample_size: 500
-  max_bad_worlds: 100
+  max_bad_worlds: 120
   filter_threshold: 200
   dataset_size: 0
-  density_cache_file: null
+  density_cache_file: "/workspace/data/world_density.json"
 
 # ---- 诊断开关 ----
 diag:

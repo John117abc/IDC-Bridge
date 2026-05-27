@@ -166,7 +166,7 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 | `world` | `min_partner_density`, `max_partner_density`, `dense_sample_size`, `max_bad_worlds`, `filter_threshold`, `dataset_size`, `density_cache_file` |
 | `paths` | `file_dir`, `model_path`, `save_freq`, `load_model` |
 | `diag` | `fix_speed`, `fix_heading`, `no_sign` |
-| `viz` | `gif_enabled`, `gif_fps`, `gif_max_worlds`, `gif_save_dir`, `gif_world_selection`, `gif_view_mode`, `gif_zoom_radius` |
+| `viz` | `gif_enabled`, `gif_fps`, `gif_record_interval`, `gif_max_worlds`, `gif_save_dir`, `gif_world_selection`, `gif_view_mode`, `gif_zoom_radius` |
 
 ### 配置继承说明
 
@@ -175,7 +175,6 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 | `base.yaml` | 5 个共享分组（`training`/`agent`/`dynamics`/`world`/`diag`） |
 | `train.yaml` | `_base: base.yaml` + `env`(epochs=600) + `paths`(load_model=true) + `viz`(gif=false) |
 | `eval.yaml` | `_base: base.yaml` + `env`(epochs=1, num_worlds=10) + `paths` + `viz`(gif=true) |
-| `viz` | `gif_enabled`, `gif_fps`, `gif_max_worlds`, `gif_save_dir`, `gif_world_selection`, `gif_view_mode`, `gif_zoom_radius` |
 
 ### GIF 可视化
 
@@ -200,13 +199,14 @@ python idc-eval.py ... --gif-max-worlds 5 --gif-world-selection random
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `gif_enabled` | `true` | 是否生成 GIF（评估时关闭可提速） |
-| `gif_fps` | `5` | GIF 帧率 |
+| `gif_enabled` | `true` | 是否生成 GIF（关闭可提速） |
+| `gif_fps` | `15` | GIF **播放**速度（帧/秒） |
+| `gif_record_interval` | `2` | **录制**间隔（每隔 N 个 env step 录一帧） |
 | `gif_max_worlds` | `10` | 最多录制 world 数（0=全部） |
 | `gif_save_dir` | `/workspace/data/gifs` | GIF 输出目录 |
-| `gif_world_selection` | `first` | 录制 world 选择策略：`first`（前 N）/ `random`（随机 N） |
+| `gif_world_selection` | `first` | 录制 world 选择：`first`（前 N）/ `random`（随机 N） |
 | `gif_view_mode` | `bird_2d` | 视图模式：`bird_2d` / `bird_3d` / `agent_pov` |
-| `gif_zoom_radius` | `70` | 鸟瞰视图缩放半径
+| `gif_zoom_radius` | `70` | 鸟瞰视图缩放半径 |
 
 ## State 布局（59 维）
 
