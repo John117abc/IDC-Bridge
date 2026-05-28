@@ -401,7 +401,7 @@ class DiscreteIDCAgent:
                     param.copy_(backup[name])
             self.pev_step = max(0, self.pev_step - 1)
             self.gep_iteration = max(0, self.gep_iteration - 1)
-            self.rho = self.rho / self.amplifier_c
+            self.rho = max(0.0, self.rho - self.amplifier_c)
             actor_loss = float('nan')
             has_violation = False
 
@@ -497,6 +497,11 @@ class DiscreteIDCAgent:
         ego_road_dist = road_dist_ref - torch.abs(lat)
         road_violation = F.relu(self.D_road_safe - ego_road_dist)
 
+        if getattr(self.config, 'no_veh_penalty', False):
+            veh_violation = torch.zeros_like(veh_violation)
+        if getattr(self.config, 'no_road_penalty', False):
+            road_violation = torch.zeros_like(road_violation)
+
         return veh_violation + road_violation
     
     def update(self):
@@ -514,7 +519,7 @@ class DiscreteIDCAgent:
             self.pev_step = 0
             actor_loss, has_violation = self.update_actor(states_tensor, word_indexs, path_indices)
             if has_violation:
-                self.rho = min(self.rho * self.amplifier_c, self.max_penalty)
+                self.rho = min(self.rho + self.amplifier_c, self.max_penalty)
                 self.gep_iteration += 1
                 logger.info(f'[GEP] violation detected, rho={self.rho:.4f} gep_iter={self.gep_iteration}')
 

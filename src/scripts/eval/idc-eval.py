@@ -276,6 +276,8 @@ if __name__ == "__main__":
     parser.add_argument('--max-partner-density', type=int, default=None)
     parser.add_argument('--dense-sample-size', type=int, default=None)
     parser.add_argument('--density-cache-file', type=str, default=None)
+    parser.add_argument('--no-road-penalty', action='store_true', default=None)
+    parser.add_argument('--no-veh-penalty', action='store_true', default=None)
 
     args = parser.parse_args()
 
@@ -300,6 +302,8 @@ if __name__ == "__main__":
         'max_partner_density': args.max_partner_density,
         'dense_sample_size': args.dense_sample_size,
         'density_cache_file': args.density_cache_file,
+        'no_road_penalty': args.no_road_penalty,
+        'no_veh_penalty': args.no_veh_penalty,
     }
     config = build_config(args.config, cli_overrides)
 

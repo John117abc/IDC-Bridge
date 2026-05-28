@@ -25,12 +25,12 @@ agent:
   lookahead_pos_weight: 0.05
   lookahead_heading_weight: 0.05
   noise_std: 0.1
-  noise_decay_rate: 0.95
+  noise_decay_rate: 0.90
   noise_std_min: 0.03
-  init_penalty: 1.0
-  max_penalty: 5.0
-  amplifier_c: 1.005
-  D_veh_safe: 4.0
+  init_penalty: 0.01
+  max_penalty: 3.0
+  amplifier_c: 0.01
+  D_veh_safe: 2.0
   D_road_safe: 1.0
   half_length: 2.25
   half_width: 1.0
@@ -56,6 +56,8 @@ diag:
   fix_speed: false
   fix_heading: false
   no_sign: false
+  no_road_penalty: false
+  no_veh_penalty: false
 
 # ---- PDMS 评分 ----
 metrics:

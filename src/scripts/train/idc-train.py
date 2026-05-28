@@ -300,6 +300,8 @@ if __name__ == "__main__":
     parser.add_argument('--fix-speed', action='store_true', default=None)
     parser.add_argument('--fix-heading', action='store_true', default=None)
     parser.add_argument('--no-sign', action='store_true', default=None)
+    parser.add_argument('--no-road-penalty', action='store_true', default=None)
+    parser.add_argument('--no-veh-penalty', action='store_true', default=None)
     args = parser.parse_args()
 
     # 加载 YAML 配置并用 CLI 覆盖
@@ -327,6 +329,8 @@ if __name__ == "__main__":
         'fix_speed': args.fix_speed,
         'fix_heading': args.fix_heading,
         'no_sign': args.no_sign,
+        'no_road_penalty': args.no_road_penalty,
+        'no_veh_penalty': args.no_veh_penalty,
     }
     config = build_config(args.config, cli_overrides)
     train(config)

@@ -1312,3 +1312,102 @@ rho 不受影响（保持现有逻辑），max_penalty 在 agent 构造时从 co
 录制间隔用 `config.gif_record_interval`，播放用 `custom_fps=config.gif_fps`。
 
 **涉及文件**：`configs/train.yaml`、`configs/eval.yaml`、`idc-eval.py`
+
+---
+
+## 53. Rho 乘性膨胀 → 线性递增（统一训练框架）
+
+**日期**：2026-05-28
+
+**症状**：`rho *= amplifier_c`（乘性膨胀）每 30 步无条件加倍率，必然到 cap → penalty 压倒 tracking → 需分离 tracking/penalty 阶段训练。用户反馈分离训练繁琐，希望统一流程。
+
+**根因**：乘性膨胀几何增长，违规率不管高低 rho 都会到 cap。跟踪阶段的 rho=0 和 penalty 阶段的 rho>0 切换不自然。
+
+**修复**：改为线性递增 `rho += amplifier_c`，仅在检测到违规时增加。
+
+| 参数 | 旧值 | 新值 | 语义 |
+|------|------|------|------|
+| `amplifier_c` | 1.005（乘性倍率） | 0.01（线性增量） | 每违规 PIM +0.01 |
+| `init_penalty` | 0.0 | 0.01 | 起点几乎为 0 |
+| `max_penalty` | 5.0 | 3.0 | 更低 cap 防压制 tracking |
+
+演进曲线：epoch 0 rho=0.01（tracking）→ epoch 50 rho≈1.2 → epoch 100 rho≈3.0 cap（平衡态）。
+
+NaN 回滚同步改为 `rho = max(0.0, rho - amplifier_c)`。
+
+**涉及文件**：`base.yaml`、`idc_agent.py:update()`、`idc_agent.py:NaN rollback`
+
+---
+
+## 54. PDMS 评估系统
+
+**日期**：2026-05-28
+
+**目标**：集成 CARLA 风格的 PDMS（Planning Decision Making Score）到训练和评估。
+
+**公式**：`PDMS = (NC × DAC × DDC) × (EP×5 + TTC×5 + C×2 + LK×2) / 14`
+
+**新增模块**：
+
+| 文件 | 职责 |
+|------|------|
+| `src/metrics/__init__.py` | 导出 |
+| `src/metrics/pdms.py` | `PDMSScorer`（在线累加器）+ `RolloutPDMSScorer`（评估前向推演） |
+| `src/metrics/plotter.py` | `print_pdms_table`（ASCII 表格）+ `plot_pdms_radar`（雷达图）+ `plot_pdms_bar`（柱状图） |
+
+**数据来源**：GPUDrive `info_tensor`（off-road/collision）、`partner_observations_tensor`（TTC）、`self_observation_tensor`（speed/jerk）、state ref_error（lat/delta_phi）。
+
+**训练集成**：每 epoch `[PDMS] score=72.3 completion=89.2% collisions=3 off_road=12`
+
+**评估集成**：终端表格 + `pdms_plots/` 图表 + step 0 推演 Rollout PDMS 预测
+
+**涉及文件**：`src/metrics/*`、`base.yaml`、`idc-train.py`、`idc-eval.py`、`idc_agent.py`
+
+---
+
+## 55. 密度离线扫描 + 范围选择
+
+**日期**：2026-05-28
+
+**问题**：训练时按周车密度筛选场景需反复在线扫描，慢（~30s 抽样）且不支持精确范围。
+
+**新增**：`src/scripts/utils/scan_density.py` — 全量扫描所有 tfrecord 的周车密度，输出 JSON。
+
+**WorldManager 增强**：
+- `density_cache_file`：直接加载外部全量 JSON（跳过在线扫描）
+- `min_partner_density` / `max_partner_density`：密度区间筛选
+- `dense_sample_size=0`：不限候选池大小
+
+**Waymo 70k 实际分布**：均值 19.19，中位数 15，0-63 范围。21% 场景密度 ≥31。
+
+**涉及文件**：`scan_density.py`、`world_manager.py`、`base.yaml`、`train.yaml`、`eval.yaml`
+
+---
+
+## 56. 诊断 penalty flag
+
+**日期**：2026-05-28
+
+**目标**：快速定位 road penalty vs vehicle penalty 哪个是问题源。
+
+**新增 CLI**：`--no-road-penalty` / `--no-veh-penalty`（均 `action='store_true'`）
+
+**实现**（`idc_agent.py:penalty_batch()`）：
+```python
+if getattr(self.config, 'no_veh_penalty', False):
+    veh_violation = torch.zeros_like(veh_violation)
+if getattr(self.config, 'no_road_penalty', False):
+    road_violation = torch.zeros_like(road_violation)
+```
+
+零侵入原有逻辑，仅将对应 violation 置零。
+
+**使用**：
+```bash
+# 仅道路约束
+python idc-train.py --no-veh-penalty
+# 仅周车约束
+python idc-train.py --no-road-penalty
+```
+
+**涉及文件**：`base.yaml`、`idc_agent.py`、`idc-train.py`、`idc-eval.py`

@@ -22,13 +22,14 @@ Actor/Critic 为两个独立 MLP（LayerNorm + ELU），动作空间为加速度
 5. **碰撞模型**：前后双圆模型替代单圆
 6. **状态空间**：59 维，含当前误差 + 3 个前瞻点（t+3/t+6/t+9）的横向/航向/道路边界预览
 7. **性能优化**：批量 tensor 操作 + GPU `ref_tensor` 预索引，消除 rollout 中的 Python 循环瓶颈
-8. **统一框架**：`rho=0` 即纯追踪诊断模式，`rho>0` 即含 collision/road penalty，无需额外 flag
+8. **线性 rho 升温**：`rho += amplifier_c` 替代乘性膨胀，tracking → penalty 自然过渡，无需分阶段训练
 9. **YAML 层级配置**：`base.yaml`（共享）→ `train.yaml`/`eval.yaml` 继承覆盖，CLI 仅需指定差异项
 10. **条件 penalty 放大**：仅在 rollout 中检测到碰撞/越界违规时才放大 ρ，防止噪声梯度污染
 11. **密度范围筛选**：离线扫描 Waymo 场景周车密度，训练/评估可按密度区间 `[min, max]` 选择世界
-12. **道路 penalty 基于参考路径**：用 `road_dist_ref - |lat|` 替代 `edge_dist`，只在跨出路外时触发，不再误罚路中心
-13. **权重重平衡**：`pos_err_weight=0.03`（原 0.3），使 heading 信号与 position 信号量级匹配
-14. **Checkpoint 续训时自动覆盖 optimizer lr**：加载后 `lr_critic`/`lr_actor` 从 config 更新，不受旧 checkpoint 影响
+12. **道路 penalty 路径化**：`relu(D_road_safe - ego_road_dist)` 替代 edge-based → 只在跨出路外触发
+13. **权重重平衡**：`pos_err_weight=0.03`（原 0.3），heading 与 position 信号量级匹配
+14. **Checkpoint 续训时自动覆盖 optimizer lr**：加载后 `lr_critic`/`lr_actor` 从 config 更新
+15. **PDMS 评估**：CARLA 风格评分（NC×DAC×DDC × weighted avg），训练每 epoch log + 评估雷达图/柱状图/终端表
 
 ## 快速开始
 
@@ -65,31 +66,24 @@ CLI 参数仅覆盖 YAML 中的值，优先级：CLI > YAML > base。
 ### 训练
 
 ```bash
-# 纯追踪诊断（rho=0，无碰撞/道路惩罚）— 用全量数据池，不限稠密场景
+# 统一训练（tracking → penalty 自动过渡，rho 从 0.01 线性升至 3.0）
+python src/scripts/train/idc-train.py --data-dir /path/to/waymo/data
+
+# 从 checkpoint 继续训练
 python src/scripts/train/idc-train.py \
     --data-dir /path/to/waymo/data \
-    --config configs/default.yaml \
-    --init-penalty 0 \
-    --epochs 300
-
-# 正常 penalty 训练（使用 YAML 默认 rho=1.0, pim_interval=30）
-# resample 时优先从稠密场景池抽取
-python src/scripts/train/idc-train.py \
-    --data-dir /path/to/waymo/data
+    --model-path /path/to/checkpoint.pth
 
 # 覆盖 YAML 参数
 python src/scripts/train/idc-train.py \
     --data-dir /path/to/waymo/data \
-    --num-worlds 200 \
-    --lr-actor 5e-5 \
-    --max-penalty 15.0
+    --num-worlds 200 --lr-actor 5e-5
 
 # 按密度范围选择场景（需先离线扫描）
 python src/scripts/train/idc-train.py \
     --data-dir /path/to/waymo/data \
     --density-cache-file /workspace/data/density_full.json \
     --min-partner-density 5 --max-partner-density 10
-```
 
 ### 评估
 
@@ -148,13 +142,15 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 | `--lr-actor` | Actor 学习率 |
 | `--lr-critic` | Critic 学习率 |
 | `--max-penalty` | ρ 上限 |
-| `--amplifier-c` | ρ 每次 PIM 放大倍率 |
+| `--amplifier-c` | ρ 线性增量/次违规（0.01 → ~100 epoch 到 cap） |
 | `--device` | 计算设备（cuda/cpu） |
 | `--seed` | 随机种子 |
 | `--density-cache-file` | 离线扫描的全量密度 JSON |
 | `--min-partner-density` | 周车密度下限（含），0=不限 |
 | `--max-partner-density` | 周车密度上限（含），默认 30 |
 | `--dense-sample-size` | 候选池大小，0=不限 |
+| `--no-road-penalty` | 关闭道路约束惩罚（诊断用） |
+| `--no-veh-penalty` | 关闭周车碰撞惩罚（诊断用） |
 
 ### YAML 配置速查
 
@@ -168,14 +164,15 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 | `dynamics` | `wheelbase`, `lr_ratio`, `v_max` |
 | `world` | `min_partner_density`, `max_partner_density`, `dense_sample_size`, `max_bad_worlds`, `filter_threshold`, `dataset_size`, `density_cache_file` |
 | `paths` | `file_dir`, `model_path`, `save_freq`, `load_model` |
-| `diag` | `fix_speed`, `fix_heading`, `no_sign` |
+| `diag` | `fix_speed`, `fix_heading`, `no_sign`, `no_road_penalty`, `no_veh_penalty` |
 | `viz` | `gif_enabled`, `gif_fps`, `gif_record_interval`, `gif_max_worlds`, `gif_save_dir`, `gif_world_selection`, `gif_view_mode`, `gif_zoom_radius` |
+| `metrics` | `pdms`: `nc_weight`, `dac_threshold`, `ttc_horizon`, `jerk_max`, `ep_weight`, `ttc_weight`, `comfort_weight`, `lk_weight` |
 
 ### 配置继承说明
 
 | 文件 | 说明 |
 |------|------|
-| `base.yaml` | 5 个共享分组（`training`/`agent`/`dynamics`/`world`/`diag`） |
+| `base.yaml` | 6 个共享分组（`training`/`agent`/`dynamics`/`world`/`diag`/`metrics`） |
 | `train.yaml` | `_base: base.yaml` + `env`(epochs=600) + `paths`(load_model=true) + `viz`(gif=false) |
 | `eval.yaml` | `_base: base.yaml` + `env`(epochs=1, num_worlds=10) + `paths` + `viz`(gif=true) |
 
@@ -211,6 +208,30 @@ python idc-eval.py ... --gif-max-worlds 5 --gif-world-selection random
 | `gif_view_mode` | `bird_2d` | 视图模式：`bird_2d` / `bird_3d` / `agent_pov` |
 | `gif_zoom_radius` | `70` | 鸟瞰视图缩放半径 |
 
+### PDMS 评分
+
+训练每 epoch 和评估时会计算 PDMS（规划决策评分）：
+
+```
+PDMS = (NC × DAC × DDC) × (EP×5 + TTC×5 + C×2 + LK×2) / 14
+
+NC:  碰撞 → 0
+DAC: off-road > 3 步 → 0
+DDC: |delta_phi| > 90° → 0（逆行）
+EP:  路线完成度
+TTC: 最小碰撞时间 / 4.0s
+C:   舒适性（jerk < 10 m/s³）
+LK:  车道保持（|lat| / road_width）
+```
+
+训练日志格式：`[PDMS] score=72.3 completion=89.2% collisions=3 off_road=12`
+
+评估时额外输出：
+- 终端 ASCII 评分表（各项得分、违规统计）
+- `pdms_plots/pdms_radar_epoch*.png` — 加权项雷达图
+- `pdms_plots/pdms_bar_epoch*.png` — 每个 world 的 Driving Score 柱状图
+- Rollout PDMS：step 0 推演 Horizon 步的预测得分
+
 ## State 布局（59 维）
 
 | 区间 | 维度 | 内容 |
@@ -243,6 +264,9 @@ python idc-eval.py ... --gif-max-worlds 5 --gif-world-selection random
 │   │   ├── train/idc-train.py
 │   │   ├── eval/idc-eval.py
 │   │   └── utils/scan_density.py   # 离线密度扫描
+│   ├── metrics/
+│   │   ├── pdms.py                  # PDMS 在线/rollout 评分
+│   │   └── plotter.py               # 雷达图/柱状图/ASCII 表
 │   └── utils/
 │       ├── config.py               # YAML _base 继承 + CLI 合并
 │       ├── traj_visualizer.py
@@ -266,7 +290,8 @@ python idc-eval.py ... --gif-max-worlds 5 --gif-world-selection random
 9. **道路 penalty 公式反向**：`F.relu(edge_dist - D_road_safe)` 惩罚路中心（远离边线），奖励靠路边（贴近边线）→ penalty 把自车推向路边，与 tracking 冲突
 10. **heading 权重被 position 淹没 250:1**：`pos_err²×0.3=750` vs `heading_err²×0.3=3` → Actor 忽略朝向，无法学纠正偏离
 11. **Checkpoint 续训 optimizer lr 被覆盖**：`load_checkpoint` 恢复旧 lr，config 中的新 lr 被忽略 → 需手动覆写 `param_groups['lr']`
-12. **GIF fps 与录制间隔混淆**：`gif_fps` 同时控制录制频率和播放速度 → 降低 fps 导致 GIF 又少帧又慢 → 解耦为 `gif_fps`（播放）和 `gif_record_interval`（录制间隔）
+12. **GIF fps 与录制间隔混淆**：`gif_fps` 同时控制录制频率和播放速度 → 解耦为 `gif_fps`（播放）和 `gif_record_interval`（录制间隔）
+13. **Rho 乘性膨胀**：`rho *= 1.005` 每 30 步无条件膨胀 → 必然到 cap → penalty 压倒 tracking → 改为线性 `rho += 0.01`，仅违规时增
 
 ## 引用
 
