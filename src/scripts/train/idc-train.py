@@ -16,8 +16,9 @@ from env.idc_state_builder import GPUDriveObservationBuilder
 from agents.idc_agent import DiscreteIDCAgent
 from utils import get_logger, VisualRecorder, TrajectoryVisualizer
 from utils.config import build_config
+from metrics import PDMSScorer
 
-logger = get_logger('idc-agent')
+logger = get_logger('idc-train')
 
 
 def _diag_init_step(config, agent, builder, ego_indices, episode_path_indices,
@@ -135,6 +136,9 @@ def train(config):
         episode_path_indices = [np.random.randint(builder.num_candidate_paths)
                                 for _ in range(config.num_worlds)]
 
+        scorers = [PDMSScorer(config) for _ in range(config.num_worlds)]
+        ref_start_agent = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
+
         for step in range(max_step):
             if step % 10 == 0:
                 logger.info(f'回合 {epoch+1}/{config.epochs}, 步数 {step+1}/{max_step}')
@@ -184,6 +188,40 @@ def train(config):
                         logger.warning(f'[TELEPORT] world_{w} step={step} x={x:.1f} y={y:.1f}')
 
             logger.debug(f'环境交互完成，开始更新智能体')
+            # PDMS 数据采集（每步一次，批量拉 tensor）
+            info_np = env.sim.info_tensor().to_torch().cpu().numpy()
+            abs_for_pdms = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+            partner_for_pdms = env.sim.partner_observations_tensor().to_torch().cpu().numpy()
+            rel_np = env.sim.self_observation_tensor().to_torch().cpu().numpy()
+            for w in range(config.num_worlds):
+                if w in wm.bad_worlds:
+                    continue
+                a = ego_indices[w]
+                ego_x, ego_y = float(abs_for_pdms[w, a, 0]), float(abs_for_pdms[w, a, 1])
+                ego_heading = float(abs_for_pdms[w, a, 7])
+                ego_vel = float(rel_np[w, a, 0])
+                partners = partner_for_pdms[w, a]
+                off_road = float(info_np[w, a, 0]) > 0
+                collision = (float(info_np[w, a, 1]) + float(info_np[w, a, 2])) > 0
+                pid = episode_path_indices[w]
+                t = builder.step_counter[w]
+                path = builder.candidate_paths[w][a][pid]
+                road_dist_ref = float(path['road_dist'][min(t, len(path['road_dist']) - 1)])
+                scorers[w].update_step(
+                    ego_pos=(ego_x, ego_y),
+                    ego_vel=ego_vel,
+                    ego_heading=ego_heading,
+                    partners=partners,
+                    off_road=off_road,
+                    collision=collision,
+                    delta_phi=float(states[w][ref_start_agent + 1]),
+                    temporal_idx=t,
+                    max_step=max_step,
+                    road_dist_ref=road_dist_ref,
+                    lat=float(states[w][ref_start_agent + 3]),
+                    dt=config.dt,
+                )
+
             if agent.buffer.should_start_training():
                 logger.debug(f'开始训练: global_step={agent.global_step}, buffer size={len(agent.buffer)}')
                 critic_loss, actor_loss = agent.update()
@@ -198,6 +236,17 @@ def train(config):
 
         agent.globe_eps += 1
         agent.history_loss.append(epoch_history.copy())
+
+        # PDMS epoch logging
+        pdms_scores = [s.compute() for s in scorers if s.steps > 0]
+        if pdms_scores:
+            avg_score = np.mean([ps['driving_score'] for ps in pdms_scores])
+            avg_comp = np.mean([ps['route_completion'] for ps in pdms_scores])
+            total_coll = sum(ps['counts']['collision_steps'] for ps in pdms_scores)
+            total_off = sum(ps['counts']['off_road_steps'] for ps in pdms_scores)
+            logger.info(f'[PDMS] score={avg_score:.1f} completion={avg_comp:.1%} '
+                        f'collisions={total_coll} off_road={total_off}')
+            agent.epoch_history_pdms.append(pdms_scores)
 
         logger.info(f'开始保存轨迹图像')
         for viz in viz_list:

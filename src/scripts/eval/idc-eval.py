@@ -16,8 +16,10 @@ from env.idc_state_builder import GPUDriveObservationBuilder
 from agents.idc_agent import DiscreteIDCAgent
 from utils import get_logger, VisualRecorder, TrajectoryVisualizer, LossPlotter
 from utils.config import build_config
+from metrics import PDMSScorer, RolloutPDMSScorer
+from metrics.plotter import print_pdms_table, plot_pdms_radar, plot_pdms_bar
 
-logger = get_logger('idc-agent')
+logger = get_logger('idc-eval')
 
 
 def _record_gif_frame(env, recorder, config, epoch, step, ego_indices, wm, selected_worlds):
@@ -133,11 +135,26 @@ def evaluate(config):
 
         gif_worlds = _select_gif_worlds(config, VIZ_WORLDS)
 
+        scorers = [PDMSScorer(config) for _ in range(config.num_worlds)]
+        ref_start_agent = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
+
         for step in range(max_step):
             logger.info(f'回合 {epoch+1}/{config.epochs}, 步数 {step+1}/{max_step}')
 
             path_indices = [0 for _ in range(config.num_worlds)]
             states = builder.get_idc_observations_batch(ego_indices, path_indices=path_indices)
+
+            # Rollout PDMS — 仅在 step 0 对前 3 个 good world 做一次前向推演
+            if step == 0 and epoch == 0:
+                rollout_scores = {}
+                roll_scorer = RolloutPDMSScorer(agent, config, path_idx=0)
+                for w in wm.good_worlds[:3]:
+                    try:
+                        roll = roll_scorer.compute_rollout_pdms(states[w], w, ego_indices[w])
+                        rollout_scores[w] = roll
+                        logger.info(f'[PDMS-rollout] world_{w} predicted_score={roll["driving_score"]:.1f}')
+                    except Exception as e:
+                        logger.debug(f'[PDMS-rollout] world_{w} failed: {e}')
 
             wm.filter_per_step(states, step)
 
@@ -156,6 +173,40 @@ def evaluate(config):
             logger.debug(f'动作选择完成，开始环境交互，动作形状: {actions.shape}')
             env.step_dynamics(actions)
 
+            # PDMS 数据采集
+            info_np = env.sim.info_tensor().to_torch().cpu().numpy()
+            abs_for_pdms = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+            partner_for_pdms = env.sim.partner_observations_tensor().to_torch().cpu().numpy()
+            rel_np = env.sim.self_observation_tensor().to_torch().cpu().numpy()
+            for w in range(config.num_worlds):
+                if w in wm.bad_worlds:
+                    continue
+                a = ego_indices[w]
+                ego_x, ego_y = float(abs_for_pdms[w, a, 0]), float(abs_for_pdms[w, a, 1])
+                ego_heading = float(abs_for_pdms[w, a, 7])
+                ego_vel = float(rel_np[w, a, 0])
+                partners = partner_for_pdms[w, a]
+                off_road = float(info_np[w, a, 0]) > 0
+                collision = (float(info_np[w, a, 1]) + float(info_np[w, a, 2])) > 0
+                pid = 0
+                t = builder.step_counter[w]
+                path = builder.candidate_paths[w][a][pid]
+                road_dist_ref = float(path['road_dist'][min(t, len(path['road_dist']) - 1)])
+                scorers[w].update_step(
+                    ego_pos=(ego_x, ego_y),
+                    ego_vel=ego_vel,
+                    ego_heading=ego_heading,
+                    partners=partners,
+                    off_road=off_road,
+                    collision=collision,
+                    delta_phi=float(states[w][ref_start_agent + 1]),
+                    temporal_idx=t,
+                    max_step=max_step,
+                    road_dist_ref=road_dist_ref,
+                    lat=float(states[w][ref_start_agent + 3]),
+                    dt=config.dt,
+                )
+
             if gif_enabled and step % recorder.fps == 0 and gif_worlds:
                 _record_gif_frame(env, recorder, config, epoch, step,
                                   ego_indices, wm, gif_worlds)
@@ -163,6 +214,28 @@ def evaluate(config):
         for viz in viz_list:
             if len(viz.actual_x) > 0:
                 viz.save_plot(viz_dir, epoch + 1)
+
+        # PDMS epoch 报告
+        pdms_scores = [s.compute() for s in scorers if s.steps > 0]
+        if pdms_scores:
+            print_pdms_table(pdms_scores, logger)
+
+            pdms_plot_dir = os.path.join(config.file_dir, 'pdms_plots')
+            os.makedirs(pdms_plot_dir, exist_ok=True)
+
+            plot_pdms_radar(pdms_scores,
+                            os.path.join(pdms_plot_dir, f'pdms_radar_epoch{epoch+1}.png'),
+                            title=f'PDMS Epoch {epoch+1}')
+
+            bar_data = []
+            for i, s in enumerate(pdms_scores):
+                # find the world index
+                for w in range(config.num_worlds):
+                    if scorers[w].steps > 0:
+                        bar_data.append({'world_idx': w, **s})
+            plot_pdms_bar(bar_data[:20],
+                         os.path.join(pdms_plot_dir, f'pdms_bar_epoch{epoch+1}.png'),
+                         title=f'Per-World Driving Score Epoch {epoch+1}')
 
     if gif_enabled:
         recorder.save_all_gifs(custom_fps=config.gif_fps)

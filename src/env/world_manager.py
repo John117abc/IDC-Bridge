@@ -129,7 +129,7 @@ class WorldManager:
             if abs(states[w][0]) > self.filter_threshold or abs(states[w][1]) > self.filter_threshold:
                 self.bad_worlds.add(w)
                 dp = abs(states[w][ref_start])
-                self.logger.warning(
+                self.logger.debug(
                     f'[FILTER-ego] world_{w} step={step} '
                     f'ego=({states[w][0]:.0f},{states[w][1]:.0f}) delta_p={dp:.0f}'
                 )

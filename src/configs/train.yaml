@@ -11,7 +11,7 @@ env:
 # ---- 路径/保存 ----
 paths:
   file_dir: "/workspace/data"
-  model_path: "/workspace/data/checkpoints/tracking.pth"
+  model_path: "/workspace/data/checkpoints/20260528/idc-waymo-v1.0_examples_072807_episode=500.pth"
   save_freq: 5
   load_model: true
 

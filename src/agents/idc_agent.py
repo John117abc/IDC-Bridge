@@ -103,6 +103,7 @@ class DiscreteIDCAgent:
 
         # 历史损失
         self.history_loss = []
+        self.epoch_history_pdms = []
 
 
     def select_action(self, state, deterministic=False):
@@ -561,6 +562,8 @@ class DiscreteIDCAgent:
             logger.warning(f"加载模型维度{loaded_dim}与当前{self.TOTAL_STATE_DIM}不一致")
         self.globe_eps = checkpoint['globe_eps']
         self.history_loss = checkpoint['history']
+        self.epoch_history_pdms = checkpoint.get('history_pdms', [])
+        self.global_step = checkpoint['global_step']
         self.global_step = checkpoint['global_step']
         self.rho = checkpoint['rho'] == 0.0 and self.config.init_penalty or checkpoint['rho']
         self.gep_iteration = checkpoint['gep_iteration']
