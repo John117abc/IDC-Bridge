@@ -11,7 +11,7 @@ env:
 # ---- 路径/保存 ----
 paths:
   file_dir: "/workspace/data"
-  model_path: null
+  model_path: "/workspace/data/checkpoints/tracking.pth"
   save_freq: 5
   load_model: true
 

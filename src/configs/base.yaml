@@ -10,14 +10,14 @@ training:
   batch_size: 512
   hidden_dim: 256
   lr_actor: 8.0e-5
-  lr_critic: 3.0e-4
+  lr_critic: 1.0e-4
   pim_interval: 30
   gamma: 0.99
   buffer_capacity: 100000
 
 # ---- Agent 参数 ----
 agent:
-  pos_err_weight: 0.3
+  pos_err_weight: 0.03
   speed_err_weight: 0.04
   heading_err_weight: 0.3
   steer_cost_weight: 0.3
@@ -25,10 +25,10 @@ agent:
   lookahead_pos_weight: 0.05
   lookahead_heading_weight: 0.05
   noise_std: 0.1
-  noise_decay_rate: 0.98
+  noise_decay_rate: 0.95
   noise_std_min: 0.03
-  init_penalty: 1.0
-  max_penalty: 10.0
+  init_penalty: 0.0
+  max_penalty: 5.0
   amplifier_c: 1.005
   D_veh_safe: 2.0
   D_road_safe: 2.0

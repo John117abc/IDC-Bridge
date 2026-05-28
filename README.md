@@ -26,6 +26,9 @@ Actor/Critic 为两个独立 MLP（LayerNorm + ELU），动作空间为加速度
 9. **YAML 层级配置**：`base.yaml`（共享）→ `train.yaml`/`eval.yaml` 继承覆盖，CLI 仅需指定差异项
 10. **条件 penalty 放大**：仅在 rollout 中检测到碰撞/越界违规时才放大 ρ，防止噪声梯度污染
 11. **密度范围筛选**：离线扫描 Waymo 场景周车密度，训练/评估可按密度区间 `[min, max]` 选择世界
+12. **道路 penalty 基于参考路径**：用 `road_dist_ref - |lat|` 替代 `edge_dist`，只在跨出路外时触发，不再误罚路中心
+13. **权重重平衡**：`pos_err_weight=0.03`（原 0.3），使 heading 信号与 position 信号量级匹配
+14. **Checkpoint 续训时自动覆盖 optimizer lr**：加载后 `lr_critic`/`lr_actor` 从 config 更新，不受旧 checkpoint 影响
 
 ## 快速开始
 
@@ -246,9 +249,6 @@ python idc-eval.py ... --gif-max-worlds 5 --gif-world-selection random
 │       └── ...
 ├── info.md
 └── README.md
-├── info.md                           # 完整开发记录
-├── README.md
-└── requirements.txt
 ```
 
 ## 踩过的坑
@@ -263,6 +263,10 @@ python idc-eval.py ... --gif-max-worlds 5 --gif-world-selection random
 6. **幽灵车**：GPUDrive 填零车被当真实车 → 虚假 penalty
 7. **每步随机换候选路径**：参考点侧向跳动 7.5m → 追踪信号污染
 8. **tracking_only 噪声不衰减**：σ=0.1 永不降 → 策略永远模糊
+9. **道路 penalty 公式反向**：`F.relu(edge_dist - D_road_safe)` 惩罚路中心（远离边线），奖励靠路边（贴近边线）→ penalty 把自车推向路边，与 tracking 冲突
+10. **heading 权重被 position 淹没 250:1**：`pos_err²×0.3=750` vs `heading_err²×0.3=3` → Actor 忽略朝向，无法学纠正偏离
+11. **Checkpoint 续训 optimizer lr 被覆盖**：`load_checkpoint` 恢复旧 lr，config 中的新 lr 被忽略 → 需手动覆写 `param_groups['lr']`
+12. **GIF fps 与录制间隔混淆**：`gif_fps` 同时控制录制频率和播放速度 → 降低 fps 导致 GIF 又少帧又慢 → 解耦为 `gif_fps`（播放）和 `gif_record_interval`（录制间隔）
 
 ## 引用
 

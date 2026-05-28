@@ -1218,3 +1218,97 @@ ego_indices = wm.resample()              # swap + 重建 + 过滤 + agent 更新
 wm.good_worlds                           # 未过滤的 world 列表
 wm.good_count                            # 存活 world 数量
 ```
+
+---
+
+## 49. Road Penalty 公式反向（CRITICAL）
+
+**日期**：2026-05-28
+
+**症状**：penalty 训练后 tracking 反而更差（good_worlds 119→34），actor_loss 被 penalty 主导（~800 vs tracking ~20）。LA-DIAG 显示 delta_phi≈0.034（heading 完美）但 delta_p=8m（偏移很大），road=7.5m。
+
+**根因**：`penalty_batch` 中 road_violation 公式为：
+
+```python
+edge_dist = sqrt((edge_pts - ego)^2)       # 自车到最近道路线距离
+road_violation = F.relu(edge_dist - D_road_safe)  # ← 错误
+```
+
+含义：
+- 路中心（edge_dist=7.5m）→ violation = 5.5，**被罚**
+- 贴路边（edge_dist=0.5m）→ violation = 0，**奖励**
+
+penalty 把自车推向路边，tracking 拉向路中心 → 冲突。rho=10 时 penalty 梯度（55/步）是 tracking 梯度（4.8/步）的 11 倍，Actor 被推向路边。
+
+**修复**：改为 path-based 公式，利用已预计算的 `road_dist_ref`（参考点到最近路边）和 state 中的 lateral error `lat`：
+
+```python
+ego_road_dist = road_dist_ref - torch.abs(lat)
+road_violation = F.relu(D_road_safe - ego_road_dist)
+```
+
+| 场景 | lat | road_dist_ref | ego_road_dist | violation |
+|------|-----|-------------|-------------|-----------|
+| 路中心 | 0 | 7.5 | 7.5 | **0** ✓ |
+| 靠路边 | 5.5 | 7.5 | 2.0 | 0 ✓ |
+| 跨出路面 | 8 | 7.5 | -0.5 | **2.5** ✓ |
+
+**涉及文件**：`idc_agent.py:460-505`（penalty_batch 签名增加 `p_i` 参数）
+
+---
+
+## 50. 权重不平衡：heading 信号被 position 淹没
+
+**日期**：2026-05-28
+
+**症状**：episode 内 pos_err 从 1m 递增到 31m，critic loss=2863，tracking 不稳定。
+
+**根因**：utility 函数中 `pos_err²×0.3` 最大可达 750，`heading_err²×0.3` 最大仅 3，比例 250:1。heading 对 utility 的贡献在数值上可忽略，Actor 梯度几乎全部来自 position error。但减小 position error 需要先改正 heading。
+
+**修复**：`pos_err_weight: 0.3 → 0.03`（/10），比例降为 25:1。同时 `lr_critic: 3e-4 → 1e-4`（value 跨度大时拟合更稳）、`noise_decay_rate: 0.98 → 0.95`（更早收敛到确定性策略）。
+
+**涉及文件**：`configs/base.yaml`
+
+---
+
+## 51. Checkpoint 续训时 optimizer lr 被旧值覆盖
+
+**日期**：2026-05-28
+
+**症状**：修改 `base.yaml` 中 `lr_critic=1e-4` 后加载 tracking checkpoint 续训，critic 仍用 3e-4。
+
+**根因**：`load_checkpoint()` → `opt.load_state_dict()` 恢复 optimizer 完整状态，包括 `param_groups['lr']`。旧 checkpoint 中 lr=3e-4 覆盖了新建 optimizer 时设置的 1e-4。rho 同理，但 rho 有专门处理逻辑（checkpoint rho=0+init_penalty>0 时从 config 取值）。
+
+**修复**：`load()` 中 `load_checkpoint()` 之后显式覆写：
+
+```python
+for pg in self.actor_optimizer.param_groups:
+    pg['lr'] = self.config.lr_actor
+for pg in self.critic_optimizer.param_groups:
+    pg['lr'] = self.config.lr_critic
+```
+
+rho 不受影响（保持现有逻辑），max_penalty 在 agent 构造时从 config 读也不受影响。
+
+**涉及文件**：`idc_agent.py:load()`
+
+---
+
+## 52. GIF fps 与录制间隔混淆
+
+**日期**：2026-05-28
+
+**症状**：用户调低 `gif_fps=1` 期望更流畅播放，实际 GIF 变成每秒只播放 1 帧，又慢又卡。
+
+**根因**：`gif_fps` 同时控制 VisualRecorder 的录制间隔（`step % fps` 决定何时录帧）和 GIF 播放速度（`imageio.mimsave(fps=fps)`）。降低 fps → 录制间隔变大 + 播放更慢 → 双重恶化。
+
+**修复**：解耦为两个独立参数：
+
+| 参数 | 默认 | 控制 |
+|------|------|------|
+| `gif_record_interval` | 2 | 每隔 N 个 env step 录一帧 |
+| `gif_fps` | 15 | GIF 播放速度（帧/秒） |
+
+录制间隔用 `config.gif_record_interval`，播放用 `custom_fps=config.gif_fps`。
+
+**涉及文件**：`configs/train.yaml`、`configs/eval.yaml`、`idc-eval.py`

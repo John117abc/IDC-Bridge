@@ -221,9 +221,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(
         description='IDC-Bridge 训练脚本。所有默认值从 YAML 配置文件读取，CLI 参数可覆盖。')
-    parser.add_argument('--config', type=str, default='configs/train.yaml',
+    parser.add_argument('--config', type=str, default='/workspace/idc/src/configs/train.yaml',
                         help='YAML 配置文件路径')
-    parser.add_argument('--data-dir', type=str, required=True,
+    parser.add_argument('--data-dir', type=str, default='/workspace/wayo_data/data_json/training/',
                         help='Waymo tfrecord 数据目录')
     parser.add_argument('--num-worlds', type=int, default=None)
     parser.add_argument('--epochs', type=int, default=None)

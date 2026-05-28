@@ -362,7 +362,7 @@ class DiscreteIDCAgent:
                             f'l3(lat={s[0, ref_start+9]:.2f} dphi={s[0, ref_start+10]:.3f} road={s[0, ref_start+11]:.1f}) '
                             f'delta_p={s[0, ref_start]:.2f} delta_phi={s[0, ref_start+1]:.3f}')
             l = torch.clamp(l, -5000.0, 5000.0)
-            p = self.penalty_batch(s, w_i)
+            p = self.penalty_batch(s, w_i, p_i)
             p = torch.clamp(p, max=100.0)
             max_penalty = max(max_penalty, p.max().item())
             if t == 0:
@@ -457,10 +457,10 @@ class DiscreteIDCAgent:
         rear = torch.stack([x - dx, y - dy], dim=-1)
         return front, rear
 
-    def penalty_batch(self, s, w_i):
+    def penalty_batch(self, s, w_i, p_i=None):
         """
-        s: [batch, TOTAL_STATE_DIM]
-        返回 [batch] 标量惩罚值（双圆碰撞模型，可导）
+        s: [batch, TOTAL_STATE_DIM], p_i: path indices [batch]
+        返回 [batch] 标量惩罚值（双圆碰撞模型 + 道路边界，可导）
         """
         ego = s[:, :self.DIM_EGO]
         others = s[:, self.DIM_EGO:self.DIM_EGO + self.DIM_OTHERS].view(-1, 8, 4)
@@ -479,17 +479,22 @@ class DiscreteIDCAgent:
         # 4 组距离: ego[2] × other[8,2] → [batch, 8, 2, 2]
         diff = ego_circles[:, None, :, None, :] - oth_circles[:, :, None, :, :]
         dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # [batch, 8, 2, 2]
-        # 每辆周车取最危险的一对圆碰撞，用 validity mask 屏蔽 padding 车
         pair_pen = F.relu(self.D_veh_safe - dist).pow(2)          # [batch, 8, 2, 2]
         per_veh_max = pair_pen.flatten(2).max(dim=2).values       # [batch, 8]
-        veh_violation = (per_veh_max * validity).sum(dim=1)       # [batch] — padding 车不计入
+        veh_violation = (per_veh_max * validity).sum(dim=1)       # [batch]
 
-        # 道路边界惩罚：线性，始终有梯度拉回道路
-        edge_pts = self.state_builder.get_road_edges_batch(
-            w_i, ego[:, 0], ego[:, 1])
-        edge_dist = torch.sqrt((edge_pts[:, 0] - ego[:, 0]) ** 2
-                              + (edge_pts[:, 1] - ego[:, 1]) ** 2 + 1e-8)
-        road_violation = F.relu(edge_dist - self.D_road_safe)  # 线性，不平方
+        # 道路边界惩罚：基于参考路径的 road_dist + 自车 lateral error
+        # road_dist_ref: 参考点到最近道路边线的距离（≈半幅路宽）
+        # lat: 自车相对参考路径的横向偏移
+        # ego_road_dist = road_dist_ref - |lat|: 为负数时说明已跨出路外
+        ref_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
+        lat = s[:, ref_start + 3]  # 当前步横向偏移（从 state ref_error 取 lat_l1）
+        temp_start = ref_start + self.DIM_REF_ERROR
+        temporal_idx = s[:, temp_start:temp_start + self.DIM_TEMPORAL].squeeze(-1).long()
+        road_dist_ref = self.state_builder.get_road_dist_batch(
+            w_i, temporal_idx, self.ego_indices, p_i if p_i is not None else [0]*len(w_i), s.device)
+        ego_road_dist = road_dist_ref - torch.abs(lat)
+        road_violation = F.relu(self.D_road_safe - ego_road_dist)
 
         return veh_violation + road_violation
     
@@ -559,5 +564,11 @@ class DiscreteIDCAgent:
         self.global_step = checkpoint['global_step']
         self.rho = checkpoint['rho'] == 0.0 and self.config.init_penalty or checkpoint['rho']
         self.gep_iteration = checkpoint['gep_iteration']
+
+        for pg in self.actor_optimizer.param_groups:
+            pg['lr'] = self.config.lr_actor
+        for pg in self.critic_optimizer.param_groups:
+            pg['lr'] = self.config.lr_critic
+
         return checkpoint
         
