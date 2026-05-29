@@ -144,7 +144,7 @@ class WorldManager:
                 if done_np is not None and done_np[w, a] > 0.5:
                     self.reached_worlds.add(w)
                     modified = True
-                    self.logger.info(f'[REACHED-GOAL] world_{w} step={step}/{path_len} — done, excluding')
+                    self.logger.debug(f'[REACHED-GOAL] world_{w} step={step}/{path_len} — done, excluding')
                     continue
                 self.bad_worlds.add(w)
                 modified = True
