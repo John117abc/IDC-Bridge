@@ -83,6 +83,8 @@ class GPUDriveObservationBuilder:
             if valid_len < num_points:
                 expert_pos_w[valid_len:, :] = expert_pos_w[valid_len - 1, :]
                 expert_h_w[valid_len:] = expert_h_w[valid_len - 1]
+                self.expert_pos[w, a] = torch.from_numpy(expert_pos_w)
+                self.expert_heading[w, a, :, :] = torch.from_numpy(expert_h_w.reshape(-1, 1))
                 logger.debug(f'[TRUNCATE] world_{w} agent_{a} expert truncated at step {valid_len}/{num_points}')
 
             for offset in offsets:
