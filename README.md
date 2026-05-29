@@ -292,6 +292,8 @@ LK:  车道保持（|lat| / road_width）
 11. **Checkpoint 续训 optimizer lr 被覆盖**：`load_checkpoint` 恢复旧 lr，config 中的新 lr 被忽略 → 需手动覆写 `param_groups['lr']`
 12. **GIF fps 与录制间隔混淆**：`gif_fps` 同时控制录制频率和播放速度 → 解耦为 `gif_fps`（播放）和 `gif_record_interval`（录制间隔）
 13. **Rho 乘性膨胀**：`rho *= 1.005` 每 30 步无条件膨胀 → 必然到 cap → penalty 压倒 tracking → 改为线性 `rho += 0.01`，仅违规时增
+14. **Expert 轨迹含 sentinel 坐标**：短轨迹世界 step 58-90 为 `(-11000,-11000)` → 参考点 sentinel 拉偏自车 → `generate_candidate_paths` 自动检测并裁剪填充
+15. **到达终点的世界误标 bad**：`reachedGoal/done` 后 GPUDrive 重置 ego 为 sentinel → filter 误杀 → 引入 `reached_worlds` 集合，用 `done_tensor` 区分正常终点 vs 真实崩溃
 
 ## 引用
 

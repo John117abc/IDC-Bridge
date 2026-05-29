@@ -17,6 +17,7 @@ class WorldManager:
 
         self.num_worlds = args.num_worlds
         self.bad_worlds = set()
+        self.reached_worlds = set()
         self.ego_indices = None
 
         self.filter_threshold = getattr(args, 'filter_threshold', 200)
@@ -104,6 +105,7 @@ class WorldManager:
     def filter_initial(self, ego_indices):
         self.ego_indices = ego_indices
         self.bad_worlds.clear()
+        self.reached_worlds.clear()
         self.logger.info('Pre-training world filter: checking path coordinates...')
 
         for w in range(self.num_worlds):
@@ -122,22 +124,35 @@ class WorldManager:
 
     def filter_per_step(self, states, step):
         ref_start = self.agent.DIM_EGO + self.agent.DIM_OTHERS + self.agent.DIM_VALIDITY
+        done_pulled = False
+        done_np = None
 
         for w in range(self.num_worlds):
-            if w in self.bad_worlds:
+            if w in self.bad_worlds or w in self.reached_worlds:
                 continue
             if abs(states[w][0]) > self.filter_threshold or abs(states[w][1]) > self.filter_threshold:
+                a = self.ego_indices[w]
+                path_len = len(self.builder.candidate_paths[w][a][0]['pos'])
+                if step >= path_len - 1:
+                    continue
+                if not done_pulled:
+                    done_np = self.env.get_dones().cpu().numpy()
+                    done_pulled = True
+                if done_np is not None and done_np[w, a] > 0.5:
+                    self.reached_worlds.add(w)
+                    self.logger.debug(f'[REACHED-GOAL] world_{w} step={step}/{path_len} — done, excluding')
+                    continue
                 self.bad_worlds.add(w)
                 dp = abs(states[w][ref_start])
-                self.logger.debug(
-                    f'[FILTER-ego] world_{w} step={step} '
+                self.logger.warning(
+                    f'[FILTER-ego] world_{w} step={step}/{path_len} '
                     f'ego=({states[w][0]:.0f},{states[w][1]:.0f}) delta_p={dp:.0f}'
                 )
 
         if step % 5 == 0:
             max_dp, max_w = 0.0, 0
             for w in range(self.num_worlds):
-                if w in self.bad_worlds:
+                if w in self.bad_worlds or w in self.reached_worlds:
                     continue
                 s = states[w]
                 dp = abs(s[ref_start])
@@ -145,11 +160,19 @@ class WorldManager:
                     max_dp, max_w = dp, w
             self.logger.info(
                 f'[DIAG-ref] max pos_err={max_dp:.2f}m @world_{max_w} '
-                f'good_worlds={self.good_count}/{self.num_worlds}'
+                f'good={self.good_count} reached={len(self.reached_worlds)} '
+                f'bad={len(self.bad_worlds)}/{self.num_worlds}'
             )
 
     def should_resample(self):
-        return len(self.bad_worlds) > self.args.max_bad_worlds
+        if len(self.bad_worlds) > self.args.max_bad_worlds:
+            return True
+        if self.good_count < self.num_worlds * 0.3:
+            return True
+        interval = getattr(self.args, 'resample_interval', 0)
+        if interval > 0 and self.agent.globe_eps > 0 and self.agent.globe_eps % interval == 0:
+            return True
+        return False
 
     def resample(self):
         self.logger.info(
@@ -180,6 +203,7 @@ class WorldManager:
         self.builder.generate_candidate_paths(new_ego, num_paths=3)
 
         self.bad_worlds.clear()
+        self.reached_worlds.clear()
         for w in range(self.num_worlds):
             a = new_ego[w]
             for pid in range(self.builder.num_candidate_paths):
@@ -205,8 +229,9 @@ class WorldManager:
 
     @property
     def good_worlds(self):
-        return [w for w in range(self.num_worlds) if w not in self.bad_worlds]
+        return [w for w in range(self.num_worlds)
+                if w not in self.bad_worlds and w not in self.reached_worlds]
 
     @property
     def good_count(self):
-        return self.num_worlds - len(self.bad_worlds)
+        return len(self.good_worlds)

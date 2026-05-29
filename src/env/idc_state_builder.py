@@ -75,6 +75,16 @@ class GPUDriveObservationBuilder:
             expert_pos_w = self.expert_pos[w, a].cpu().numpy()
             expert_h_w = self.expert_heading[w, a].squeeze(-1).cpu().numpy()
 
+            valid_len = num_points
+            for j in range(1, num_points):
+                if abs(expert_pos_w[j, 0]) > 5000 or abs(expert_pos_w[j, 1]) > 5000:
+                    valid_len = j
+                    break
+            if valid_len < num_points:
+                expert_pos_w[valid_len:, :] = expert_pos_w[valid_len - 1, :]
+                expert_h_w[valid_len:] = expert_h_w[valid_len - 1]
+                logger.debug(f'[TRUNCATE] world_{w} agent_{a} expert truncated at step {valid_len}/{num_points}')
+
             for offset in offsets:
                 if abs(offset) < 1e-6:
                     pos = expert_pos_w.copy()
@@ -278,6 +288,7 @@ class GPUDriveObservationBuilder:
             dphi_l1 = lh1 - ego[4]
             dphi_l1 = math.atan2(math.sin(dphi_l1), math.cos(dphi_l1))
             road1 = path['road_dist'][t_l1]
+            spd1 = path['speed'][t_l1]
 
             lx2, ly2 = float(path['pos'][t_l2, 0]), float(path['pos'][t_l2, 1])
             lh2 = float(path['heading'][t_l2])
@@ -285,6 +296,7 @@ class GPUDriveObservationBuilder:
             dphi_l2 = lh2 - ego[4]
             dphi_l2 = math.atan2(math.sin(dphi_l2), math.cos(dphi_l2))
             road2 = path['road_dist'][t_l2]
+            spd2 = path['speed'][t_l2]
 
             lx3, ly3 = float(path['pos'][t_l3, 0]), float(path['pos'][t_l3, 1])
             lh3_ = float(path['heading'][t_l3])
@@ -292,10 +304,11 @@ class GPUDriveObservationBuilder:
             dphi_l3 = lh3_ - ego[4]
             dphi_l3 = math.atan2(math.sin(dphi_l3), math.cos(dphi_l3))
             road3 = path['road_dist'][t_l3]
+            spd3 = path['speed'][t_l3]
 
-            lookahead_err = np.array([lat1, dphi_l1, road1,
-                                       lat2, dphi_l2, road2,
-                                       lat3, dphi_l3, road3], dtype=np.float32)
+            lookahead_err = np.array([lat1, dphi_l1, road1, spd1,
+                                       lat2, dphi_l2, road2, spd2,
+                                       lat3, dphi_l3, road3, spd3], dtype=np.float32)
             ref_err = np.concatenate([ref_err, lookahead_err])
 
             # 诊断大偏离: pos_err > 100m 时打印 ego/ref 坐标和路径索引

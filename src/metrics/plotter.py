@@ -5,11 +5,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-def print_pdms_table(scores_list, logger):
+def print_pdms_table(scores_list, logger, total_worlds=None):
     """打印 PDMS 评估表格到终端。
 
     Args:
         scores_list: list of dict, 每个 dict 是 PDMSScorer.compute() 的输出
+        total_worlds: 总 world 数（用于显示 surviving 比例）
     """
     if not scores_list:
         return
@@ -35,6 +36,8 @@ def print_pdms_table(scores_list, logger):
     lines.append("")
     lines.append("=" * 58)
     lines.append("  PDMS Evaluation Results")
+    if total_worlds:
+        lines.append(f"  Surviving worlds: {n}/{total_worlds}")
     lines.append("=" * 58)
     lines.append(f"  Worlds evaluated: {n}")
     lines.append("-" * 58)

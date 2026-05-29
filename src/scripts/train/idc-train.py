@@ -126,6 +126,16 @@ def train(config):
         for w in range(config.num_worlds):
             builder.reset_world_step(w, 0)
         builder.clear_cache()
+        wm.reached_worlds.clear()
+
+        # 检测 epoch 开头已 done 的世界（轨迹数据异常/已到终点）
+        done_np = env.get_dones().cpu().numpy()
+        for w in range(config.num_worlds):
+            if w in wm.bad_worlds:
+                continue
+            a = ego_indices[w]
+            if done_np[w, a] > 0.5:
+                wm.reached_worlds.add(w)
 
         epoch_history = []
 
@@ -152,20 +162,16 @@ def train(config):
 
             if config.no_sign:
                 ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
-                for w in range(config.num_worlds):
-                    if w in wm.bad_worlds:
-                        continue
+                for w in wm.good_worlds:
                     states[w][ref_start] = abs(states[w][ref_start])
 
-            for w in range(config.num_worlds):
-                if w in wm.bad_worlds:
-                    continue
+            for w in wm.good_worlds:
                 agent.buffer.handle_new_experience((states[w], w, episode_path_indices[w]))
                 builder.increment_step(w)
 
             positions = builder.get_ego_positions_batch(ego_indices)
             for i, w in enumerate(VIZ_WORLDS):
-                if w in wm.bad_worlds:
+                if w in wm.bad_worlds or w in wm.reached_worlds:
                     continue
                 viz_list[i].record_step(positions[w, 0], positions[w, 1])
 
@@ -193,9 +199,7 @@ def train(config):
             abs_for_pdms = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
             partner_for_pdms = env.sim.partner_observations_tensor().to_torch().cpu().numpy()
             rel_np = env.sim.self_observation_tensor().to_torch().cpu().numpy()
-            for w in range(config.num_worlds):
-                if w in wm.bad_worlds:
-                    continue
+            for w in wm.good_worlds:
                 a = ego_indices[w]
                 ego_x, ego_y = float(abs_for_pdms[w, a, 0]), float(abs_for_pdms[w, a, 1])
                 ego_heading = float(abs_for_pdms[w, a, 7])
@@ -237,15 +241,18 @@ def train(config):
         agent.globe_eps += 1
         agent.history_loss.append(epoch_history.copy())
 
-        # PDMS epoch logging
-        pdms_scores = [s.compute() for s in scorers if s.steps > 0]
+        # PDMS epoch logging (仅 surviving worlds，排除坐标系异常的 crash 场景)
+        pdms_scores = [scorers[w].compute()
+                       for w in range(config.num_worlds)
+                       if w not in wm.bad_worlds and scorers[w].steps > 0]
         if pdms_scores:
             avg_score = np.mean([ps['driving_score'] for ps in pdms_scores])
             avg_comp = np.mean([ps['route_completion'] for ps in pdms_scores])
             total_coll = sum(ps['counts']['collision_steps'] for ps in pdms_scores)
             total_off = sum(ps['counts']['off_road_steps'] for ps in pdms_scores)
             logger.info(f'[PDMS] score={avg_score:.1f} completion={avg_comp:.1%} '
-                        f'collisions={total_coll} off_road={total_off}')
+                        f'collisions={total_coll} off_road={total_off} '
+                        f'(surviving: {len(pdms_scores)}/{config.num_worlds})')
             agent.epoch_history_pdms.append(pdms_scores)
 
         logger.info(f'开始保存轨迹图像')

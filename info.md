@@ -1411,3 +1411,61 @@ python idc-train.py --no-road-penalty
 ```
 
 **涉及文件**：`base.yaml`、`idc_agent.py`、`idc-train.py`、`idc-eval.py`
+
+---
+
+## 57. Expert 轨迹含 sentinel 坐标 → 参考点污染
+
+**日期**：2026-05-29
+
+**症状**：短轨迹 world 在 step 57 后自车偏离到 sentinel `(-11000, -11000)`，导致 filter 误标 bad。`pos_err=15585m` 持续污染 DIAG-ref 和 buffer。
+
+**根因**：GPUDrive C++ 源码确认 `kPaddingPosition = (-11000, -11000)`（`src/consts.hpp:64`）。Waymo 数据中很多场景只有 50-70 步有效轨迹，expert data 在无效步填入 sentinel。`generate_candidate_paths` 将此 sentinel 作为参考点，自车在有效步结束后跟踪到 sentinel → 动作偏离。
+
+**修复**：`idc_state_builder.py:generate_candidate_paths()` 中在构建路径前检测 expert data 中的 sentinel（`abs(pos) > 5000`），找到截止点后用最后有效位置/heading 填充剩余步。所有下游消费者（ref_tensor、get_ref_states_batch、get_road_dist_batch、PDMS 等）自动受益。
+
+**涉及文件**：`idc_state_builder.py`
+
+---
+
+## 58. 到达终点的世界误标 bad → reached_worlds 分类
+
+**日期**：2026-05-29
+
+**症状**：good_worlds 从 150 快速降至 30-50，但多数世界跟踪质量良好（pos_err < 5m）；日志无 `[FILTER-ego]` 警告，DIAG-ref 却在持续。到达终点的世界被 sentinel 误标。
+
+**根因**：GPUDrive 在 agent 到达目标（`reachedGoal=1`）或 episode 结束时触发 `done.v=1` → `movementSystem` 将 ego 移至 sentinel `(-11000, -11000)`（`src/sim.cpp:327-331`）。filter 检测到 sentinel 但无法区分是正常终点还是真实崩溃。
+
+**修复**：引入三类世界分类：
+
+| 集合 | 含义 | 生命周期 |
+|------|------|---------|
+| `bad_worlds` | 真实崩溃 | resample 时清 |
+| `reached_worlds` | 正常到达终点 | **每 epoch 清** |
+| `good_worlds` | 两者都不在 | 每 epoch 动态变化 |
+
+- `filter_per_step`：sentinel 检测后用 `env.get_dones()` 替代 `info_tensor[:,:,3]` 判断，done=1 → `reached_worlds.add`
+- epoch 开头：`env.reset()` 后立即拉 `get_dones()` 预检测已 done world
+- `good_worlds` 属性：排除 both bad + reached
+- buffer 插入、PDMS 采集、no-sign 处理全部改为使用 `good_worlds`
+- `should_resample`：新增 `good_count < num_worlds * 0.3` 触发
+
+**涉及文件**：`world_manager.py`、`idc-train.py`、`idc-eval.py`
+
+---
+
+## 59. 日志分层：区分正常终点 vs 崩溃
+
+**日期**：2026-05-29
+
+**症状**：无法从日志判断 good_worlds 下降是因为到达终点还是真实崩溃。
+
+**修复**：
+
+- `[REACHED-GOAL] world_X step=35/91 — done, excluding`（正常终点，info 级别）
+- `[FILTER-ego] world_X step=30/91 ego=(-11000,-11000)`（真实崩溃，warning 级别）
+- `[DIAG-ref] good=135 reached=7 bad=8/150`（一目了然）
+
+行人一眼能看到 150 个世界中：135 个正常训练、7 个到达终点、8 个真实崩溃。
+
+**涉及文件**：`world_manager.py`

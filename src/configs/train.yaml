@@ -11,9 +11,9 @@ env:
 # ---- 路径/保存 ----
 paths:
   file_dir: "/workspace/data"
-  model_path: "/workspace/data/checkpoints/tracking_eps_300.pth"
+  model_path: "/workspace/data/checkpoints/20260529/idc-waymo-v1.0_examples_013810_episode=490.pth"
   save_freq: 5
-  load_model: false
+  load_model: true
 
 # ---- 可视化/GIF 配置（训练默认关闭） ----
 viz:

@@ -29,7 +29,7 @@ def _record_gif_frame(env, recorder, config, epoch, step, ego_indices, wm, selec
 
     if view_mode == "agent_pov":
         for w in selected_worlds:
-            if w in wm.bad_worlds:
+            if w in wm.bad_worlds or w in wm.reached_worlds:
                 continue
             result = env.vis.plot_agent_observation(
                 agent_idx=ego_indices[w], env_idx=w)
@@ -128,6 +128,15 @@ def evaluate(config):
         for w in range(config.num_worlds):
             builder.reset_world_step(w, 0)
         builder.clear_cache()
+        wm.reached_worlds.clear()
+
+        done_np = env.get_dones().cpu().numpy()
+        for w in range(config.num_worlds):
+            if w in wm.bad_worlds:
+                continue
+            a = ego_indices[w]
+            if done_np[w, a] > 0.5:
+                wm.reached_worlds.add(w)
 
         viz_list = [TrajectoryVisualizer(builder, w, ego_indices[w])
                     for w in wm.good_worlds]
@@ -158,12 +167,12 @@ def evaluate(config):
 
             wm.filter_per_step(states, step)
 
-            for w in range(config.num_worlds):
+            for w in wm.good_worlds:
                 builder.increment_step(w)
 
             positions = builder.get_ego_positions_batch(ego_indices)
             for i, w in enumerate(VIZ_WORLDS):
-                if w in wm.bad_worlds:
+                if w in wm.bad_worlds or w in wm.reached_worlds:
                     continue
                 if i < len(viz_list):
                     viz_list[i].record_step(positions[w, 0], positions[w, 1])
@@ -178,9 +187,7 @@ def evaluate(config):
             abs_for_pdms = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
             partner_for_pdms = env.sim.partner_observations_tensor().to_torch().cpu().numpy()
             rel_np = env.sim.self_observation_tensor().to_torch().cpu().numpy()
-            for w in range(config.num_worlds):
-                if w in wm.bad_worlds:
-                    continue
+            for w in wm.good_worlds:
                 a = ego_indices[w]
                 ego_x, ego_y = float(abs_for_pdms[w, a, 0]), float(abs_for_pdms[w, a, 1])
                 ego_heading = float(abs_for_pdms[w, a, 7])
@@ -215,10 +222,13 @@ def evaluate(config):
             if len(viz.actual_x) > 0:
                 viz.save_plot(viz_dir, epoch + 1)
 
-        # PDMS epoch 报告
-        pdms_scores = [s.compute() for s in scorers if s.steps > 0]
+        # PDMS epoch 报告（仅 surviving worlds）
+        pdms_scores = [scorers[w].compute()
+                       for w in range(config.num_worlds)
+                       if w not in wm.bad_worlds and scorers[w].steps > 0]
         if pdms_scores:
-            print_pdms_table(pdms_scores, logger)
+            print_pdms_table(pdms_scores, logger,
+                             total_worlds=config.num_worlds)
 
             pdms_plot_dir = os.path.join(config.file_dir, 'pdms_plots')
             os.makedirs(pdms_plot_dir, exist_ok=True)
@@ -227,12 +237,9 @@ def evaluate(config):
                             os.path.join(pdms_plot_dir, f'pdms_radar_epoch{epoch+1}.png'),
                             title=f'PDMS Epoch {epoch+1}')
 
-            bar_data = []
-            for i, s in enumerate(pdms_scores):
-                # find the world index
-                for w in range(config.num_worlds):
-                    if scorers[w].steps > 0:
-                        bar_data.append({'world_idx': w, **s})
+            bar_data = [{'world_idx': w, **scorers[w].compute()}
+                        for w in range(config.num_worlds)
+                        if w not in wm.bad_worlds and scorers[w].steps > 0]
             plot_pdms_bar(bar_data[:20],
                          os.path.join(pdms_plot_dir, f'pdms_bar_epoch{epoch+1}.png'),
                          title=f'Per-World Driving Score Epoch {epoch+1}')

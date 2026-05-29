@@ -33,7 +33,7 @@ class DiscreteIDCAgent:
         self.DIM_EGO = 6
         self.DIM_OTHERS = 32
         self.DIM_VALIDITY = 8
-        self.DIM_REF_ERROR = 12
+        self.DIM_REF_ERROR = 15           # [dp, dphi, dv, lat+lphi+lroad+lspd ×3 for t+3, t+6, t+9]
         self.DIM_TEMPORAL = 1
         self.TOTAL_STATE_DIM = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR + self.DIM_TEMPORAL
         self.DIM_ROAD = 80
@@ -289,21 +289,24 @@ class DiscreteIDCAgent:
         dphi_l1 = refs_l1[:, 4] - theta_next
         dphi_l1 = torch.atan2(torch.sin(dphi_l1), torch.cos(dphi_l1))
         road_l1 = self.state_builder.get_road_dist_batch(w_i, tl1, self.ego_indices, p_i, x_next.device)
+        spd_l1 = refs_l1[:, 2]
 
         lat_l2 = (refs_l2[:, 1] - y_next) * torch.cos(refs_l2[:, 4]) - (refs_l2[:, 0] - x_next) * torch.sin(refs_l2[:, 4])
         dphi_l2 = refs_l2[:, 4] - theta_next
         dphi_l2 = torch.atan2(torch.sin(dphi_l2), torch.cos(dphi_l2))
         road_l2 = self.state_builder.get_road_dist_batch(w_i, tl2, self.ego_indices, p_i, x_next.device)
+        spd_l2 = refs_l2[:, 2]
 
         lat_l3 = (refs_l3[:, 1] - y_next) * torch.cos(refs_l3[:, 4]) - (refs_l3[:, 0] - x_next) * torch.sin(refs_l3[:, 4])
         dphi_l3 = refs_l3[:, 4] - theta_next
         dphi_l3 = torch.atan2(torch.sin(dphi_l3), torch.cos(dphi_l3))
         road_l3 = self.state_builder.get_road_dist_batch(w_i, tl3, self.ego_indices, p_i, x_next.device)
+        spd_l3 = refs_l3[:, 2]
 
         ref_error_tensors = torch.stack([delta_p, delta_phi, delta_v,
-                                          lat_l1, dphi_l1, road_l1,
-                                          lat_l2, dphi_l2, road_l2,
-                                          lat_l3, dphi_l3, road_l3], dim=-1)
+                                          lat_l1, dphi_l1, road_l1, spd_l1,
+                                          lat_l2, dphi_l2, road_l2, spd_l2,
+                                          lat_l3, dphi_l3, road_l3, spd_l3], dim=-1)
         
         # 组合并返回最终状态
         next_states = []
@@ -358,10 +361,10 @@ class DiscreteIDCAgent:
             s = self.f_pred_batch(s, u, w_i, p_i)
             l = self.utility_batch(s, u, w_i, p_i)
             if t == 0:
-                logger.info(f'[LA-DIAG] l1(lat={s[0, ref_start+3]:.2f} dphi={s[0, ref_start+4]:.3f} road={s[0, ref_start+5]:.1f}) '
-                            f'l2(lat={s[0, ref_start+6]:.2f} dphi={s[0, ref_start+7]:.3f} road={s[0, ref_start+8]:.1f}) '
-                            f'l3(lat={s[0, ref_start+9]:.2f} dphi={s[0, ref_start+10]:.3f} road={s[0, ref_start+11]:.1f}) '
-                            f'delta_p={s[0, ref_start]:.2f} delta_phi={s[0, ref_start+1]:.3f}')
+                logger.info(f'[LA-DIAG] l1(lat={s[0, ref_start+3]:.2f} dphi={s[0, ref_start+4]:.3f} road={s[0, ref_start+5]:.1f} spd={s[0, ref_start+6]:.1f}) '
+                            f'l2(lat={s[0, ref_start+7]:.2f} dphi={s[0, ref_start+8]:.3f} road={s[0, ref_start+9]:.1f} spd={s[0, ref_start+10]:.1f}) '
+                            f'l3(lat={s[0, ref_start+11]:.2f} dphi={s[0, ref_start+12]:.3f} road={s[0, ref_start+13]:.1f} spd={s[0, ref_start+14]:.1f}) '
+                            f'delta_p={s[0, ref_start]:.2f} delta_phi={s[0, ref_start+1]:.3f} spd={s[0, ref_start+2]:.1f}')
             l = torch.clamp(l, -5000.0, 5000.0)
             p = self.penalty_batch(s, w_i, p_i)
             p = torch.clamp(p, max=100.0)
@@ -372,7 +375,7 @@ class DiscreteIDCAgent:
             total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
 
         actor_loss = total_cost.mean()
-        has_violation = max_penalty > 0.01
+        has_violation = max_penalty > 0.5
 
         # 衰减探索噪声（所有模式统一衰减）
         old_std = self.noise_std
@@ -435,8 +438,8 @@ class DiscreteIDCAgent:
              + (0.0 if self.fix_heading else self.heading_err_weight) * heading_err ** 2
              + self.steer_cost_weight * steer_cost
              + self.acc_cost_weight * acc_cost
-             + self.lookahead_pos_weight * (s[:, ref_start + 3] ** 2 + s[:, ref_start + 6] ** 2 + s[:, ref_start + 9] ** 2)
-             + self.lookahead_heading_weight * (s[:, ref_start + 4] ** 2 + s[:, ref_start + 7] ** 2 + s[:, ref_start + 10] ** 2))
+             + self.lookahead_pos_weight * (s[:, ref_start + 3] ** 2 + s[:, ref_start + 7] ** 2 + s[:, ref_start + 11] ** 2)
+             + self.lookahead_heading_weight * (s[:, ref_start + 4] ** 2 + s[:, ref_start + 8] ** 2 + s[:, ref_start + 12] ** 2))
 
         # 诊断：每次调用自动抓 pos_err 最大的样本
         max_idx = pos_err.argmax().item()
