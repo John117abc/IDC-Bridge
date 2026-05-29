@@ -167,8 +167,6 @@ class WorldManager:
     def should_resample(self):
         if len(self.bad_worlds) > self.args.max_bad_worlds:
             return True
-        if self.good_count < self.num_worlds * 0.3:
-            return True
         interval = getattr(self.args, 'resample_interval', 0)
         if interval > 0 and self.agent.globe_eps > 0 and self.agent.globe_eps % interval == 0:
             return True

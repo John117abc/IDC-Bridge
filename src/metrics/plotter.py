@@ -54,6 +54,13 @@ def print_pdms_table(scores_list, logger, total_worlds=None):
     lines.append(f"    TTC (time-to-collision) : {w_avg['ttc']:.3f}")
     lines.append(f"    C   (comfort)          : {w_avg['comfort']:.3f}")
     lines.append(f"    LK  (lane keeping)     : {w_avg['lk']:.3f}")
+    lines.append("-" * 58)
+    s80 = sum(1 for s in scores_list if s['driving_score'] >= 80)
+    s60 = sum(1 for s in scores_list if 60 <= s['driving_score'] < 80)
+    s30 = sum(1 for s in scores_list if 30 <= s['driving_score'] < 60)
+    s0 = sum(1 for s in scores_list if s['driving_score'] < 30)
+    lines.append(f"  Score distribution:")
+    lines.append(f"    ≥80: {s80}  |  60-79: {s60}  |  30-59: {s30}  |  <30: {s0}")
     lines.append("=" * 58)
 
     for line in lines:

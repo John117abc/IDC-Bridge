@@ -47,7 +47,7 @@ world:
   max_partner_density: 99
   dense_sample_size: 500
   max_bad_worlds: 120
-  resample_interval: 50
+  resample_interval: 3
   filter_threshold: 200
   dataset_size: 0
   density_cache_file: "/workspace/data/world_density.json"

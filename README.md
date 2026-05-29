@@ -294,6 +294,8 @@ LK:  车道保持（|lat| / road_width）
 13. **Rho 乘性膨胀**：`rho *= 1.005` 每 30 步无条件膨胀 → 必然到 cap → penalty 压倒 tracking → 改为线性 `rho += 0.01`，仅违规时增
 14. **Expert 轨迹含 sentinel 坐标**：短轨迹世界 step 58-90 为 `(-11000,-11000)` → 参考点 sentinel 拉偏自车 → `generate_candidate_paths` 自动检测并裁剪填充
 15. **到达终点的世界误标 bad**：`reachedGoal/done` 后 GPUDrive 重置 ego 为 sentinel → filter 误杀 → 引入 `reached_worlds` 集合，用 `done_tensor` 区分正常终点 vs 真实崩溃
+16. **PDMS route completion 低估**：分母用固定 91 步 → 35 步短轨迹完美完成只得 38% → 改为按各世界实际路径长度计算
+17. **Resample 间隔过宽**：50 epoch 才换世界 → 400 epoch 仅见 1500 场景 → 改为 3 epoch 覆盖 20,000+ 场景
 
 ## 引用
 

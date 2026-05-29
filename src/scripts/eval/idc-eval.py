@@ -208,7 +208,7 @@ def evaluate(config):
                     collision=collision,
                     delta_phi=float(states[w][ref_start_agent + 1]),
                     temporal_idx=t,
-                    max_step=max_step,
+                    max_step=len(path['pos']),
                     road_dist_ref=road_dist_ref,
                     lat=float(states[w][ref_start_agent + 3]),
                     dt=config.dt,

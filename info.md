@@ -1469,3 +1469,46 @@ python idc-train.py --no-road-penalty
 行人一眼能看到 150 个世界中：135 个正常训练、7 个到达终点、8 个真实崩溃。
 
 **涉及文件**：`world_manager.py`
+
+---
+
+## 60. Route Completion 用固定 91 作分母 → PDMS 分数虚低
+
+**日期**：2026-05-29
+
+**症状**：模型完美追踪到终点，但 PDMS 显示 `completion=56.3%`。短轨迹世界（35 步）到达终点后 completion = 35/91 = 38%。
+
+**根因**：`PDMSScorer.update_step` 的 `max_step` 参数传入固定 `config.max_step=91`，而非该世界的实际候选路径长度。
+
+**修复**：train/eval PDMS 采集处改为 `max_step=len(path['pos'])`，使用各世界 sentinel 裁剪后的实际路径长度。
+
+**涉及文件**：`idc-train.py`、`idc-eval.py`
+
+---
+
+## 61. PDMS 表格缺分数分布 → 看不出是少数世界拖垮还是普遍问题
+
+**日期**：2026-05-29
+
+**问题**：PDMS 终端表格只显示均值和违规数，无法一眼判断 150 个世界中多少世界得分 >80、多少挂掉。
+
+**修复**：`print_pdms_table` 新增一行分数分布：
+
+```
+Score distribution:
+  ≥80: 92  |  60-79: 35  |  30-59: 18  |  <30: 5
+```
+
+**涉及文件**：`metrics/plotter.py`
+
+---
+
+## 62. Resample Interval 优化 → 提升数据多样性
+
+**日期**：2026-05-29
+
+**问题**：`resample_interval=50` → 400 epoch 仅见过 ~1500 个世界 → 70k Waymo 数据几乎未用。
+
+**修复**：`resample_interval: 50 → 3`。每 3 epoch 换 150 个新世界，400 epoch 覆盖 ~20,000 个场景。buffer 清空成本 < 1.5%（填充仅需 4 步）。
+
+**涉及文件**：`base.yaml`
