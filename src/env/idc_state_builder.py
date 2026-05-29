@@ -221,15 +221,26 @@ class GPUDriveObservationBuilder:
 
     def get_idc_observations_batch(self, ego_indices: list,
                                     num_other_vehicles: int = 8,
-                                    path_indices: list = None) -> list:
+                                    path_indices: list = None,
+                                    _abs_np=None, _rel_np=None,
+                                    _partner_np=None) -> list:
         """
         批量构建所有 world 的网络状态。
-        每步只拉一次 GPUDrive tensor，减少 GPU→CPU 传输次数。
         path_indices: 可选，list of int，每个 world 使用的候选路径索引。
+        _abs_np/_rel_np/_partner_np: 可选，预拉取的 tensor（避免重复 GPU→CPU 传输）
         """
-        abs_np = self.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
-        rel_np = self.sim.self_observation_tensor().to_torch().cpu().numpy()
-        partner_np = self.sim.partner_observations_tensor().to_torch().cpu().numpy()
+        if _abs_np is None:
+            abs_np = self.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+        else:
+            abs_np = _abs_np
+        if _rel_np is None:
+            rel_np = self.sim.self_observation_tensor().to_torch().cpu().numpy()
+        else:
+            rel_np = _rel_np
+        if _partner_np is None:
+            partner_np = self.sim.partner_observations_tensor().to_torch().cpu().numpy()
+        else:
+            partner_np = _partner_np
 
         states = []
         for w in range(self.num_worlds):
@@ -278,11 +289,11 @@ class GPUDriveObservationBuilder:
             ref = np.array([rx, ry, rs, 0.0, rh, 0.0], dtype=np.float32)
             ref_err = self._calc_ref_error(ego, ref)
 
-            # 前瞻参考点（t+3, t+6, t+9），给 Actor 前方弯道/道路信息
+            # 前瞻参考点（t+5, t+10, t+15），给 Actor 前方弯道/道路信息
             num_pts = len(path['pos'])
-            t_l1 = min(t + 3, num_pts - 1)
-            t_l2 = min(t + 6, num_pts - 1)
-            t_l3 = min(t + 9, num_pts - 1)
+            t_l1 = min(t + 5, num_pts - 1)
+            t_l2 = min(t + 10, num_pts - 1)
+            t_l3 = min(t + 15, num_pts - 1)
 
             lx1, ly1 = float(path['pos'][t_l1, 0]), float(path['pos'][t_l1, 1])
             lh1 = float(path['heading'][t_l1])
@@ -328,9 +339,13 @@ class GPUDriveObservationBuilder:
             states.append(state)
         return states
 
-    def get_ego_positions_batch(self, ego_indices: list) -> np.ndarray:
+    def get_ego_positions_batch(self, ego_indices: list,
+                                 _abs_np=None) -> np.ndarray:
         """仅拉取 self 绝对观测，返回 [num_worlds, 2] 的 (x, y) 坐标。"""
-        abs_np = self.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+        if _abs_np is None:
+            abs_np = self.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+        else:
+            abs_np = _abs_np
         pos = np.zeros((self.num_worlds, 2), dtype=np.float32)
         for w in range(self.num_worlds):
             a = ego_indices[w]

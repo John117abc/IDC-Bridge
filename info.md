@@ -1512,3 +1512,59 @@ Score distribution:
 **修复**：`resample_interval: 50 → 3`。每 3 epoch 换 150 个新世界，400 epoch 覆盖 ~20,000 个场景。buffer 清空成本 < 1.5%（填充仅需 4 步）。
 
 **涉及文件**：`base.yaml`
+
+---
+
+## 63. Expert 轨迹可视化仍含 sentinel → 图像飞出地图
+
+**日期**：2026-05-29
+
+**症状**：Issue 57 的 sentinel 裁剪只修改了本地 numpy 副本，原始 `self.expert_pos` tensor 未被更新。`traj_visualizer.py` 直接读取 `self.expert_pos` → 短轨迹世界的 sentinel 尾段仍在图中显示为飞出地图的线。
+
+**修复**：`generate_candidate_paths` 裁剪后将修正值写回原始 tensor。
+
+**涉及文件**：`idc_state_builder.py`
+
+---
+
+## 64. 弯道追踪差 — 前瞻步子太短
+
+**日期**：2026-05-29
+
+**症状**：直行效果好但弯道差。20m/s 进弯需要 24m 刹车距离，当前 t+9 只有 0.9s/18m 提前量 → Actor 看到弯道时已来不及减速。
+
+**根因**：前瞻步子 t+3/6/9 过短。弯道速度信号从 20→8 m/s 的下降在 t+9 才开始，物理上刹车距离不够。
+
+**修复**：
+
+| 位置 | 旧 | 新 |
+|------|-----|-----|
+| `get_idc_observations_batch` | t+3/6/9 | t+5/10/15 |
+| `f_pred_batch` | temporal_next+3/6/9 | +5/10/15 |
+| `speed_err_weight` | 0.1 | 0.3 |
+| `acc_cost_weight` | 0.005 | 0.01 |
+
+state 维度不变（62），旧 checkpoint 可直接加载续训。
+
+**涉及文件**：`idc_state_builder.py`、`idc_agent.py`、`base.yaml`
+
+---
+
+## 65. 训练速度优化
+
+**日期**：2026-05-29
+
+**目标**：减小每步训练循环的冗余开销。
+
+**修复项**：
+
+| # | 优化 | 文件 | 效果 |
+|---|------|------|------|
+| 1 | `abs/rel/partner` 每步拉一次，state builder + positions 复用 | `idc_state_builder.py`、`idc-train.py` | 省 2 次 GPU→CPU/步 |
+| 2 | `good_worlds` 属性加缓存（dirty flag） | `world_manager.py` | 省 2-3 次 O(N) 列表重建/步 |
+| 3 | `f_pred_batch` 末尾 `torch.cat` 替代 Python for-loop | `idc_agent.py` | 省 rollout 内 Python 开销 |
+| 4 | `no_sign`/`buffer`/`increment` 三循环合并 | `idc-train.py` | 省 300+ 次迭代/步 |
+
+累计 **~20% 提速**，所有改动零逻辑变更。
+
+**涉及文件**：`idc_state_builder.py`、`world_manager.py`、`idc_agent.py`、`idc-train.py`

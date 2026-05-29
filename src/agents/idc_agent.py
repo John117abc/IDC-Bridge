@@ -271,10 +271,10 @@ class DiscreteIDCAgent:
         ego_speed = torch.hypot(ego_next_formatted[:, 2], ego_next_formatted[:, 3])
         delta_v = ego_speed - refs[:, 2]
 
-        # 6. 前瞻参考点：给 Actor 前方弯道/道路信息（t+3, t+6, t+9）
-        tl1 = torch.clamp(temporal_next + 3, max=89)
-        tl2 = torch.clamp(temporal_next + 6, max=89)
-        tl3 = torch.clamp(temporal_next + 9, max=89)
+        # 6. 前瞻参考点：给 Actor 前方弯道/道路信息（t+5, t+10, t+15）
+        tl1 = torch.clamp(temporal_next + 5, max=91)
+        tl2 = torch.clamp(temporal_next + 10, max=91)
+        tl3 = torch.clamp(temporal_next + 15, max=91)
         refs_l1 = self.state_builder.get_ref_states_batch(
             w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
             temporal_indices=tl1)
@@ -309,17 +309,10 @@ class DiscreteIDCAgent:
                                           lat_l3, dphi_l3, road_l3, spd_l3], dim=-1)
         
         # 组合并返回最终状态
-        next_states = []
-        for i in range(len(states)):
-            next_s = self.tensor_to_state_tensor(ego_next_formatted[i], others_next[i], validity_tensors[i], ref_error_tensors[i], temporal_next[i])
-            next_states.append(next_s)
-            
-        return torch.stack(next_states)
+        return torch.cat([ego_next_formatted, others_next.view(len(states), -1),
+                          validity_tensors, ref_error_tensors,
+                          temporal_next.unsqueeze(-1).float()], dim=-1)
     
-    def tensor_to_state_tensor(self, ego_tensor, others_tensor, validity_tensor, ref_error_tensor, temporal_idx):
-        """组合状态张量"""
-        return torch.cat([ego_tensor, others_tensor.view(-1), validity_tensor, ref_error_tensor, temporal_idx.view(-1)], dim=-1)
-
     def update_critic(self, states, world_indices, path_indices=None):
         logger.debug(f'更新 Critic: states batch size={states.shape[0]}')
         with torch.no_grad():

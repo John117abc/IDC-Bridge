@@ -296,6 +296,8 @@ LK:  车道保持（|lat| / road_width）
 15. **到达终点的世界误标 bad**：`reachedGoal/done` 后 GPUDrive 重置 ego 为 sentinel → filter 误杀 → 引入 `reached_worlds` 集合，用 `done_tensor` 区分正常终点 vs 真实崩溃
 16. **PDMS route completion 低估**：分母用固定 91 步 → 35 步短轨迹完美完成只得 38% → 改为按各世界实际路径长度计算
 17. **Resample 间隔过宽**：50 epoch 才换世界 → 400 epoch 仅见 1500 场景 → 改为 3 epoch 覆盖 20,000+ 场景
+18. **弯道追踪差 — 前瞻步子太短**：t+9=0.9s 不够 20m/s 刹车 → 改为 t+5/10/15、speed_err_weight 0.3、acc_cost 0.01
+19. **训练速度优化**：tensor 复用 + good_worlds 缓存 + f_pred_batch cat + 循环合并 → ~20% 提速
 
 ## 引用
 

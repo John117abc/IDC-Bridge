@@ -18,10 +18,10 @@ training:
 # ---- Agent 参数 ----
 agent:
   pos_err_weight: 0.03
-  speed_err_weight: 0.1
+  speed_err_weight: 0.3
   heading_err_weight: 0.3
   steer_cost_weight: 0.3
-  acc_cost_weight: 0.005
+  acc_cost_weight: 0.01
   lookahead_pos_weight: 0.05
   lookahead_heading_weight: 0.05
   noise_std: 0.1
@@ -45,12 +45,12 @@ dynamics:
 world:
   min_partner_density: 30
   max_partner_density: 99
-  dense_sample_size: 500
+  dense_sample_size: 10000
   max_bad_worlds: 120
   resample_interval: 3
   filter_threshold: 200
   dataset_size: 0
-  density_cache_file: "/workspace/data/world_density.json"
+  density_cache_file: "/workspace/data/density_full.json"
 
 # ---- 诊断开关 ----
 diag:

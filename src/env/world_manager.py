@@ -18,6 +18,7 @@ class WorldManager:
         self.num_worlds = args.num_worlds
         self.bad_worlds = set()
         self.reached_worlds = set()
+        self._good_cache = None
         self.ego_indices = None
 
         self.filter_threshold = getattr(args, 'filter_threshold', 200)
@@ -46,7 +47,7 @@ class WorldManager:
             self.logger.info(f'密度缓存已加载: {len(cache)} 个世界')
             return cache
 
-        probe_size = min(2000, len(self.all_files))
+        probe_size = min(70000, len(self.all_files))
         probe_files = random.sample(self.all_files, probe_size)
         self.logger.info(
             f'正在计算世界密度缓存（随机抽样 {probe_size}/{len(self.all_files)} 个文件，约 30 秒）...'
@@ -106,6 +107,7 @@ class WorldManager:
         self.ego_indices = ego_indices
         self.bad_worlds.clear()
         self.reached_worlds.clear()
+        self._good_cache = None
         self.logger.info('Pre-training world filter: checking path coordinates...')
 
         for w in range(self.num_worlds):
@@ -126,6 +128,7 @@ class WorldManager:
         ref_start = self.agent.DIM_EGO + self.agent.DIM_OTHERS + self.agent.DIM_VALIDITY
         done_pulled = False
         done_np = None
+        modified = False
 
         for w in range(self.num_worlds):
             if w in self.bad_worlds or w in self.reached_worlds:
@@ -140,9 +143,11 @@ class WorldManager:
                     done_pulled = True
                 if done_np is not None and done_np[w, a] > 0.5:
                     self.reached_worlds.add(w)
-                    self.logger.debug(f'[REACHED-GOAL] world_{w} step={step}/{path_len} — done, excluding')
+                    modified = True
+                    self.logger.info(f'[REACHED-GOAL] world_{w} step={step}/{path_len} — done, excluding')
                     continue
                 self.bad_worlds.add(w)
+                modified = True
                 dp = abs(states[w][ref_start])
                 self.logger.warning(
                     f'[FILTER-ego] world_{w} step={step}/{path_len} '
@@ -163,6 +168,9 @@ class WorldManager:
                 f'good={self.good_count} reached={len(self.reached_worlds)} '
                 f'bad={len(self.bad_worlds)}/{self.num_worlds}'
             )
+
+        if modified:
+            self._good_cache = None
 
     def should_resample(self):
         if len(self.bad_worlds) > self.args.max_bad_worlds:
@@ -202,6 +210,7 @@ class WorldManager:
 
         self.bad_worlds.clear()
         self.reached_worlds.clear()
+        self._good_cache = None
         for w in range(self.num_worlds):
             a = new_ego[w]
             for pid in range(self.builder.num_candidate_paths):
@@ -227,8 +236,10 @@ class WorldManager:
 
     @property
     def good_worlds(self):
-        return [w for w in range(self.num_worlds)
-                if w not in self.bad_worlds and w not in self.reached_worlds]
+        if self._good_cache is None:
+            self._good_cache = [w for w in range(self.num_worlds)
+                                if w not in self.bad_worlds and w not in self.reached_worlds]
+        return self._good_cache
 
     @property
     def good_count(self):

@@ -155,21 +155,24 @@ def train(config):
             else:
                 logger.debug(f'回合 {epoch+1}/{config.epochs}, 步数 {step+1}/{max_step}')
 
-            states = builder.get_idc_observations_batch(ego_indices,
-                                                        path_indices=episode_path_indices)
+            # 批量拉取 tensor（一次 GPU→CPU），后续 state building + positions 复用
+            abs_np_step = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+            rel_np_step = env.sim.self_observation_tensor().to_torch().cpu().numpy()
+            partner_np_step = env.sim.partner_observations_tensor().to_torch().cpu().numpy()
+            states = builder.get_idc_observations_batch(
+                ego_indices, path_indices=episode_path_indices,
+                _abs_np=abs_np_step, _rel_np=rel_np_step, _partner_np=partner_np_step)
 
             wm.filter_per_step(states, step)
 
-            if config.no_sign:
-                ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
-                for w in wm.good_worlds:
-                    states[w][ref_start] = abs(states[w][ref_start])
-
+            ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
             for w in wm.good_worlds:
+                if config.no_sign:
+                    states[w][ref_start] = abs(states[w][ref_start])
                 agent.buffer.handle_new_experience((states[w], w, episode_path_indices[w]))
                 builder.increment_step(w)
 
-            positions = builder.get_ego_positions_batch(ego_indices)
+            positions = builder.get_ego_positions_batch(ego_indices, _abs_np=abs_np_step)
             for i, w in enumerate(VIZ_WORLDS):
                 if w in wm.bad_worlds or w in wm.reached_worlds:
                     continue
