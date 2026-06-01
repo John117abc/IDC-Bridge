@@ -54,8 +54,18 @@ class DiscreteIDCAgent:
         )
 
         # 优化器
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config.lr_actor)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.lr_critic)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config.lr_actor_max)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.lr_critic_max)
+
+        # 余弦退火调度器
+        steps_per_epoch = 91
+        buffer_fill = max(1, self.batch_size // self.num_worlds)
+        pev_per_epoch = max(1, steps_per_epoch - buffer_fill)
+        total_u_steps = pev_per_epoch * config.epochs
+        self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.actor_optimizer, T_max=total_u_steps, eta_min=config.lr_actor_min)
+        self.critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.critic_optimizer, T_max=total_u_steps, eta_min=config.lr_critic_min)
 
         # IDC 成本权重
         self.pos_err_weight = config.pos_err_weight
@@ -109,44 +119,39 @@ class DiscreteIDCAgent:
     def select_action(self, state, deterministic=False):
         """
         state: list of state objects (batch)
-        返回 tensor [batch, max_agents, 2]，每个动作为 [delta, a]
+        返回 tensor [batch, max_agents, 2]，每个动作为 [acc, steer] (物理值)
         """
         with torch.no_grad():
-            state_tensor = self.batch_state_to_tensor(state)        # [batch, TOTAL_STATE_DIM]
+            state_tensor = self.batch_state_to_tensor(state)
             logger.debug(f'选择动作: state_tensor shape={state_tensor.shape}')
-            
-            norm_action = self.actor(state_tensor)                  # [batch, max_agents * 2]
+
+            raw_output = self.actor(state_tensor)
             batch_size = state_tensor.shape[0]
-            # 假设 self.max_agents 已定义
-            norm_action = norm_action.view(batch_size, self.max_agents, 2)   # [batch, max_agents, 2]
+            raw_output = raw_output.view(batch_size, self.max_agents, 2)
 
             if not deterministic:
-                # 生成与 norm_action 相同形状的高斯噪声，标准差可设为 0.1（也可按维度分别设置）
-                noise = torch.normal(0, self.noise_std, size=norm_action.shape, device=norm_action.device)
-                norm_action = norm_action + noise
-                norm_action = torch.clamp(norm_action, -1.0, 1.0)
+                noise = torch.normal(0, self.noise_std * 0.3, size=raw_output.shape,
+                                     device=raw_output.device)
+                raw_output = raw_output + noise
 
-            # 转向映射：[-1,1] → [-0.6,0.6] rad
-            delta_phy = norm_action[..., 0] * 0.6
+            # 转向：线性映射 + clamp → [-0.6, 0.6] rad
+            delta_phy = torch.clamp(raw_output[..., 0] * 0.3, -0.6, 0.6)
 
-            # 加速度映射：分段线性，norm=0 时输出 0（默认滑行），范围保持 [-3.0, 1.5]
+            # 加速度：tanh → 非对称映射 → [-3.0, 1.5] m/s²
+            acc_norm = torch.tanh(raw_output[..., 1])
             a_phy = torch.where(
-                norm_action[..., 1] >= 0,
-                norm_action[..., 1] * 1.5,
-                norm_action[..., 1] * 3.0
+                acc_norm >= 0,
+                acc_norm * 1.5,
+                acc_norm * 3.0
             )
 
-            # 组合最终动作 [batch, max_agents, 2]
             action = torch.stack([a_phy, delta_phy], dim=-1)
 
-            # [DIAG] 前几个 world 的实际动作值和 norm_action 原始输出
             if self.global_step % 10 == 0:
                 n_show = min(20, batch_size)
                 for i in range(n_show):
-                    raw_steer = norm_action[i, 0, 0].item()  # tanh 前 [-1,1]
-                    raw_acc = norm_action[i, 0, 1].item()
-                    logger.debug(f'[DIAG-act] world_{i} acc={action[i,0,0].item():.3f} steer={action[i,0,1].item():.3f} '
-                                f'| norm_steer={raw_steer:.4f} norm_acc={raw_acc:.4f}')
+                    logger.info(f'[DIAG-act] world_{i} acc={action[i,0,0].item():.3f} '
+                                f'steer={action[i,0,1].item():.3f}')
             return action
 
 
@@ -220,10 +225,11 @@ class DiscreteIDCAgent:
         temporal_next = (temporal_idx + 1).long()
         
         # 1. 动力学推演（将Actor原始输出映射为物理量，与select_action保持一致）
-        delta_phy = actions[..., 0] * 0.6  # 转向：[-1,1] → [-0.6, 0.6] rad
-        a_phy = torch.where(actions[..., 1] >= 0,
-                            actions[..., 1] * 1.5,
-                            actions[..., 1] * 3.0)  # 加速度：[-1,1] → [-3.0, 1.5] m/s²
+        delta_phy = torch.clamp(actions[..., 0] * 0.3, -0.6, 0.6)
+        acc_norm = torch.tanh(actions[..., 1])
+        a_phy = torch.where(acc_norm >= 0,
+                            acc_norm * 1.5,
+                            acc_norm * 3.0)
         actions_phy = torch.stack([a_phy, delta_phy], dim=-1)  # [acc, steer]
         ego_next = self.dynamics(ego_tensors[...,:6], actions_phy)
         x_raw, y_raw, theta_next, v_next = ego_next[:, 0], ego_next[:, 1], ego_next[:, 2], ego_next[:, 3]
@@ -342,6 +348,7 @@ class DiscreteIDCAgent:
         logger.debug(f"[DEBUG] grad norm = {total_norm:.4f}")
 
         self.critic_optimizer.step()
+        self.critic_scheduler.step()
         return loss.detach().item()
 
     def update_actor(self, states, w_i, p_i=None):
@@ -383,6 +390,7 @@ class DiscreteIDCAgent:
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.actor_optimizer.step()
+        self.actor_scheduler.step()
 
         # 检测 NaN 权重并回滚
         has_nan = False
@@ -540,6 +548,8 @@ class DiscreteIDCAgent:
                 'state_dim': self.TOTAL_STATE_DIM,
                 'rho': self.rho,
                 'gep_iteration': self.gep_iteration,
+                'actor_scheduler_last_epoch': self.actor_scheduler.last_epoch,
+                'critic_scheduler_last_epoch': self.critic_scheduler.last_epoch,
             }
             metrics = {'episode': extra_info['globe_eps']}
             save_checkpoint(model=model,
@@ -565,14 +575,23 @@ class DiscreteIDCAgent:
         self.history_loss = checkpoint['history']
         self.epoch_history_pdms = checkpoint.get('history_pdms', [])
         self.global_step = checkpoint['global_step']
-        self.global_step = checkpoint['global_step']
         self.rho = checkpoint['rho'] == 0.0 and self.config.init_penalty or checkpoint['rho']
         self.gep_iteration = checkpoint['gep_iteration']
 
         for pg in self.actor_optimizer.param_groups:
-            pg['lr'] = self.config.lr_actor
+            pg['lr'] = self.config.lr_actor_max
         for pg in self.critic_optimizer.param_groups:
-            pg['lr'] = self.config.lr_critic
+            pg['lr'] = self.config.lr_critic_max
+
+        # 重新初始化 scheduler，从 checkpoint 的 last_epoch 继续
+        last_ep_a = checkpoint.get('actor_scheduler_last_epoch', 0)
+        last_ep_c = checkpoint.get('critic_scheduler_last_epoch', 0)
+        self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.actor_optimizer, T_max=self.actor_scheduler.T_max,
+            eta_min=self.actor_scheduler.eta_min, last_epoch=last_ep_a)
+        self.critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.critic_optimizer, T_max=self.critic_scheduler.T_max,
+            eta_min=self.critic_scheduler.eta_min, last_epoch=last_ep_c)
 
         return checkpoint
         

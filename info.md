@@ -1568,3 +1568,81 @@ state 维度不变（62），旧 checkpoint 可直接加载续训。
 累计 **~20% 提速**，所有改动零逻辑变更。
 
 **涉及文件**：`idc_state_builder.py`、`world_manager.py`、`idc_agent.py`、`idc-train.py`
+
+---
+
+## 66. 余弦退火 LR 调度器
+
+**日期**：2026-06-01
+
+**目标**：固定 LR（8e-5）初期收敛慢、末期震荡大 → 引入 CosineAnnealingLR。
+
+**修复**：用 PyTorch 内置 `CosineAnnealingLR`，T_max 根据 epochs/batch_size 自动估算。
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `lr_actor_max` | 1e-4 | cosine 起点 |
+| `lr_actor_min` | 1e-6 | cosine 终点 |
+| `lr_critic_max` | 3e-4 | |
+| `lr_critic_min` | 1e-5 | |
+
+checkpoint 保存/加载 `last_epoch`，续训无缝衔接。删除旧的 `lr_actor`/`lr_critic` 参数。
+
+**涉及文件**：`idc_agent.py`、`base.yaml`
+
+---
+
+## 67. Road width 异常 clamp + Actor tanh 移除
+
+**日期**：2026-06-01
+
+**症状**：
+1. 某些世界候选路径飞出道路 → `segment_width` 异常大 (50-100m) → 候选路径 ±50m 偏移
+2. DIAG-act 显示 steer 永久 ±0.6 rad（69% 饱和） → tanh 输出 ±1.0 不变
+
+**根因**：
+1. `dynamic_width` 从 nearest road point 读取，sentinel 世界的 nearest 点可能异常远 → 宽度值异常
+2. tanh 输出饱和后梯度 ≈0 → 网络无法学习中间 steer 值
+
+**修复**：
+1. `dynamic_width` clamp 上限 15m，超过则 fallback 为 lane_width=3.75
+2. Actor 输出移除 tanh，steer 改为 `clamp(raw*0.3, -0.6, 0.6)`（全程有梯度）、acc 保留 tanh
+
+**涉及文件**：`idc_state_builder.py`、`continuous_actor_critic.py`、`idc_agent.py`
+
+---
+
+## 68. Steer bias → 0 + Acc bias → 1.2（低速→高速 regime）
+
+**日期**：2026-06-01
+
+**症状**：tanh 移除后 steer 仍 69% 饱和（DIAG-act 统计 22k 次 0.6）。ego 持续在 5-10 m/s 低速 → max steer 0.6 是低速下过弯的唯一解 → 恶性循环。
+
+**根因**：bias[1]=0（acc 默认 0 m/s²）→ ego 29 步才能到 20 m/s → 80% 时间低速 → Actor 在"低速+max steer=唯一解"regime 学习。
+
+**修复**：
+
+| bias | 旧 | 新 | 效果 |
+|------|-----|-----|------|
+| `bias[0]` (steer) | 0.5 | 0.0 | steer 默认居中 |
+| `bias[1]` (acc) | ~0 | 1.2 | acc=1.26 m/s²，16 步到 20 m/s |
+
+ego 在 20 m/s 下 0.25 rad 转向足以过弯 → 网络自然学会不需要 max steer。
+
+**涉及文件**：`continuous_actor_critic.py`
+
+---
+
+## 69. steer_cost_weight 平衡调整
+
+**日期**：2026-06-01
+
+**背景**：随 steer_cost 从 0.3→0.03→0.06 逐步调优。最终 0.06 搭配线性 steer 和 acc bias=1.2 达到最优平衡。
+
+| 阶段 | steer_cost | 效果 |
+|------|-----------|------|
+| 初始 | 0.3 | 转向被压制，Actor 不转 |
+| 降 | 0.03 | tanh 饱和，0.6 rad 成本极低 → max steer |
+| 最终 | **0.06** | 线性 steer + 0.06 cost → 0.3rad steer 成本 0.005/步 |
+
+**涉及文件**：`base.yaml`

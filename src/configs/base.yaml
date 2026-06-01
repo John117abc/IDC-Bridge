@@ -8,9 +8,11 @@ training:
   dt: 0.1
   horizon: 20
   batch_size: 512
-  hidden_dim: 256
-  lr_actor: 8.0e-5
-  lr_critic: 1.0e-4
+  hidden_dim: 512
+  lr_actor_max: 1.0e-4
+  lr_actor_min: 1.0e-6
+  lr_critic_max: 3.0e-4
+  lr_critic_min: 1.0e-5
   pim_interval: 30
   gamma: 0.99
   buffer_capacity: 100000
@@ -18,9 +20,9 @@ training:
 # ---- Agent 参数 ----
 agent:
   pos_err_weight: 0.03
-  speed_err_weight: 0.3
+  speed_err_weight: 0.05
   heading_err_weight: 0.3
-  steer_cost_weight: 0.3
+  steer_cost_weight: 0.06
   acc_cost_weight: 0.01
   lookahead_pos_weight: 0.05
   lookahead_heading_weight: 0.05

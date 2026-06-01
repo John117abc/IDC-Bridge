@@ -63,7 +63,7 @@ class GPUDriveObservationBuilder:
             dy = world_road[:, 1] - sp[1]
             nearest = int(np.argmin(dx * dx + dy * dy))
             dynamic_width = float(world_road[nearest, WIDTH_IDX])
-            if dynamic_width <= 0.0 or not np.isfinite(dynamic_width):
+            if dynamic_width <= 0.0 or not np.isfinite(dynamic_width) or dynamic_width > 15.0:
                 dynamic_width = lane_width  # fallback
             logger.debug(f'[LANE-WIDTH] world_{w} width={dynamic_width:.2f}m')
 

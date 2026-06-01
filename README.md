@@ -298,6 +298,9 @@ LK:  车道保持（|lat| / road_width）
 17. **Resample 间隔过宽**：50 epoch 才换世界 → 400 epoch 仅见 1500 场景 → 改为 3 epoch 覆盖 20,000+ 场景
 18. **弯道追踪差 — 前瞻步子太短**：t+9=0.9s 不够 20m/s 刹车 → 改为 t+5/10/15、speed_err_weight 0.3、acc_cost 0.01
 19. **训练速度优化**：tensor 复用 + good_worlds 缓存 + f_pred_batch cat + 循环合并 → ~20% 提速
+20. **网络容量 + 余弦退火 LR**：2层→3层 (512→512→256)，CosineAnnealingLR 从 1e-4 衰减到 1e-6
+21. **Road width 异常 clamp**：某些世界 segment_width >15m → 候选路径飞出道路 → clamp 上限 15m
+22. **Actor tanh 饱和 → 线性 + acc bias**：tanh 输出永久±1.0 → 移除 tanh、steer 线性 clamp、acc bias[1]=1.2 解低速恶性循环
 
 ## 引用
 
