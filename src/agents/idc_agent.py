@@ -112,7 +112,6 @@ class DiscreteIDCAgent:
         from collections import deque
         self._deque = deque
         self.gep_iteration = 0
-        self.warmup_pims = int(getattr(config, 'warmup_pims', 150))
 
         # 道路状态缓存
         self.road_states = [None] * self.num_worlds
@@ -568,22 +567,20 @@ class DiscreteIDCAgent:
         critic_loss = self.update_critic(windows_tensor, word_indexs, path_indices)
         self.pev_step += 1
 
-        # PIM: 积累足够 PEV 步后才更新 actor，仅在检测到 violation 时放大 ρ
+        # PIM: 积累足够 PEV 步后才更新 actor
+        # rho 使用 EMA 跟踪近期违规严重度（非累加器，旧违规自动遗忘）
         actor_loss = None
         if self.pev_step >= self.pim_interval:
             self.pev_step = 0
             actor_loss, has_violation, max_p = self.update_actor(windows_tensor, word_indexs, path_indices)
-            if self.gep_iteration < self.warmup_pims:
-                if has_violation:
-                    self.gep_iteration += 1
-                    logger.debug(f'[GEP] warmup violation, gep={self.gep_iteration}/{self.warmup_pims} rho={self.rho:.4f}')
-            elif has_violation:
-                scale = min(max(1.0, max_p), 10.0)
-                self.rho = min(self.rho + self.amplifier_c * scale, self.max_penalty)
-                self.gep_iteration += 1
-                logger.info(f'[GEP] violation, scale={scale:.0f}, rho={self.rho:.4f} gep={self.gep_iteration}')
+            self.gep_iteration += 1
+            if has_violation:
+                target = self.config.init_penalty + min(max_p, 50.0) * 0.02
+                self.rho = min(0.95 * self.rho + 0.05 * target, self.max_penalty)
+                logger.info(f'[GEP] violation, max_p={max_p:.0f} target={target:.3f} rho={self.rho:.4f} gep={self.gep_iteration}')
             else:
-                self.rho = max(self.config.init_penalty, self.rho - self.amplifier_c * 0.1)
+                self.rho = max(0.99 * self.rho + 0.01 * self.config.init_penalty,
+                               self.config.init_penalty)
                 logger.info(f'[GEP] clean PIM, rho={self.rho:.4f} gep={self.gep_iteration}')
 
         return critic_loss, actor_loss

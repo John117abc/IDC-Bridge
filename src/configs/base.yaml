@@ -35,10 +35,9 @@ agent:
   noise_decay_rate: 0.95          # 每次 PIM 后噪声衰减倍率：σ ← max(σ×0.95, noise_std_min)
   noise_std_min: 0.03             # 噪声下限——保证后期仍有少量探索
   bc_weight: 0.1                  # BC loss（行为克隆）在 actor loss 中的权重
-  init_penalty: 0.01              # 初始惩罚系数 ρ，warmup 阶段固定为此值
+  init_penalty: 0.01              # ρ 初始值 + 无违规时的 EMA 锚点
   max_penalty: 3.0                # ρ 上限，防止 penalty 完全淹没 utility
-  amplifier_c: 0.002              # ρ 每次违规 PIM 的基础增量（实际增量 = c × scale）
-  warmup_pims: 300                # 前 N 次 PIM 冻结 ρ（只计数 gep_iteration）≈ 100 epoch
+  amplifier_c: 0.002              # 已弃用（EMA 方案不再依赖此参数），保留兼容
   D_veh_safe: 2.0                 # 车辆碰撞安全距离（m）：自车-周车圆心距 < 此值时产生 penalty
   D_road_safe: 1.5                # 道路安全距离（m）：自车到路边距离 < 此值时产生 penalty
   half_length: 2.25               # 半车长（m），用于双圆模型的圆心偏移

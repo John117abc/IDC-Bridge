@@ -22,7 +22,7 @@ Actor 为 **TransformerEncoder**（16 步滑窗 + 4 头自注意力），Critic 
 5. **碰撞模型**：前后双圆模型替代单圆
 6. **状态空间**：62 维，含当前误差 + 3 个前瞻点（t+5/t+10/t+15）的横向/航向/道路边界/参考速度预览
 7. **性能优化**：批量 tensor 操作 + GPU `ref_tensor` 预索引，消除 rollout 中的 Python 循环瓶颈
-8. **线性 rho 升温**：`rho += amplifier_c` 替代乘性膨胀，tracking → penalty 自然过渡，无需分阶段训练
+8. **EMA rho 调节**：ρ 通过指数移动平均跟踪近期违规严重度（非累加器），违规多→快速响应上升，违规少→缓慢遗忘回落，自然均衡无需分阶段训练
 9. **YAML 层级配置**：`base.yaml`（共享）→ `train.yaml`/`eval.yaml` 继承覆盖，CLI 仅需指定差异项
 10. **条件 penalty 放大**：仅在 rollout 中检测到碰撞/越界违规时才放大 ρ，防止噪声梯度污染
 11. **密度范围筛选**：离线扫描 Waymo 场景周车密度，训练/评估可按密度区间 `[min, max]` 选择世界
@@ -32,6 +32,7 @@ Actor 为 **TransformerEncoder**（16 步滑窗 + 4 头自注意力），Critic 
 15. **PDMS 评估**：CARLA 风格评分（NC×DAC×DDC × weighted avg），训练每 epoch log + 评估雷达图/柱状图/终端表
 16. **Transformer 滑窗 Actor**：16 帧 × 4 头自注意力替代 MLP，训练/推理分布一致，解决 MLP 逐帧盲推的转向平滑问题
 17. **PER Buffer 窗口化**：每个经验存储完整 16 步窗口，SumTree 索引化，~760 MB 额外 CPU 内存
+18. **GEP rho EMA 替代累加器**：rho 通过指数移动平均跟踪违规严重度，早期不爆炸、后期不闷死，自然均衡
 
 ## 快速开始
 
@@ -68,7 +69,7 @@ CLI 参数仅覆盖 YAML 中的值，优先级：CLI > YAML > base。
 ### 训练
 
 ```bash
-# 统一训练（tracking → penalty 自动过渡，rho 从 0.01 线性升至 3.0）
+# 统一训练（rho 使用 EMA 自动均衡，无需分阶段）
 python src/scripts/train/idc-train.py --data-dir /path/to/waymo/data
 
 # 从 checkpoint 继续训练
@@ -80,12 +81,6 @@ python src/scripts/train/idc-train.py \
 python src/scripts/train/idc-train.py \
     --data-dir /path/to/waymo/data \
     --num-worlds 200 --lr-actor 5e-5
-
-# 按密度范围选择场景（需先离线扫描）
-python src/scripts/train/idc-train.py \
-    --data-dir /path/to/waymo/data \
-    --density-cache-file /workspace/data/density_full.json \
-    --min-partner-density 5 --max-partner-density 10
 
 ### 评估
 
@@ -138,13 +133,12 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 | `--config` | YAML 配置文件路径（train 默认 `configs/train.yaml`，eval 默认 `configs/eval.yaml`） |
 | `--data-dir` | Waymo tfrecord 数据目录（**必填**） |
 | `--model-path` | 模型 checkpoint 路径（评估必填） |
-| `--init-penalty` | 初始 ρ（0.01 = tracking 为主，线性升至 cap=3.0） |
+| `--init-penalty` | 初始 ρ（0.01），EMA 锚点值 |
 | `--num-worlds` | 并行仿真世界数 |
 | `--epochs` | 训练轮数 |
 | `--lr-actor` | Actor 学习率 |
 | `--lr-critic` | Critic 学习率 |
-| `--max-penalty` | ρ 上限 |
-| `--amplifier-c` | ρ 线性增量/次违规（0.01 → ~100 epoch 到 cap） |
+| `--max-penalty` | ρ 上限（默认 3.0） |
 | `--device` | 计算设备（cuda/cpu） |
 | `--seed` | 随机种子 |
 | `--density-cache-file` | 离线扫描的全量密度 JSON |
@@ -303,10 +297,11 @@ LK:  车道保持（|lat| / road_width）
 20. **网络容量 + 余弦退火 LR**：2层→3层 (512→512→256)，CosineAnnealingLR 从 1e-4 衰减到 1e-6
 21. **Road width 异常 clamp**：某些世界 segment_width >15m → 候选路径飞出道路 → clamp 上限 15m
 22. **Steer bang-bang 饱和 97%**：多轮参数调优无效 → 新增 BC loss，从 expert heading/pos 差分计算近似 steer：`atan(5.0 × Δh / Δs)`；仅训练时生效
-23. **训练协议优化**：buffer 200k + batch 256 + horizon 30 → 16（配合 Transformer 窗口）+ resample 10 + priority 采样（|δp| + |δφ|×5）
+23. **训练协议优化**：buffer 200k + batch 256 + horizon 16（配合 Transformer 窗口）+ resample 10 + priority 采样（|δp| + |δφ|×5）
 24. **偏移候选路径终点不触发 goal**：左右路径终点偏移 ±3.75m → goal 距离 >2m → done 永不触发 → 最后 ~10% 步收敛到中心终点
 25. **Transformer rollout 窗口退化**：30 步 horizon → window 步 16 后全预测帧 → attention 腐败 → horizon 缩至 16，窗口刚切换即终止
-26. **Rho 涨速过快**：amplifier_c=0.005 → penalty 迅速支配 loss → 降至 0.002
+26. **GEP 累加器死锁**：线性/乘性/双向/scale-cap/warmup 五轮迭代均失败 → 最终改为 EMA（`ρ←0.95ρ+0.05×target`），rho 跟踪近期违规严重度而非历史累加
+27. **Warmup 冻 rho 导致转圈**：100 epoch 冷冻 → 无 penalty 信号 → 模型收敛到"小转向=低成本"坏极值点 → 取消 warmup，rho 从步 1 就参与
 
 ## 引用
 
