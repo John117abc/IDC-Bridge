@@ -11,11 +11,11 @@ IDC 的核心思想是**一边开一边学**：
 - **PEV（策略评估）**：Critic 网络评估当前 state 的价值，每步更新。
 - **PIM（策略改进）**：每隔 N 步，Actor 通过可微运动学模型推演未来 H 步轨迹，计算跟踪误差 + 碰撞风险的总成本，反向传播改进策略。每次改进放大惩罚系数 ρ。
 
-Actor/Critic 为两个独立 MLP（LayerNorm + ELU），动作空间为加速度和方向盘转角。
+Actor 为 **TransformerEncoder**（16 步滑窗 + 4 头自注意力），Critic 保持独立 MLP。动作空间为加速度和方向盘转角。
 
 ## 和原论文的差异
 
-1. **网络结构**：Actor/Critic 独立网络，无共享参数（原论文共享 latent embed）
+1. **网络结构**：Actor 为 TransformerEncoder（16 步 × 4 头自注意力滑窗），Critic 为独立 MLP（原论文共享 latent embed）
 2. **训练架构**：单线程主循环替代 30 个异步 learner
 3. **环境**：Nocturne → GPUDrive（Waymo 数据）
 4. **候选参考路径**：3 条 expert pos + 曲率限速路径（左/中/右 lateral offset），每 episode 固定选一条。道路宽度从 GPUDrive 动态读取
@@ -30,6 +30,8 @@ Actor/Critic 为两个独立 MLP（LayerNorm + ELU），动作空间为加速度
 13. **权重重平衡**：`pos_err_weight=0.03`（原 0.3），heading 与 position 信号量级匹配
 14. **Checkpoint 续训时自动覆盖 optimizer lr**：加载后 `lr_critic`/`lr_actor` 从 config 更新
 15. **PDMS 评估**：CARLA 风格评分（NC×DAC×DDC × weighted avg），训练每 epoch log + 评估雷达图/柱状图/终端表
+16. **Transformer 滑窗 Actor**：16 帧 × 4 头自注意力替代 MLP，训练/推理分布一致，解决 MLP 逐帧盲推的转向平滑问题
+17. **PER Buffer 窗口化**：每个经验存储完整 16 步窗口，SumTree 索引化，~760 MB 额外 CPU 内存
 
 ## 快速开始
 
@@ -159,7 +161,7 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 | 分组 | 包含参数 |
 |------|----------|
 | `env` | `num_worlds`, `max_agents`, `epochs`, `seed`, `device` |
-| `training` | `dt`, `horizon`, `batch_size`, `hidden_dim`, `lr_actor_max`/`min`, `lr_critic_max`/`min`, `pim_interval`, `gamma`, `buffer_capacity` |
+| `training` | `dt`, `horizon`, `batch_size`, `hidden_dim`, `lr_actor_max`/`min`, `lr_critic_max`/`min`, `pim_interval`, `gamma`, `buffer_capacity`, `window_size`, `transformer_d_model`, `transformer_nhead`, `transformer_num_layers`, `transformer_dropout` |
 | `agent` | `pos_err_weight`, `heading_err_weight`, 等 7 个 cost weight；`noise_std`/`decay_rate`/`min`；`init_penalty`/`max_penalty`/`amplifier_c`；`D_veh_safe`/`D_road_safe`/`half_length`/`half_width`；`bc_weight` |
 | `dynamics` | `wheelbase`, `lr_ratio`, `v_max` |
 | `world` | `min_partner_density`, `max_partner_density`, `dense_sample_size`, `max_bad_worlds`, `filter_threshold`, `dataset_size`, `density_cache_file` |
@@ -258,7 +260,7 @@ LK:  车道保持（|lat| / road_width）
 │   │   └── idc_state_builder.py
 │   ├── models/
 │   │   ├── kinematic_bicycle.py
-│   │   └── continuous_actor_critic.py
+│   │   └── continuous_actor_critic.py  # TransformerActor + ContinuousCritic
 │   ├── buffer/per_buffer.py
 │   ├── scripts/
 │   │   ├── train/idc-train.py
@@ -301,8 +303,10 @@ LK:  车道保持（|lat| / road_width）
 20. **网络容量 + 余弦退火 LR**：2层→3层 (512→512→256)，CosineAnnealingLR 从 1e-4 衰减到 1e-6
 21. **Road width 异常 clamp**：某些世界 segment_width >15m → 候选路径飞出道路 → clamp 上限 15m
 22. **Steer bang-bang 饱和 97%**：多轮参数调优无效 → 新增 BC loss，从 expert heading/pos 差分计算近似 steer：`atan(5.0 × Δh / Δs)`；仅训练时生效
-23. **训练协议优化**：buffer 200k + batch 256 + horizon 30 + resample 10 + priority 采样（|δp| + |δφ|×5）
-24. **偏移候选路径终点不触发 goal**：左右路径终点偏移 ±3.75m → goal 距离 >2m → done 永不触发 → 最后 5 步收敛到中心终点
+23. **训练协议优化**：buffer 200k + batch 256 + horizon 30 → 16（配合 Transformer 窗口）+ resample 10 + priority 采样（|δp| + |δφ|×5）
+24. **偏移候选路径终点不触发 goal**：左右路径终点偏移 ±3.75m → goal 距离 >2m → done 永不触发 → 最后 ~10% 步收敛到中心终点
+25. **Transformer rollout 窗口退化**：30 步 horizon → window 步 16 后全预测帧 → attention 腐败 → horizon 缩至 16，窗口刚切换即终止
+26. **Rho 涨速过快**：amplifier_c=0.005 → penalty 迅速支配 loss → 降至 0.002
 
 ## 引用
 

@@ -9,9 +9,9 @@ class SumTree:
     def __init__(self, capacity):
         self.capacity = capacity
         self.tree = np.zeros(2 * capacity - 1, dtype=np.float64)
-        self.data = np.zeros(capacity, dtype=object)  # 存储经验
-        self.data_pointer = 0          # 环形缓冲区指针
-        self.n_entries = 0             # 当前存储的样本数
+        self.data = np.zeros(capacity, dtype=np.int32)
+        self.data_pointer = 0
+        self.n_entries = 0
 
     def _propagate(self, idx, change):
         parent = (idx - 1) // 2
@@ -53,62 +53,60 @@ class SumTree:
 
 class PERBuffer:
     """
-    优先经验回放缓冲区，与 StochasticBuffer 接口兼容
-    经验结构为 (state, action, reward, value, done, info)
+    优先经验回放缓冲区。
+    经验存储为 (window, world_idx, path_idx)，通过独立 numpy 数组存储。
     """
     def __init__(self, capacity=100000, min_start_train=256,
-                 alpha=0.6, beta=0.4, beta_increment=0.001):
+                 alpha=0.6, beta=0.4, beta_increment=0.001,
+                 window_size=16, state_dim=62):
         self.tree = SumTree(capacity)
         self.capacity = capacity
         self.min_start_train = min_start_train
-        self.alpha = alpha          # 优先级指数 (0: 均匀采样, 1: 完全按优先级)
-        self.beta = beta            # 重要性采样修正系数
+        self.alpha = alpha
+        self.beta = beta
         self.beta_increment = beta_increment
-        self.max_priority = 1.0     # 记录最大优先级，用于新样本
-        self.last_indices = None    # 最近一次采样使用的索引
+        self.max_priority = 1.0
+        self.last_indices = None
+
+        self.window_size = window_size
+        self.state_dim = state_dim
+        self.windows = np.zeros((capacity, window_size, state_dim), dtype=np.float32)
+        self._world_idx = np.zeros(capacity, dtype=np.int32)
+        self._path_idx = np.zeros(capacity, dtype=np.int32)
 
     def _calc_initial_priority(self, experience):
-        """根据经验内容估算初始优先级"""
-        # _, _, reward, _, _, info = experience
-        # # 安全关键样本给予极高初始优先级
-        # if info.get('collision', False) or info.get('collision_reward', 0) < -0.5:
-        #     return 10.0
-        # elif info.get('collision_reward', 0) < 0:
-        #     return 5.0
-        # elif info.get('centering_reward', 1.0) < 0.5:  # 偏离道路
-        #     return 3.0
-        # else:
-        #     return 1.0
         return 1.0
 
     def handle_new_experience(self, experience, priority=None):
-        """存储经验。可传入 priority 指定优先度，否则使用默认计算"""
         if priority is None:
             priority = self._calc_initial_priority(experience)
-        self.add(experience, priority)
+        window, w, p = experience
+        self.add(window, w, p, priority)
 
     def add_safety_trajectory(self, transitions):
-        """强制以最高优先级存储整条轨迹（用于碰撞/危险场景）"""
-        for exp in transitions:
-            self.add(exp, 10.0)
+        for window, w, p, _ in transitions:
+            self.add(window, w, p, 10.0)
 
-    def add(self, experience, priority):
-        """手动添加经验，优先级会被 alpha 次方处理"""
+    def add(self, window, world_idx, path_idx, priority):
         p = max(priority, 1e-6) ** self.alpha
-        self.tree.add(p, experience)
+        ptr = self.tree.data_pointer
+        self.windows[ptr] = window
+        self._world_idx[ptr] = world_idx
+        self._path_idx[ptr] = path_idx
+        self.tree.add(p, ptr)
         self.max_priority = max(self.max_priority, p)
 
     def sample_batch(self, batch_size):
-        """
-        采样一批经验，返回与原 StochasticBuffer 兼容的列表。
-        同时内部保存本次采样的索引，供后续 update_last_batch_priorities 使用。
-        """
         if self.tree.n_entries < batch_size:
             batch_size = self.tree.n_entries
         if batch_size == 0:
-            return []
+            return (np.zeros((0, self.window_size, self.state_dim), dtype=np.float32),
+                    np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32))
 
-        batch = []
+        batch_windows = np.zeros((batch_size, self.window_size, self.state_dim),
+                                  dtype=np.float32)
+        batch_worlds = np.zeros(batch_size, dtype=np.int32)
+        batch_paths = np.zeros(batch_size, dtype=np.int32)
         idxs = []
         priorities = []
         segment = self.tree.total_priority() / batch_size
@@ -118,23 +116,20 @@ class PERBuffer:
             a = segment * i
             b = segment * (i + 1)
             s = np.random.uniform(a, b)
-            idx, p, data = self.tree.get_leaf(s)
-            batch.append(data)
+            idx, p, data_idx = self.tree.get_leaf(s)
+            batch_windows[i] = self.windows[data_idx]
+            batch_worlds[i] = self._world_idx[data_idx]
+            batch_paths[i] = self._path_idx[data_idx]
             idxs.append(idx)
             priorities.append(p)
 
-        # 保存本次采样索引，供 update_last_batch_priorities 使用
         self.last_indices = idxs
-        return batch
+        return batch_windows, batch_worlds, batch_paths
 
     def update_last_batch_priorities(self, new_priorities):
-        """
-        根据 IDC 计算出的违规量（或其他指标）更新最近一批样本的优先级。
-        new_priorities: list/array of float, 长度与上次采样的 batch_size 相同
-        """
         p_array = np.array(new_priorities, dtype=np.float64)
-        if len(np.unique(p_array)) >  1:
-            logger.debug(f"经验缓冲区更新 update: {len(p_array)} priorities, unique values: {len(np.unique(p_array))}")
+        if len(np.unique(p_array)) > 1:
+            logger.debug(f"update: {len(p_array)} priorities, unique: {len(np.unique(p_array))}")
 
         if self.last_indices is None:
             return
@@ -148,13 +143,15 @@ class PERBuffer:
         return self.tree.n_entries >= self.min_start_train
 
     def clear(self):
-        """重置缓冲区"""
         self.tree = SumTree(self.capacity)
+        self.windows = np.zeros((self.capacity, self.window_size, self.state_dim),
+                                 dtype=np.float32)
+        self._world_idx = np.zeros(self.capacity, dtype=np.int32)
+        self._path_idx = np.zeros(self.capacity, dtype=np.int32)
         self.max_priority = 1.0
         self.last_indices = None
 
     def get_save_buffer_data(self):
-        """获取用于保存的数据"""
         return {
             'tree_data': self.tree.tree.copy(),
             'data': self.tree.data.copy(),
@@ -163,11 +160,13 @@ class PERBuffer:
             'max_priority': self.max_priority,
             'beta': self.beta,
             'capacity': self.capacity,
-            'min_start_train': self.min_start_train
+            'min_start_train': self.min_start_train,
+            'windows': self.windows.copy(),
+            '_world_idx': self._world_idx.copy(),
+            '_path_idx': self._path_idx.copy(),
         }
 
     def load_buffer_data(self, data):
-        """从数据恢复缓冲区"""
         self.tree.tree = data['tree_data'].copy()
         self.tree.data = data['data'].copy()
         self.tree.data_pointer = data['data_pointer']
@@ -176,6 +175,14 @@ class PERBuffer:
         self.beta = data.get('beta', self.beta)
         self.capacity = data.get('capacity', self.capacity)
         self.min_start_train = data.get('min_start_train', self.min_start_train)
+        if 'windows' in data:
+            self.windows = data['windows'].copy()
+            self._world_idx = data['_world_idx'].copy()
+            self._path_idx = data['_path_idx'].copy()
+        else:
+            self.windows = self.windows
+            self._world_idx = self._world_idx
+            self._path_idx = self._path_idx
 
     def __len__(self):
         return self.tree.n_entries

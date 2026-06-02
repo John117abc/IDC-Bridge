@@ -7,7 +7,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from typing import Tuple, List, Dict, Any
 
-from models.continuous_actor_critic import ContinuousActor, ContinuousCritic
+from models.continuous_actor_critic import TransformerActor, ContinuousCritic
 from models.kinematic_bicycle import KinematicBicycleModel
 from buffer import PERBuffer
 from utils import get_logger
@@ -44,7 +44,15 @@ class DiscreteIDCAgent:
         self.batch_size = config.batch_size
 
         # 网络
-        self.actor = ContinuousActor(self.TOTAL_STATE_DIM, config.hidden_dim).to(device)
+        self.window_size = int(getattr(config, 'window_size', 16))
+        self.actor = TransformerActor(
+            state_dim=self.TOTAL_STATE_DIM,
+            d_model=int(getattr(config, 'transformer_d_model', 256)),
+            nhead=int(getattr(config, 'transformer_nhead', 4)),
+            num_layers=int(getattr(config, 'transformer_num_layers', 2)),
+            window_size=self.window_size,
+            dropout=float(getattr(config, 'transformer_dropout', 0.1)),
+        ).to(device)
         self.critic = ContinuousCritic(self.TOTAL_STATE_DIM, config.hidden_dim).to(device)
         self.dynamics = KinematicBicycleModel(
             dt=self.dt,
@@ -91,9 +99,20 @@ class DiscreteIDCAgent:
         self.HALF_W = config.half_width
 
         # 缓冲区
-        self.buffer = PERBuffer(capacity=config.buffer_capacity, min_start_train=config.batch_size)
+        self.buffer = PERBuffer(
+            capacity=config.buffer_capacity,
+            min_start_train=config.batch_size,
+            window_size=self.window_size,
+            state_dim=self.TOTAL_STATE_DIM,
+        )
         self.global_step = 1
+
+        # per-world 状态窗口（训练/推理时维护，不持久化）
+        self.state_windows: Dict[int, Any] = {}
+        from collections import deque
+        self._deque = deque
         self.gep_iteration = 0
+        self.warmup_pims = int(getattr(config, 'warmup_pims', 150))
 
         # 道路状态缓存
         self.road_states = [None] * self.num_worlds
@@ -118,15 +137,24 @@ class DiscreteIDCAgent:
 
     def select_action(self, state, deterministic=False):
         """
-        state: list of state objects (batch)
+        state: list of state objects (batch)，按世界索引排列
         返回 tensor [batch, max_agents, 2]，每个动作为 [acc, steer] (物理值)
         """
         with torch.no_grad():
-            state_tensor = self.batch_state_to_tensor(state)
-            logger.debug(f'选择动作: state_tensor shape={state_tensor.shape}')
+            batch_windows = []
+            for i, state_np in enumerate(state):
+                if i not in self.state_windows:
+                    self.state_windows[i] = self._deque(maxlen=self.window_size)
+                self.state_windows[i].append(state_np)
+                win_list = list(self.state_windows[i])
+                window = np.tile(win_list[0], (self.window_size, 1)).astype(np.float32)
+                window[-len(win_list):] = np.array(win_list)
+                batch_windows.append(window)
 
-            raw_output = self.actor(state_tensor)
-            batch_size = state_tensor.shape[0]
+            window_tensor = torch.from_numpy(
+                np.stack(batch_windows)).to(self.device)
+            raw_output = self.actor(window_tensor)
+            batch_size = raw_output.shape[0]
             raw_output = raw_output.view(batch_size, self.max_agents, 2)
 
             if not deterministic:
@@ -154,6 +182,9 @@ class DiscreteIDCAgent:
                                 f'steer={action[i,0,1].item():.3f}')
             return action
 
+    def reset_world_state(self, world_idx):
+        self.state_windows.pop(world_idx, None)
+
 
     def predict_others(self,others_state):
         """
@@ -168,23 +199,24 @@ class DiscreteIDCAgent:
         speed_next = speed
         return torch.stack([px_next, py_next, phi_next, speed_next], dim=-1)
     
-    def compute_rollout_target(self, states, world_indices, path_indices=None):
-        total_utility = torch.zeros(states.shape[0], device=self.device)
-        s, w_i, p_i = states, world_indices, path_indices
+    def compute_rollout_target(self, windows, world_indices, path_indices=None):
+        total_utility = torch.zeros(windows.shape[0], device=self.device)
+        s_window = windows
         l_min_log, l_max_log = float('inf'), float('-inf')
         for t in range(self.horizon):
-            u = self.actor(s)
+            u = self.actor(s_window)
             if torch.isnan(u).any():
                 logger.warning(f'[NaN] actor output at rollout step {t}')
-            s = self.f_pred_batch(s, u, w_i, p_i)
-            if torch.isnan(s).any():
+            s_next = self.f_pred_batch(s_window[:, -1, :], u, world_indices, path_indices)
+            if torch.isnan(s_next).any():
                 logger.warning(f'[NaN] f_pred state at rollout step {t}')
-            l = self.utility_batch(s, u, w_i, p_i)
+            l = self.utility_batch(s_next, u, world_indices, path_indices)
             if torch.isnan(l).any():
                 logger.warning(f'[NaN] utility at rollout step {t}')
             l_min_log = min(l_min_log, l.min().item())
             l_max_log = max(l_max_log, l.max().item())
             total_utility = total_utility + (self.gamma ** t) * torch.clamp(l, -50.0, 50.0)
+            s_window = torch.cat([s_window[:, 1:, :], s_next.unsqueeze(1)], dim=1)
         if self.global_step % 50 == 0:
             tu = total_utility
             logger.debug(f'[DIAG-critic] utility raw range=[{l_min_log:.2f}, {l_max_log:.2f}], '
@@ -319,17 +351,17 @@ class DiscreteIDCAgent:
                           validity_tensors, ref_error_tensors,
                           temporal_next.unsqueeze(-1).float()], dim=-1)
     
-    def update_critic(self, states, world_indices, path_indices=None):
-        logger.debug(f'更新 Critic: states batch size={states.shape[0]}')
+    def update_critic(self, windows, world_indices, path_indices=None):
+        logger.debug(f'更新 Critic: windows shape={windows.shape}')
         with torch.no_grad():
-            targets = self.compute_rollout_target(states, world_indices, path_indices).detach()
+            targets = self.compute_rollout_target(windows, world_indices, path_indices).detach()
         logger.debug(f"[DEBUG] target stats: min={targets.min().item():.2f}, max={targets.max().item():.2f}, mean={targets.mean().item():.2f}, has_nan={torch.isnan(targets).any()}")
 
         if torch.isnan(targets).any():
             logger.warning(f'Target 包含 NaN，跳过本次 Critic 更新')
             return float('nan')
 
-        values = self.critic(states)
+        values = self.critic(windows[:, -1, :])
         logger.debug(f"[DEBUG] value stats: min={values.min().item():.2f}, max={values.max().item():.2f}, mean={values.mean().item():.2f}, has_nan={torch.isnan(values).any()}")
 
         loss = F.mse_loss(values, targets.unsqueeze(1))
@@ -351,28 +383,29 @@ class DiscreteIDCAgent:
         self.critic_scheduler.step()
         return loss.detach().item()
 
-    def update_actor(self, states, w_i, p_i=None):
-        total_cost = torch.zeros(states.shape[0], device=self.device)
-        s = states
+    def update_actor(self, windows, w_i, p_i=None):
+        total_cost = torch.zeros(windows.shape[0], device=self.device)
+        s_window = windows
         ref_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
         max_penalty = 0.0
         for t in range(self.horizon):
-            u = self.actor(s)
-            s = self.f_pred_batch(s, u, w_i, p_i)
-            l = self.utility_batch(s, u, w_i, p_i)
+            u = self.actor(s_window)
+            s_next = self.f_pred_batch(s_window[:, -1, :], u, w_i, p_i)
+            l = self.utility_batch(s_next, u, w_i, p_i)
             if t == 0:
-                logger.info(f'[LA-DIAG] l1(lat={s[0, ref_start+3]:.2f} dphi={s[0, ref_start+4]:.3f} road={s[0, ref_start+5]:.1f} spd={s[0, ref_start+6]:.1f}) '
-                            f'l2(lat={s[0, ref_start+7]:.2f} dphi={s[0, ref_start+8]:.3f} road={s[0, ref_start+9]:.1f} spd={s[0, ref_start+10]:.1f}) '
-                            f'l3(lat={s[0, ref_start+11]:.2f} dphi={s[0, ref_start+12]:.3f} road={s[0, ref_start+13]:.1f} spd={s[0, ref_start+14]:.1f}) '
-                            f'delta_p={s[0, ref_start]:.2f} delta_phi={s[0, ref_start+1]:.3f} spd={s[0, ref_start+2]:.1f}')
+                logger.info(f'[LA-DIAG] l1(lat={s_next[0, ref_start+3]:.2f} dphi={s_next[0, ref_start+4]:.3f} road={s_next[0, ref_start+5]:.1f} spd={s_next[0, ref_start+6]:.1f}) '
+                            f'l2(lat={s_next[0, ref_start+7]:.2f} dphi={s_next[0, ref_start+8]:.3f} road={s_next[0, ref_start+9]:.1f} spd={s_next[0, ref_start+10]:.1f}) '
+                            f'l3(lat={s_next[0, ref_start+11]:.2f} dphi={s_next[0, ref_start+12]:.3f} road={s_next[0, ref_start+13]:.1f} spd={s_next[0, ref_start+14]:.1f}) '
+                            f'delta_p={s_next[0, ref_start]:.2f} delta_phi={s_next[0, ref_start+1]:.3f} spd={s_next[0, ref_start+2]:.1f}')
             l = torch.clamp(l, -5000.0, 5000.0)
-            p = self.penalty_batch(s, w_i, p_i)
+            p = self.penalty_batch(s_next, w_i, p_i)
             p = torch.clamp(p, max=100.0)
             max_penalty = max(max_penalty, p.max().item())
             if t == 0:
                 logger.debug(f'[DIAG-pen] raw penalty min={p.min().item():.2f} max={p.max().item():.2f} '
                             f'mean={p.mean().item():.2f}  (rho={self.rho:.4f})')
             total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
+            s_window = torch.cat([s_window[:, 1:, :], s_next.unsqueeze(1)], dim=1)
 
         actor_loss = total_cost.mean()
         has_violation = max_penalty > 0.5
@@ -380,10 +413,10 @@ class DiscreteIDCAgent:
         bc_weight = getattr(self.config, 'bc_weight', 0.0)
         if bc_weight > 0:
             temp_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR
-            temporal_idx = states[:, temp_start:temp_start + self.DIM_TEMPORAL].squeeze(-1).long()
+            temporal_idx = windows[:, -1, temp_start:temp_start + self.DIM_TEMPORAL].squeeze(-1).long()
             expert_steer = self.state_builder.get_expert_steer_batch(
                 w_i, temporal_idx, self.ego_indices)
-            raw_init = self.actor(states)
+            raw_init = self.actor(windows)
             actor_steer = torch.clamp(raw_init[:, 0] * 0.3, -0.6, 0.6)
             bc_loss = ((actor_steer - expert_steer.to(actor_steer.device)) ** 2).mean()
             actor_loss = actor_loss + bc_weight * bc_loss
@@ -424,8 +457,9 @@ class DiscreteIDCAgent:
             self.rho = max(0.0, self.rho - self.amplifier_c)
             actor_loss = float('nan')
             has_violation = False
+            max_penalty = 0.0
 
-        return actor_loss.detach().item() if not has_nan else float('nan'), has_violation
+        return actor_loss.detach().item() if not has_nan else float('nan'), has_violation, max_penalty
 
     def utility_batch(self, s, u, w_i, p_i=None):
         """
@@ -525,23 +559,32 @@ class DiscreteIDCAgent:
         return veh_violation + road_violation
     
     def update(self):
-        samples = self.buffer.sample_batch(self.batch_size)
-        states, word_indexs, path_indices = zip(*samples)
-        states_tensor = self.batch_state_to_tensor(states)
+        windows, word_indexs, path_indices = self.buffer.sample_batch(self.batch_size)
+        if len(windows) == 0:
+            return None, None
+        windows_tensor = torch.from_numpy(windows).to(self.device)
 
         # PEV: 每次 update 都更新 critic
-        critic_loss = self.update_critic(states_tensor, word_indexs, path_indices)
+        critic_loss = self.update_critic(windows_tensor, word_indexs, path_indices)
         self.pev_step += 1
 
         # PIM: 积累足够 PEV 步后才更新 actor，仅在检测到 violation 时放大 ρ
         actor_loss = None
         if self.pev_step >= self.pim_interval:
             self.pev_step = 0
-            actor_loss, has_violation = self.update_actor(states_tensor, word_indexs, path_indices)
-            if has_violation:
-                self.rho = min(self.rho + self.amplifier_c, self.max_penalty)
+            actor_loss, has_violation, max_p = self.update_actor(windows_tensor, word_indexs, path_indices)
+            if self.gep_iteration < self.warmup_pims:
+                if has_violation:
+                    self.gep_iteration += 1
+                    logger.debug(f'[GEP] warmup violation, gep={self.gep_iteration}/{self.warmup_pims} rho={self.rho:.4f}')
+            elif has_violation:
+                scale = min(max(1.0, max_p), 10.0)
+                self.rho = min(self.rho + self.amplifier_c * scale, self.max_penalty)
                 self.gep_iteration += 1
-                logger.info(f'[GEP] violation detected, rho={self.rho:.4f} gep_iter={self.gep_iteration}')
+                logger.info(f'[GEP] violation, scale={scale:.0f}, rho={self.rho:.4f} gep={self.gep_iteration}')
+            else:
+                self.rho = max(self.config.init_penalty, self.rho - self.amplifier_c * 0.1)
+                logger.info(f'[GEP] clean PIM, rho={self.rho:.4f} gep={self.gep_iteration}')
 
         return critic_loss, actor_loss
         
@@ -549,7 +592,12 @@ class DiscreteIDCAgent:
         self.ego_indices = new_ego_indices
 
     def clear_buffer(self):
-        self.buffer = PERBuffer(capacity=self.config.buffer_capacity, min_start_train=self.config.batch_size)
+        self.buffer = PERBuffer(
+            capacity=self.config.buffer_capacity,
+            min_start_train=self.config.batch_size,
+            window_size=self.window_size,
+            state_dim=self.TOTAL_STATE_DIM,
+        )
 
     def save(self, save_info: Dict[str, Any]) -> None:
         if self.globe_eps % self.config.save_freq == 0:

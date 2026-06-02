@@ -1723,4 +1723,89 @@ BC 仅训练时生效——GEP rollout 仍是主 loss，BC 是辅助梯度信号
 | priority | uniform | `\|δp\| + \|δφ\|×5` | 偏离/碰撞场景优先采样 |
 | offset path endpoint | 偏移 3.75m | 最后 5 步收敛到中心终点 | goal 检测触发 done |
 
+**注意**：Issue 74 将此修复进一步完善为无条件最后 10% 步骤收敛（非依赖 `valid_len`），因为对 95%+ 的正常世界 `valid_len==91`，旧逻辑永不会触发。
+
 **涉及文件**：`base.yaml`、`per_buffer.py`、`idc-train.py`、`idc_state_builder.py`
+
+---
+
+## 74. Transformer 滑窗架构替换 MLP Actor
+
+**日期**：2026-06-02
+
+**背景**：MLP 3 层 512→512→256 训练 500 轮 PDMS ~50，转向仍然差。根本问题是 MLP 逐帧盲推——每帧独立回归，没有时间记忆。转向是 2 阶控制问题，依赖累积转角，前馈网络没有积分器。
+
+**方案选型**：评估了 LSTM+hidden snapshot (B+C) 和 Transformer 滑窗 (D)。选 D — Transformer 固定窗口 O(1)、训练/推理完全一致、无需 hidden state snapshot 管理。
+
+**架构**：
+
+```
+TransformerActor(state_dim=62, d_model=256, nhead=4, num_layers=2, window=16)
+
+输入: [batch, 16, 62]   # 最近 1.6 秒完整状态
+  → Linear(62→256)
+  → + learnable position encoding(16, 256)
+  → TransformerEncoder(2 layers, 4 heads, FFN 1024, GELU, dropout 0.1)
+  → 取最后一帧: [batch, 256]
+  → Linear(256→2) → [steer_raw, acc_raw]
+```
+
+**关键设计决策**：
+
+| 决策 | 理由 |
+|------|------|
+| window_size=16 | 1.6 秒上下文，3× 转向时间常数 |
+| Critic 保持 MLP | V(s) 是 Markov 瞬时估值，无需时序 |
+| f_pred_batch 不动 | 动力学推演仍是单帧接口 |
+| rollout 滑窗 | `window_{t+1} = [window_t[1:] || f_pred_batch(window_t[-1], actor(window_t))]` |
+| 窗口前端 pad | 重复第一帧（非零填充），避免 attention 被零向量干扰 |
+| BC loss 仍用初始窗口 | BC 只在真实帧上算 steer supervision |
+
+**PER Buffer 重构**：
+
+| 改前 | 改后 |
+|------|------|
+| SumTree.data 存 Python object 元组 | 存 int 索引 |
+| 经验 = (state[62], w, p) | 经验 = (window[16,62], w, p) |
+| sample_batch 返回 `(states, worlds, paths)` | 返回 `(windows, worlds, paths)` |
+| 新增 ~760 MB 窗口数组（200k × 16 × 62 × 4B） | 序列化同步 |
+
+**窗口维护**：
+
+- `agent.state_windows[world_idx] = deque(maxlen=16)` 每步 push 新状态
+- `select_action` 从 deque 拼窗口 → batched forward
+- `agent.reset_world_state(w)` 在 epoch 开始、world done/bad/reached、resample 时调用
+
+**涉及文件**（7 个）：
+
+| 文件 | 改动 |
+|------|------|
+| `continuous_actor_critic.py` | +84 行 TransformerActor（保留 ContinuousActor） |
+| `per_buffer.py` | SumTree.data int 索引，+windows 数组，改 add/sample/序列化 |
+| `idc_agent.py` | Actor→TransformerActor，select_action/update/rollout 全改窗口流转 |
+| `idc-train.py` | 缓冲插入前拼窗口，epoch/resample 时 reset |
+| `idc-eval.py` | epoch/filter 后 reset 窗口 |
+| `pdms.py` | RolloutPDMSScorer 改为窗口 rollout |
+| `base.yaml` | +window_size/d_model/nhead/num_layers/dropout 配置 |
+
+---
+
+## 75. Rollout 窗口退化修复：horizon 收窄 + rho 涨速控制
+
+**日期**：2026-06-02
+
+**症状**：Transformer 训练 100 轮：actor loss 振荡于 100↔5000（无收敛趋势），critic loss 早期 300k+，PDMS 5-37 宽幅震荡。每步 PIM 都触发 violation → rho 0.01 单调升至 1.76。LA-DIAG 显示 rollout 后期出现 18-35m 跟踪误差。
+
+**根因**：30 步 rollout × window=16。步 16 之后窗口 100% 是预测帧 → Transformer self-attention 在腐败数据上做决策 → 误差几何放大。rho 涨速太快（+0.005/PIM）→ penalty 迅速支配 loss → actor 再也学不到 tracking。
+
+**修复**：
+
+| 参数 | 旧 | 新 | 效果 |
+|------|-----|-----|------|
+| `horizon` | 30 | 16 | rollout 在窗口全腐败前终止 |
+| `amplifier_c` | 0.005 | 0.002 | rho 涨速降 60%，给 tracking 更多时间 |
+
+horizon=16 步 × 0.1s = 1.6 秒，恰好等于窗口长度——第 16 步窗口才切换到全预测帧，但 rollout 已结束。
+
+**涉及文件**：`base.yaml`
+

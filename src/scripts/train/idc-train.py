@@ -26,9 +26,14 @@ def _diag_init_step(config, agent, builder, ego_indices, episode_path_indices,
     if step != 0:
         return
 
-    state_tensor = agent.batch_state_to_tensor(states[:2])
+    # 用窗口形式传给 Transformer Actor
+    batch_windows = []
+    for i in [0, 1]:
+        win = np.tile(states[i], (config.window_size, 1)).astype(np.float32)
+        batch_windows.append(win)
+    window_tensor = torch.from_numpy(np.stack(batch_windows)).to(agent.device)
     with torch.no_grad():
-        norm_action_raw = agent.actor(state_tensor)
+        norm_action_raw = agent.actor(window_tensor)
         norm_2d = norm_action_raw.view(2, 1, 2)
 
     for i in [0, 1]:
@@ -125,6 +130,7 @@ def train(config):
         obs = env.reset()
         for w in range(config.num_worlds):
             builder.reset_world_step(w, 0)
+            agent.reset_world_state(w)
         builder.clear_cache()
         wm.reached_worlds.clear()
 
@@ -170,9 +176,20 @@ def train(config):
                 if config.no_sign:
                     states[w][ref_start] = abs(states[w][ref_start])
                 priority = abs(states[w][ref_start]) + abs(states[w][ref_start + 1]) * 5.0 + 1e-6
+
+                if w not in agent.state_windows:
+                    agent.state_windows[w] = agent._deque(maxlen=config.window_size)
+                agent.state_windows[w].append(states[w])
+                win_list = list(agent.state_windows[w])
+                window = np.tile(win_list[0], (config.window_size, 1)).astype(np.float32)
+                window[-len(win_list):] = np.array(win_list)
+
                 agent.buffer.handle_new_experience(
-                    (states[w], w, episode_path_indices[w]), priority=priority)
+                    (window, w, episode_path_indices[w]), priority=priority)
                 builder.increment_step(w)
+
+            for w in list(wm.bad_worlds) + list(wm.reached_worlds):
+                agent.reset_world_state(w)
 
             positions = builder.get_ego_positions_batch(ego_indices, _abs_np=abs_np_step)
             for i, w in enumerate(VIZ_WORLDS):
@@ -274,6 +291,8 @@ def train(config):
                 f'good<{config.num_worlds - config.max_bad_worlds}, triggering resample...'
             )
             ego_indices = wm.resample()
+            for w in range(config.num_worlds):
+                agent.reset_world_state(w)
 
     logger.debug('训练完成')
 

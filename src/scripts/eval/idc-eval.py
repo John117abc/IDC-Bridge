@@ -127,6 +127,7 @@ def evaluate(config):
         obs = env.reset()
         for w in range(config.num_worlds):
             builder.reset_world_step(w, 0)
+            agent.reset_world_state(w)
         builder.clear_cache()
         wm.reached_worlds.clear()
 
@@ -166,6 +167,9 @@ def evaluate(config):
                         logger.debug(f'[PDMS-rollout] world_{w} failed: {e}')
 
             wm.filter_per_step(states, step)
+
+            for w in list(wm.bad_worlds) + list(wm.reached_worlds):
+                agent.reset_world_state(w)
 
             for w in wm.good_worlds:
                 builder.increment_step(w)

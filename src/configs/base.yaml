@@ -5,72 +5,79 @@
 
 # ---- 训练超参 ----
 training:
-  dt: 0.1
-  horizon: 30
-  batch_size: 256
-  hidden_dim: 512
-  lr_actor_max: 1.0e-4
-  lr_actor_min: 1.0e-6
-  lr_critic_max: 3.0e-4
-  lr_critic_min: 1.0e-5
-  pim_interval: 30
-  gamma: 0.99
-  buffer_capacity: 200000
+  dt: 0.1                         # 动力学推演步长（秒）：0.1s × horizon 步 = 有效前瞻时间
+  horizon: 16                     # PIM/PEV rollout 推演步数（16 步 = 1.6 秒，与 Transformer 窗口等长）
+  batch_size: 256                 # 每次 PEV/PIM 从 buffer 采样的样本数
+  hidden_dim: 512                 # Critic MLP 隐层维度（Actor 为 Transformer，不受此参数影响）
+  lr_actor_max: 1.0e-4            # CosineAnnealingLR 起始学习率（Actor）
+  lr_actor_min: 1.0e-6            # CosineAnnealingLR 终止学习率（Actor）
+  lr_critic_max: 3.0e-4           # CosineAnnealingLR 起始学习率（Critic）
+  lr_critic_min: 1.0e-5           # CosineAnnealingLR 终止学习率（Critic）
+  pim_interval: 30                # 每 N 次 PEV 后执行一次 PIM（Actor 更新频率）
+  gamma: 0.99                     # 折扣因子，用于 rollout 中未来 utility 的折现
+  buffer_capacity: 200000         # PER 缓冲区最大容量（条目数）：~10 epoch 填满
+  window_size: 16                 # Transformer Actor 滑窗帧数（16 帧 × 0.1s = 1.6 秒历史）
+  transformer_d_model: 256        # Transformer 隐层维度（embedding 维度 + attention 维度）
+  transformer_nhead: 4            # Multi-Head Attention 头数（d_model 必须能被 nhead 整除）
+  transformer_num_layers: 2       # TransformerEncoder 堆叠层数
+  transformer_dropout: 0.1        # Transformer 内部 dropout 概率（attention + FFN）
 
 # ---- Agent 参数 ----
 agent:
-  pos_err_weight: 0.03
-  speed_err_weight: 0.05
-  heading_err_weight: 0.3
-  steer_cost_weight: 0.06
-  acc_cost_weight: 0.01
-  lookahead_pos_weight: 0.05
-  lookahead_heading_weight: 0.05
-  noise_std: 0.1
-  noise_decay_rate: 0.95
-  noise_std_min: 0.03
-  bc_weight: 0.1
-  init_penalty: 0.01
-  max_penalty: 3.0
-  amplifier_c: 0.005
-  D_veh_safe: 2.0
-  D_road_safe: 1.5
-  half_length: 2.25
-  half_width: 1.0
+  pos_err_weight: 0.03            # utility 中位置跟踪误差的权重（|ego - ref|²）
+  speed_err_weight: 0.05          # utility 中速度跟踪误差的权重（|v_ego - v_ref|²）
+  heading_err_weight: 0.3         # utility 中航向误差的权重（delta_phi²）
+  steer_cost_weight: 0.06         # 转向控制代价权重（steer_raw²），正则化转向剧烈程度
+  acc_cost_weight: 0.01           # 加速控制代价权重（acc_raw²），正则化加速度剧烈程度
+  lookahead_pos_weight: 0.05      # 前瞻点横向误差权重（t+5/10/15 的 lat_err² ×3）
+  lookahead_heading_weight: 0.05  # 前瞻点航向误差权重（t+5/10/15 的 dphi² ×3）
+  noise_std: 0.1                  # select_action 探索噪声标准差（高斯加到 raw_output）
+  noise_decay_rate: 0.95          # 每次 PIM 后噪声衰减倍率：σ ← max(σ×0.95, noise_std_min)
+  noise_std_min: 0.03             # 噪声下限——保证后期仍有少量探索
+  bc_weight: 0.1                  # BC loss（行为克隆）在 actor loss 中的权重
+  init_penalty: 0.01              # 初始惩罚系数 ρ，warmup 阶段固定为此值
+  max_penalty: 3.0                # ρ 上限，防止 penalty 完全淹没 utility
+  amplifier_c: 0.002              # ρ 每次违规 PIM 的基础增量（实际增量 = c × scale）
+  warmup_pims: 300                # 前 N 次 PIM 冻结 ρ（只计数 gep_iteration）≈ 100 epoch
+  D_veh_safe: 2.0                 # 车辆碰撞安全距离（m）：自车-周车圆心距 < 此值时产生 penalty
+  D_road_safe: 1.5                # 道路安全距离（m）：自车到路边距离 < 此值时产生 penalty
+  half_length: 2.25               # 半车长（m），用于双圆模型的圆心偏移
+  half_width: 1.0                 # 半车宽（m），暂未直接使用
 
 # ---- 车辆动力学 ----
 dynamics:
-  wheelbase: 5.0
-  lr_ratio: 0.5
-  v_max: 30.0
+  wheelbase: 5.0                  # 轴距 L（m）：匹配 Waymo 真实车长 ~5.0m
+  lr_ratio: 0.5                   # 质心到后轴距离占轴距的比例（后轮转向模型）
+  v_max: 30.0                     # 动力学模型速度上限（m/s），clamp 安全网
 
 # ---- 世界管理 ----
 world:
-  min_partner_density: 30
-  max_partner_density: 99
-  dense_sample_size: 10000
-  max_bad_worlds: 120
-  resample_interval: 10
-  filter_threshold: 200
-  dataset_size: 0
-  density_cache_file: "/workspace/data/density_full.json"
+  min_partner_density: 30         # 周车密度下限（平均 partner 数 ≥ 此值才入选）
+  max_partner_density: 99         # 周车密度上限
+  dense_sample_size: 10000        # 稠密场景候选池大小（优先从密度区间采样）
+  max_bad_worlds: 60              # 坏 world 数超过此值触发 resample（保留 ≥ num_worlds-max 个 good）
+  resample_interval: 10           # 每 N 个 epoch 检查一次是否需 resample
+  filter_threshold: 200           # ego 坐标超过 ±200m 视为坏 world
+  dataset_size: 0                 # 数据池大小，0=自动检测 data_dir 下 tfrecord 文件数
+  density_cache_file: "/workspace/data/logs/density_full.json"  # 离线密度扫描缓存
 
 # ---- 诊断开关 ----
 diag:
-  fix_speed: false
-  fix_heading: false
-  no_sign: false
-  no_road_penalty: false
-  no_veh_penalty: false
+  fix_speed: false                # 若 true：屏蔽 speed_err utility 项（调试用）
+  fix_heading: false              # 若 true：屏蔽 heading_err utility 项（调试用）
+  no_sign: false                  # 若 true：delta_p 取绝对值（调试用，去掉左右符号）
+  no_road_penalty: false          # 若 true：关闭道路约束 penalty（调试用，定位问题源）
+  no_veh_penalty: false           # 若 true：关闭周车碰撞 penalty（调试用，定位问题源）
 
 # ---- PDMS 评分 ----
 metrics:
   pdms:
-    nc_weight: 0.0
-    dac_threshold: 3
-    ttc_horizon: 4.0
-    jerk_max: 10.0
-    ep_weight: 5
-    ttc_weight: 5
-    comfort_weight: 2
-    lk_weight: 2
+    nc_weight: 0.0                # 未使用（NC 采用硬判定：碰撞 = 0 分）
+    dac_threshold: 3              # DAC 阈值：偏路步数 > 3 → DAC = 0
+    ttc_horizon: 4.0              # TTC 前瞻时间窗口（秒）
+    jerk_max: 10.0                # 最大允许 jerk（m/s³），超过视为不舒适
+    ep_weight: 5                  # 路线完成度（EP）在加权平均中的权重
+    ttc_weight: 5                 # 最小碰撞时间（TTC）的权重
+    comfort_weight: 2             # 舒适性（C）的权重
+    lk_weight: 2                  # 车道保持（LK）的权重
+    # 总分 = (NC × DAC × DDC) × (EP×5 + TTC×5 + C×2 + LK×2) / 14 × 100

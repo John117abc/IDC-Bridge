@@ -190,6 +190,8 @@ class RolloutPDMSScorer:
 
         s_np = state
         s = torch.from_numpy(s_np).float().unsqueeze(0).to(device)
+        window_size = agent.window_size
+        s_window = s.unsqueeze(1).repeat(1, window_size, 1)  # [1, W, 62]
         w_i = [world_idx]
         p_i = [self.path_idx]
         ref_start_val = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
@@ -200,12 +202,13 @@ class RolloutPDMSScorer:
 
         with torch.no_grad():
             for t in range(horizon):
-                u = agent.actor(s)
-                s = agent.f_pred_batch(s, u, w_i, p_i)
+                u = agent.actor(s_window)
+                s_next = agent.f_pred_batch(s_window[:, -1, :], u, w_i, p_i)
+                s_window = torch.cat([s_window[:, 1:, :], s_next.unsqueeze(1)], dim=1)
 
-                ego_np = s[0].cpu().numpy()
+                ego_np = s_next[0].cpu().numpy()
                 ex, ey = float(ego_np[0]), float(ego_np[1])
-                ego_vel = float(torch.hypot(s[0, 2], s[0, 3]))
+                ego_vel = float(torch.hypot(s_next[0, 2], s_next[0, 3]))
                 ego_heading = float(ego_np[4])
 
                 partners = []  # 从 others 重建

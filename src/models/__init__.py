@@ -1,5 +1,5 @@
 from .dsiscrete_actor_critic import DiscreteActor,DiscreteCritic
 from .kinematic_bicycle import KinematicBicycleModel
-from .continuous_actor_critic import ContinuousActor, ContinuousCritic
+from .continuous_actor_critic import ContinuousActor, TransformerActor, ContinuousCritic
 
-__all__ = ['DiscreteActor','DiscreteCritic','KinematicBicycleModel','ContinuousActor','ContinuousCritic']
+__all__ = ['DiscreteActor','DiscreteCritic','KinematicBicycleModel','ContinuousActor','TransformerActor','ContinuousCritic']
