@@ -6,8 +6,8 @@
 # ---- 训练超参 ----
 training:
   dt: 0.1
-  horizon: 20
-  batch_size: 512
+  horizon: 30
+  batch_size: 256
   hidden_dim: 512
   lr_actor_max: 1.0e-4
   lr_actor_min: 1.0e-6
@@ -15,7 +15,7 @@ training:
   lr_critic_min: 1.0e-5
   pim_interval: 30
   gamma: 0.99
-  buffer_capacity: 100000
+  buffer_capacity: 200000
 
 # ---- Agent 参数 ----
 agent:
@@ -50,7 +50,7 @@ world:
   max_partner_density: 99
   dense_sample_size: 10000
   max_bad_worlds: 120
-  resample_interval: 3
+  resample_interval: 10
   filter_threshold: 200
   dataset_size: 0
   density_cache_file: "/workspace/data/density_full.json"

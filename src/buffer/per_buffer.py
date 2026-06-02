@@ -81,9 +81,10 @@ class PERBuffer:
         #     return 1.0
         return 1.0
 
-    def handle_new_experience(self, experience):
-        """自动计算初始优先级并存储"""
-        priority = self._calc_initial_priority(experience)
+    def handle_new_experience(self, experience, priority=None):
+        """存储经验。可传入 priority 指定优先度，否则使用默认计算"""
+        if priority is None:
+            priority = self._calc_initial_priority(experience)
         self.add(experience, priority)
 
     def add_safety_trajectory(self, transitions):

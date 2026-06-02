@@ -301,6 +301,8 @@ LK:  车道保持（|lat| / road_width）
 20. **网络容量 + 余弦退火 LR**：2层→3层 (512→512→256)，CosineAnnealingLR 从 1e-4 衰减到 1e-6
 21. **Road width 异常 clamp**：某些世界 segment_width >15m → 候选路径飞出道路 → clamp 上限 15m
 22. **Steer bang-bang 饱和 97%**：多轮参数调优无效 → 新增 BC loss，从 expert heading/pos 差分计算近似 steer：`atan(5.0 × Δh / Δs)`；仅训练时生效
+23. **训练协议优化**：buffer 200k + batch 256 + horizon 30 + resample 10 + priority 采样（|δp| + |δφ|×5）
+24. **偏移候选路径终点不触发 goal**：左右路径终点偏移 ±3.75m → goal 距离 >2m → done 永不触发 → 最后 5 步收敛到中心终点
 
 ## 引用
 

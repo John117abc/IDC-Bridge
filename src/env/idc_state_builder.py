@@ -92,12 +92,17 @@ class GPUDriveObservationBuilder:
                     pos = expert_pos_w.copy()
                 else:
                     pos = np.zeros((num_points, 2), dtype=np.float32)
+                    blend_start = int(num_points * 0.9)
                     for j in range(num_points):
+                        eff_offset = offset
+                        if j >= blend_start:
+                            blend = (j - blend_start + 1) / max(1, num_points - blend_start)
+                            eff_offset = offset * (1.0 - blend)
                         h = float(expert_h_w[j])
                         lx = -math.sin(h)
                         ly = math.cos(h)
-                        pos[j, 0] = float(expert_pos_w[j, 0]) + offset * lx
-                        pos[j, 1] = float(expert_pos_w[j, 1]) + offset * ly
+                        pos[j, 0] = float(expert_pos_w[j, 0]) + eff_offset * lx
+                        pos[j, 1] = float(expert_pos_w[j, 1]) + eff_offset * ly
 
                 path = {
                     'pos': pos.astype(np.float32),
@@ -139,11 +144,11 @@ class GPUDriveObservationBuilder:
                 head = p['heading']
                 spd = p['speed']
                 mid = len(pos) // 2
-                logger.info(f'[BEZIER-CHK] world_{w} path_{pid} '
+                logger.debug(f'[BEZIER-CHK] world_{w} path_{pid} '
                             f'start=({pos[0,0]:.1f},{pos[0,1]:.1f}) head={head[0]:.2f} spd={spd[0]:.2f}')
-                logger.info(f'[BEZIER-CHK] world_{w} path_{pid} '
+                logger.debug(f'[BEZIER-CHK] world_{w} path_{pid} '
                             f'mid=({pos[mid,0]:.1f},{pos[mid,1]:.1f}) head={head[mid]:.2f} spd={spd[mid]:.2f}')
-                logger.info(f'[BEZIER-CHK] world_{w} path_{pid} '
+                logger.debug(f'[BEZIER-CHK] world_{w} path_{pid} '
                             f'end=({pos[-1,0]:.1f},{pos[-1,1]:.1f}) head={head[-1]:.2f} spd={spd[-1]:.2f}')
 
         # 最近点跳变检测

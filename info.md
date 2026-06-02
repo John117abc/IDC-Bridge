@@ -1701,3 +1701,26 @@ BC 仅训练时生效——GEP rollout 仍是主 loss，BC 是辅助梯度信号
 **修复**：改用 `atan(L × Δheading / Δs)` 从已有 expert heading/pos 数据计算近似 steer。
 
 **涉及文件**：`idc_state_builder.py`
+
+---
+
+## 73. 训练协议 + 候选路径终点修复
+
+**日期**：2026-06-02
+
+**问题 1**：3-epoch resample 导致 buffer 仅填 41k/100k，每个世界只练 3 轮，优先级采样无意义。Critic loss 在 ~300 epoch 后 plateau。
+
+**问题 2**：偏移候选路径（pid=0/2）的终点 = expert 终点 ±3.75m → GPUDrive goal 判定（2m 阈值）永不触发 → offset 路径世界永远不会 reached
+
+**修复**：
+
+| 参数 | 旧 | 新 | 效果 |
+|------|-----|-----|------|
+| `buffer_capacity` | 100k | 200k | 10 epoch 填满 |
+| `batch_size` | 512 | 256 | 小 batch 减少极端 utility 污染 |
+| `horizon` | 20 | 30 | 更长前瞻视野 |
+| `resample_interval` | 3 | 10 | 每世界练 10 轮，配合 priority sampling |
+| priority | uniform | `\|δp\| + \|δφ\|×5` | 偏离/碰撞场景优先采样 |
+| offset path endpoint | 偏移 3.75m | 最后 5 步收敛到中心终点 | goal 检测触发 done |
+
+**涉及文件**：`base.yaml`、`per_buffer.py`、`idc-train.py`、`idc_state_builder.py`

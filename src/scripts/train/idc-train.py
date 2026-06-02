@@ -169,7 +169,9 @@ def train(config):
             for w in wm.good_worlds:
                 if config.no_sign:
                     states[w][ref_start] = abs(states[w][ref_start])
-                agent.buffer.handle_new_experience((states[w], w, episode_path_indices[w]))
+                priority = abs(states[w][ref_start]) + abs(states[w][ref_start + 1]) * 5.0 + 1e-6
+                agent.buffer.handle_new_experience(
+                    (states[w], w, episode_path_indices[w]), priority=priority)
                 builder.increment_step(w)
 
             positions = builder.get_ego_positions_batch(ego_indices, _abs_np=abs_np_step)
