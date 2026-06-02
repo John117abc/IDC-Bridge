@@ -186,9 +186,22 @@ class GPUDriveObservationBuilder:
         self.expert_pos = raw_traj[:, :, :2*T].reshape(W, A, T, 2)
         self.expert_vel = raw_traj[:, :, 2*T:4*T].reshape(W, A, T, 2)
         self.expert_heading = raw_traj[:, :, 4*T:5*T].reshape(W, A, T, 1)
-        
-        # 如果以后需要模仿学习，可以顺便存下这个：
-        # self.expert_actions = raw_traj[:, :, 6*T:16*T].reshape(W, A, T, 10)
+
+    def get_expert_steer_batch(self, world_indices, temporal_indices, ego_indices_map):
+        """从 expert pos/heading 数值差分计算近似 steering [batch]"""
+        steers = []
+        for i in range(len(world_indices)):
+            w = world_indices[i]
+            a = ego_indices_map[w]
+            t = min(int(temporal_indices[i]), self.EXPERT_TRAJ_LEN - 2)
+            dh = float(self.expert_heading[w, a, t + 1] - self.expert_heading[w, a, t])
+            dx = float(self.expert_pos[w, a, t + 1, 0] - self.expert_pos[w, a, t, 0])
+            dy = float(self.expert_pos[w, a, t + 1, 1] - self.expert_pos[w, a, t, 1])
+            ds = math.hypot(dx, dy) + 1e-6
+            # kinematic bicycle model: δ = atan(L × Δθ / Δs)
+            L = 5.0  # wheelbase
+            steers.append(math.atan(L * dh / ds))
+        return torch.tensor(steers, dtype=torch.float32)
 
     def clear_cache(self):
         """每集开始时调用，使道路缓存失效。"""

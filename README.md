@@ -20,7 +20,7 @@ Actor/Critic 为两个独立 MLP（LayerNorm + ELU），动作空间为加速度
 3. **环境**：Nocturne → GPUDrive（Waymo 数据）
 4. **候选参考路径**：3 条 expert pos + 曲率限速路径（左/中/右 lateral offset），每 episode 固定选一条。道路宽度从 GPUDrive 动态读取
 5. **碰撞模型**：前后双圆模型替代单圆
-6. **状态空间**：59 维，含当前误差 + 3 个前瞻点（t+3/t+6/t+9）的横向/航向/道路边界预览
+6. **状态空间**：62 维，含当前误差 + 3 个前瞻点（t+5/t+10/t+15）的横向/航向/道路边界/参考速度预览
 7. **性能优化**：批量 tensor 操作 + GPU `ref_tensor` 预索引，消除 rollout 中的 Python 循环瓶颈
 8. **线性 rho 升温**：`rho += amplifier_c` 替代乘性膨胀，tracking → penalty 自然过渡，无需分阶段训练
 9. **YAML 层级配置**：`base.yaml`（共享）→ `train.yaml`/`eval.yaml` 继承覆盖，CLI 仅需指定差异项
@@ -136,7 +136,7 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 | `--config` | YAML 配置文件路径（train 默认 `configs/train.yaml`，eval 默认 `configs/eval.yaml`） |
 | `--data-dir` | Waymo tfrecord 数据目录（**必填**） |
 | `--model-path` | 模型 checkpoint 路径（评估必填） |
-| `--init-penalty` | 初始 ρ（0=纯追踪，1.0=含 penalty） |
+| `--init-penalty` | 初始 ρ（0.01 = tracking 为主，线性升至 cap=3.0） |
 | `--num-worlds` | 并行仿真世界数 |
 | `--epochs` | 训练轮数 |
 | `--lr-actor` | Actor 学习率 |
@@ -154,13 +154,13 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 
 ### YAML 配置速查
 
-完整参数见 `configs/default.yaml`，关键分组：
+完整参数见 `configs/base.yaml`，关键分组：
 
 | 分组 | 包含参数 |
 |------|----------|
 | `env` | `num_worlds`, `max_agents`, `epochs`, `seed`, `device` |
-| `training` | `dt`, `horizon`, `batch_size`, `hidden_dim`, `lr_actor`, `lr_critic`, `pim_interval`, `gamma`, `buffer_capacity` |
-| `agent` | `pos_err_weight`, `heading_err_weight`, 等 7 个 cost weight；`noise_std`/`decay_rate`/`min`；`init_penalty`/`max_penalty`/`amplifier_c`；`D_veh_safe`/`D_road_safe`/`half_length`/`half_width` |
+| `training` | `dt`, `horizon`, `batch_size`, `hidden_dim`, `lr_actor_max`/`min`, `lr_critic_max`/`min`, `pim_interval`, `gamma`, `buffer_capacity` |
+| `agent` | `pos_err_weight`, `heading_err_weight`, 等 7 个 cost weight；`noise_std`/`decay_rate`/`min`；`init_penalty`/`max_penalty`/`amplifier_c`；`D_veh_safe`/`D_road_safe`/`half_length`/`half_width`；`bc_weight` |
 | `dynamics` | `wheelbase`, `lr_ratio`, `v_max` |
 | `world` | `min_partner_density`, `max_partner_density`, `dense_sample_size`, `max_bad_worlds`, `filter_threshold`, `dataset_size`, `density_cache_file` |
 | `paths` | `file_dir`, `model_path`, `save_freq`, `load_model` |
@@ -172,7 +172,7 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 
 | 文件 | 说明 |
 |------|------|
-| `base.yaml` | 6 个共享分组（`training`/`agent`/`dynamics`/`world`/`diag`/`metrics`） |
+| `base.yaml` | 7 个共享分组（`training`/`agent`/`dynamics`/`world`/`diag`/`viz`/`metrics`） |
 | `train.yaml` | `_base: base.yaml` + `env`(epochs=600) + `paths`(load_model=true) + `viz`(gif=false) |
 | `eval.yaml` | `_base: base.yaml` + `env`(epochs=1, num_worlds=10) + `paths` + `viz`(gif=true) |
 
@@ -232,15 +232,15 @@ LK:  车道保持（|lat| / road_width）
 - `pdms_plots/pdms_bar_epoch*.png` — 每个 world 的 Driving Score 柱状图
 - Rollout PDMS：step 0 推演 Horizon 步的预测得分
 
-## State 布局（59 维）
+## State 布局（62 维）
 
 | 区间 | 维度 | 内容 |
 |------|------|------|
 | [0:6] | 6 | 自车: x, y, v_lon, v_lat, phi, omega |
 | [6:38] | 32 | 周车: 8 车 × (x, y, phi, v) |
 | [38:46] | 8 | validity mask |
-| [46:58] | 12 | ref_error: dp/dphi/dv + 3×(lat+dphi+road_dist) @ t+3/6/9 |
-| [58:59] | 1 | temporal index |
+| [46:61] | 15 | ref_error: dp/dphi/dv + 3×(lat+dphi+road+spd) @ t+5/10/15 |
+| [61:62] | 1 | temporal index |
 
 ## 文件结构
 
@@ -296,11 +296,11 @@ LK:  车道保持（|lat| / road_width）
 15. **到达终点的世界误标 bad**：`reachedGoal/done` 后 GPUDrive 重置 ego 为 sentinel → filter 误杀 → 引入 `reached_worlds` 集合，用 `done_tensor` 区分正常终点 vs 真实崩溃
 16. **PDMS route completion 低估**：分母用固定 91 步 → 35 步短轨迹完美完成只得 38% → 改为按各世界实际路径长度计算
 17. **Resample 间隔过宽**：50 epoch 才换世界 → 400 epoch 仅见 1500 场景 → 改为 3 epoch 覆盖 20,000+ 场景
-18. **弯道追踪差 — 前瞻步子太短**：t+9=0.9s 不够 20m/s 刹车 → 改为 t+5/10/15、speed_err_weight 0.3、acc_cost 0.01
+18. **弯道追踪差 — 前瞻 + 速度 + 转向多轮调优**：t+3→t+5/10/15、speed_err_weight 调整、steer_cost 平衡（最终 0.03→0.06）、Actor 输出移除 tanh 改线性 clamp；bias[1]=1.2 设加速度起点
 19. **训练速度优化**：tensor 复用 + good_worlds 缓存 + f_pred_batch cat + 循环合并 → ~20% 提速
 20. **网络容量 + 余弦退火 LR**：2层→3层 (512→512→256)，CosineAnnealingLR 从 1e-4 衰减到 1e-6
 21. **Road width 异常 clamp**：某些世界 segment_width >15m → 候选路径飞出道路 → clamp 上限 15m
-22. **Actor tanh 饱和 → 线性 + acc bias**：tanh 输出永久±1.0 → 移除 tanh、steer 线性 clamp、acc bias[1]=1.2 解低速恶性循环
+22. **Steer bang-bang 饱和 97%**：多轮参数调优无效 → 新增 BC loss，从 expert heading/pos 差分计算近似 steer：`atan(5.0 × Δh / Δs)`；仅训练时生效
 
 ## 引用
 

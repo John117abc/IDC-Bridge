@@ -150,7 +150,7 @@ class DiscreteIDCAgent:
             if self.global_step % 10 == 0:
                 n_show = min(20, batch_size)
                 for i in range(n_show):
-                    logger.info(f'[DIAG-act] world_{i} acc={action[i,0,0].item():.3f} '
+                    logger.debug(f'[DIAG-act] world_{i} acc={action[i,0,0].item():.3f} '
                                 f'steer={action[i,0,1].item():.3f}')
             return action
 
@@ -376,6 +376,22 @@ class DiscreteIDCAgent:
 
         actor_loss = total_cost.mean()
         has_violation = max_penalty > 0.5
+
+        bc_weight = getattr(self.config, 'bc_weight', 0.0)
+        if bc_weight > 0:
+            temp_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR
+            temporal_idx = states[:, temp_start:temp_start + self.DIM_TEMPORAL].squeeze(-1).long()
+            expert_steer = self.state_builder.get_expert_steer_batch(
+                w_i, temporal_idx, self.ego_indices)
+            raw_init = self.actor(states)
+            actor_steer = torch.clamp(raw_init[:, 0] * 0.3, -0.6, 0.6)
+            bc_loss = ((actor_steer - expert_steer.to(actor_steer.device)) ** 2).mean()
+            actor_loss = actor_loss + bc_weight * bc_loss
+            if self.global_step % 50 == 0:
+                logger.info(f'[DIAG-bc] bc_loss={bc_loss.item():.4f} weight={bc_weight} '
+                            f'expert_mean={expert_steer.mean().item():.3f}')
+        else:
+            bc_loss = None
 
         # 衰减探索噪声（所有模式统一衰减）
         old_std = self.noise_std

@@ -49,7 +49,7 @@ def _diag_init_step(config, agent, builder, ego_indices, episode_path_indices,
         pos_err = np.hypot(ego[0] - ref[0], ego[1] - ref[1])
         heading_err = ego[4] - ref[4]
         speed_err = np.hypot(ego[2], ego[3]) - ref[2]
-        logger.info(
+        logger.debug(
             f'[DIAG-init] world_{i} speed={init_speed:.2f} acc={acc:.3f} steer={steer:.3f} '
             f'raw_steer={rsteer:.3f} raw_acc={racc:.3f} ref_spd={ref_spd0:.2f} '
             f'pos_err={pos_err:.2f} heading_err={heading_err:.3f} speed_err={speed_err:.2f}'

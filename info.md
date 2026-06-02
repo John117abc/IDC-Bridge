@@ -1633,16 +1633,71 @@ ego 在 20 m/s 下 0.25 rad 转向足以过弯 → 网络自然学会不需要 m
 
 ---
 
-## 69. steer_cost_weight 平衡调整
+## 69. steer_cost_weight + Actor 输出线性化
 
 **日期**：2026-06-01
 
-**背景**：随 steer_cost 从 0.3→0.03→0.06 逐步调优。最终 0.06 搭配线性 steer 和 acc bias=1.2 达到最优平衡。
+**背景**：多轮调优发现 steer 行为主要由两项主导——steer_cost 权重和输出层激活函数。最终方案：
+- `steer_cost_weight: 0.06`（平衡 0.3→0.03→0.06 迭代确定）
+- Actor 移除 tanh，改为 `clamp(raw*0.3, -0.6, 0.6)` 线性输出（配合 BC loss）
+- `bias[1]=1.2` 加速起点
 
 | 阶段 | steer_cost | 效果 |
 |------|-----------|------|
-| 初始 | 0.3 | 转向被压制，Actor 不转 |
-| 降 | 0.03 | tanh 饱和，0.6 rad 成本极低 → max steer |
-| 最终 | **0.06** | 线性 steer + 0.06 cost → 0.3rad steer 成本 0.005/步 |
+| 初始 | 0.3 | 转向被压制 |
+| 降 | 0.03 | 全量转向，饱和 |
+| 最终 | 0.06 | 配合 BC loss 达到平衡 |
 
-**涉及文件**：`base.yaml`
+**涉及文件**：`base.yaml`、`continuous_actor_critic.py`、`idc_agent.py`
+
+---
+
+## 70. Steer bang-bang 饱和 — 最终由 BC loss 解决
+
+**日期**：2026-06-01 → 最终修：2026-06-02
+
+**症状**：多轮参数调优后，DIAG-act 统计始终 97% 的 steer 在 ±0.6 rad。PDMS ~55 不上升。
+
+**尝试历程**：steer_cost 降 30×、tanh 移除、bias 调整、高噪声探索——均无效。RL 探索机制无法逃离"max steer = 最优"的局部最低点。
+
+**最终修复**：Issue 71/72 的 BC loss（`atan(L × Δh/Δs)` 计算 expert steer）打破饱和——epoch 280 时 steer 分布已全部转为 0.02-0.34 中间值。
+
+**涉及文件**：`idc_state_builder.py`、`idc_agent.py`、`base.yaml`
+
+---
+
+## 71. 专家行为克隆 BC loss（方案 B）
+
+**日期**：2026-06-02
+
+**目标**：用 Waymo expert 轨迹中的转向信息作为监督信号，打破 bang-bang steer 饱和。
+
+**实现**：
+
+| 文件 | 改动 |
+|------|------|
+| `idc_state_builder.py` | `get_expert_steer_batch()`：从 expert heading/pos 差分计算近似 steer：`δ = atan(L × Δh / Δs)`，L=5.0 |
+| `idc_agent.py:update_actor` | BC loss: `MSE(clamp(raw[0]*0.3,-0.6,0.6), expert_steer) × bc_weight` |
+| `base.yaml` | `bc_weight: 0.1`、`noise_std: 0.1`、`noise_decay_rate: 0.95` |
+
+BC 仅训练时生效——GEP rollout 仍是主 loss，BC 是辅助梯度信号。推理/评估时不需要 expert 数据。
+
+**效果**（epoch 280）：steer 分布从 97% ±0.600 转为全部 0.02-0.34 中间值，bang-bang 饱和彻底打破。PDMS 从 ~50 开始回升。
+
+**涉及文件**：`idc_state_builder.py`、`idc_agent.py`、`base.yaml`
+
+---
+
+## 72. BC 初始方案失败 — expert_actions 全为零
+
+**日期**：2026-06-02
+
+**症状**：BC loss 的 `expert_mean` 持续为 0。DIAG-bc 打印 `expert_mean=0.000` 全部 15 条。1000 epoch 后 steer 分布不变。
+
+**根因**：`expert_trajectory_tensor()` 的 `6*T:16*T` 区间（预留给 expert actions）在 GPUDrive 中全部为 0——C++ 端预留了槽位但未填充真实数据。BC 从未学到非零的 expert steer。
+
+**诊断**：打印 3 个 world×2 agent×3 step 的所有 10 个 action 索引，全部为 0.000。
+
+**修复**：改用 `atan(L × Δheading / Δs)` 从已有 expert heading/pos 数据计算近似 steer。
+
+**涉及文件**：`idc_state_builder.py`
