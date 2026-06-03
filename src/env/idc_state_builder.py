@@ -87,27 +87,43 @@ class GPUDriveObservationBuilder:
                 self.expert_heading[w, a, :, :] = torch.from_numpy(expert_h_w.reshape(-1, 1))
                 logger.debug(f'[TRUNCATE] world_{w} agent_{a} expert truncated at step {valid_len}/{num_points}')
 
+            # 先生成中心路径，计算 road_dist 用于约束偏移路径
+            center_pos = expert_pos_w.copy()
+            center_path = {
+                'pos': center_pos.astype(np.float32),
+                'heading': expert_h_w.astype(np.float32),
+                'speed': self._curvature_speed(center_pos),
+            }
+            center_road_dist = np.zeros(num_points, dtype=np.float32)
+            for j in range(num_points):
+                center_road_dist[j] = self._road_dist_point(
+                    world_road, float(center_pos[j, 0]), float(center_pos[j, 1]))
+            center_path['road_dist'] = center_road_dist
+            paths.append(center_path)
+
+            # 偏移路径：用中心路径的 road_dist 约束偏移量，不超出路面
             for offset in offsets:
                 if abs(offset) < 1e-6:
-                    pos = expert_pos_w.copy()
-                else:
-                    pos = np.zeros((num_points, 2), dtype=np.float32)
-                    blend_start = int(num_points * 0.9)
-                    for j in range(num_points):
-                        eff_offset = offset
-                        if j >= blend_start:
-                            blend = (j - blend_start + 1) / max(1, num_points - blend_start)
-                            eff_offset = offset * (1.0 - blend)
-                        h = float(expert_h_w[j])
-                        lx = -math.sin(h)
-                        ly = math.cos(h)
-                        pos[j, 0] = float(expert_pos_w[j, 0]) + eff_offset * lx
-                        pos[j, 1] = float(expert_pos_w[j, 1]) + eff_offset * ly
+                    continue
+                pos = np.zeros((num_points, 2), dtype=np.float32)
+                blend_start = int(num_points * 0.9)
+                sign = 1.0 if offset > 0 else -1.0
+                for j in range(num_points):
+                    eff_offset = offset
+                    if j >= blend_start:
+                        blend = (j - blend_start + 1) / max(1, num_points - blend_start)
+                        eff_offset = offset * (1.0 - blend)
+                    safe_max = max(1.0, center_road_dist[j] * 0.8)
+                    eff_offset = sign * min(abs(eff_offset), safe_max)
+                    h = float(expert_h_w[j])
+                    lx = -math.sin(h); ly = math.cos(h)
+                    pos[j, 0] = float(expert_pos_w[j, 0]) + eff_offset * lx
+                    pos[j, 1] = float(expert_pos_w[j, 1]) + eff_offset * ly
 
                 path = {
                     'pos': pos.astype(np.float32),
                     'heading': expert_h_w.astype(np.float32),
-                    'speed': self._curvature_speed(pos),
+                    'speed': center_path['speed'],
                 }
                 road_dists = np.zeros(num_points, dtype=np.float32)
                 for j in range(num_points):
@@ -165,18 +181,16 @@ class GPUDriveObservationBuilder:
         """从路径位置的数值曲率计算曲率限速 [num_points]"""
         n = len(pos)
         speeds = np.full(n, v_max, dtype=np.float32)
-        for i in range(1, n - 1):
-            dx1 = pos[i, 0] - pos[i-1, 0]
-            dy1 = pos[i, 1] - pos[i-1, 1]
-            dx2 = pos[i+1, 0] - pos[i, 0]
-            dy2 = pos[i+1, 1] - pos[i, 1]
-            ds1 = float(np.hypot(dx1, dy1)) + 1e-6
-            ds2 = float(np.hypot(dx2, dy2)) + 1e-6
-            kappa = abs(np.arctan2(dy2, dx2) - np.arctan2(dy1, dx1)) / ((ds1 + ds2) / 2.0)
+        for i in range(2, n - 2):
+            dx01 = pos[i, 0] - pos[i-2, 0]; dy01 = pos[i, 1] - pos[i-2, 1]
+            dx12 = pos[i+2, 0] - pos[i, 0]; dy12 = pos[i+2, 1] - pos[i, 1]
+            ds01 = float(np.hypot(dx01, dy01)) + 1e-6
+            ds12 = float(np.hypot(dx12, dy12)) + 1e-6
+            kappa = abs(np.arctan2(dy12, dx12) - np.arctan2(dy01, dx01)) / ((ds01 + ds12) / 2.0)
             speeds[i] = float(np.sqrt(a_lat_max / (kappa + 1e-6)))
         speeds = np.minimum(speeds, v_max)
-        speeds[0] = speeds[1]
-        speeds[-1] = speeds[-2]
+        speeds[0] = speeds[2]; speeds[1] = speeds[2]
+        speeds[-1] = speeds[-3]; speeds[-2] = speeds[-3]
         return speeds
 
     def _setup_expert_data(self):
@@ -207,6 +221,12 @@ class GPUDriveObservationBuilder:
             L = 5.0  # wheelbase
             steers.append(math.atan(L * dh / ds))
         return torch.tensor(steers, dtype=torch.float32)
+
+    def get_expert_speed_batch(self, world_indices, temporal_indices, ego_indices_map, path_indices, device):
+        t_tensor = temporal_indices.long().clamp(0, self.ref_tensor.shape[3] - 1).to(device)
+        w_tensor = torch.tensor(list(world_indices), device=device, dtype=torch.long)
+        p_tensor = torch.tensor(list(path_indices), device=device, dtype=torch.long)
+        return self.ref_tensor[w_tensor, 0, p_tensor, t_tensor, 2]
 
     def clear_cache(self):
         """每集开始时调用，使道路缓存失效。"""
@@ -523,7 +543,7 @@ class GPUDriveObservationBuilder:
         mask = road_tensor_world[:, 6] == 1  # TYPE_IDX=6, ROADLINE_TYPE=1
         line_pts = road_tensor_world[mask]
         if len(line_pts) == 0:
-            return 999.0
+            return 10.0  # 无 RoadLine 数据时的合理 fallback（~典型道路半宽）
         dx = line_pts[:, 0] - qx
         dy = line_pts[:, 1] - qy
         nearest = int(np.argmin(dx * dx + dy * dy))

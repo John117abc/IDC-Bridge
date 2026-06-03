@@ -40,7 +40,7 @@ class TransformerActor(nn.Module):
         self.transformer = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers)
         self.head = nn.Linear(d_model, 2)
-        nn.init.constant_(self.head.bias[0], 0.0)
+        nn.init.constant_(self.head.bias[0], 0.05)   # steer slight positive → break zero-steer local min
         nn.init.constant_(self.head.bias[1], 1.2)
 
     def forward(self, x):

@@ -264,16 +264,25 @@ def train(config):
         agent.history_loss.append(epoch_history.copy())
 
         # PDMS epoch logging (仅 surviving worlds，排除坐标系异常的 crash 场景)
-        pdms_scores = [scorers[w].compute()
-                       for w in range(config.num_worlds)
-                       if w not in wm.bad_worlds and scorers[w].steps > 0]
+        pdms_scores, pdms_worlds = [], []
+        for w in range(config.num_worlds):
+            if w not in wm.bad_worlds and scorers[w].steps > 0:
+                pdms_scores.append(scorers[w].compute())
+                pdms_worlds.append(w)
         if pdms_scores:
             avg_score = np.mean([ps['driving_score'] for ps in pdms_scores])
             avg_comp = np.mean([ps['route_completion'] for ps in pdms_scores])
             total_coll = sum(ps['counts']['collision_steps'] for ps in pdms_scores)
             total_off = sum(ps['counts']['off_road_steps'] for ps in pdms_scores)
+            path_0_avg = np.mean([ps['driving_score'] for i, ps in enumerate(pdms_scores)
+                                   if episode_path_indices[pdms_worlds[i]] == 0] or [0])
+            path_1_avg = np.mean([ps['driving_score'] for i, ps in enumerate(pdms_scores)
+                                   if episode_path_indices[pdms_worlds[i]] == 1] or [0])
+            path_2_avg = np.mean([ps['driving_score'] for i, ps in enumerate(pdms_scores)
+                                   if episode_path_indices[pdms_worlds[i]] == 2] or [0])
             logger.info(f'[PDMS] score={avg_score:.1f} completion={avg_comp:.1%} '
                         f'collisions={total_coll} off_road={total_off} '
+                        f'p0={path_0_avg:.0f} p1={path_1_avg:.0f} p2={path_2_avg:.0f} '
                         f'(surviving: {len(pdms_scores)}/{config.num_worlds})')
             agent.epoch_history_pdms.append(pdms_scores)
 

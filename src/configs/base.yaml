@@ -34,7 +34,9 @@ agent:
   noise_std: 0.1                  # select_action 探索噪声标准差（高斯加到 raw_output）
   noise_decay_rate: 0.95          # 每次 PIM 后噪声衰减倍率：σ ← max(σ×0.95, noise_std_min)
   noise_std_min: 0.03             # 噪声下限——保证后期仍有少量探索
-  bc_weight: 0.1                  # BC loss（行为克隆）在 actor loss 中的权重
+  bc_weight: 0.1                  # 转向 BC loss 在 actor loss 中的权重
+  bc_speed_weight: 0.002          # 速度 BC loss fine-tune（从 baseline checkpoint 续训启用）
+  progress_weight: 0.02           # 沿路径前进奖励（utility 负项：前进越多 cost 越低）
   init_penalty: 0.01              # ρ 初始值 + 无违规时的 EMA 锚点
   max_penalty: 3.0                # ρ 上限，防止 penalty 完全淹没 utility
   amplifier_c: 0.002              # 已弃用（EMA 方案不再依赖此参数），保留兼容
