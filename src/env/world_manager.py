@@ -206,7 +206,7 @@ class WorldManager:
 
         self.builder._setup_expert_data()
         self.builder.clear_cache()
-        self.builder.generate_candidate_paths(new_ego, num_paths=3)
+        self.builder.generate_candidate_paths(new_ego, num_paths=1)
 
         self.bad_worlds.clear()
         self.reached_worlds.clear()

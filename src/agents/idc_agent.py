@@ -33,7 +33,7 @@ class DiscreteIDCAgent:
         self.DIM_EGO = 6
         self.DIM_OTHERS = 32
         self.DIM_VALIDITY = 8
-        self.DIM_REF_ERROR = 15           # [dp, dphi, dv, lat+dphi+road+spd ×3 at t+5/10/15]
+        self.DIM_REF_ERROR = 18           # [dp, dphi, dv, lat+dphi+road+spd ×3(t+5/10/15) + curvahead+spdahead+rdahead]
         self.DIM_TEMPORAL = 1
         self.TOTAL_STATE_DIM = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR + self.DIM_TEMPORAL
         self.DIM_ROAD = 80
@@ -83,7 +83,6 @@ class DiscreteIDCAgent:
         self.acc_cost_weight = config.acc_cost_weight
         self.lookahead_pos_weight = config.lookahead_pos_weight
         self.lookahead_heading_weight = config.lookahead_heading_weight
-        self.progress_weight = getattr(config, 'progress_weight', 0.0)
 
         # GEP 惩罚
         self.rho = config.init_penalty
@@ -162,8 +161,8 @@ class DiscreteIDCAgent:
                                      device=raw_output.device)
                 raw_output = raw_output + noise
 
-            # 转向：线性映射 + clamp → [-0.8, 0.8] rad (覆盖 Waymo 急弯)
-            delta_phy = torch.clamp(raw_output[..., 0] * 0.4, -0.8, 0.8)
+            # 转向：线性映射 + clamp → [-0.6, 0.6] rad
+            delta_phy = torch.clamp(raw_output[..., 0] * 0.3, -0.6, 0.6)
 
             # 加速度：tanh → 非对称映射 → [-3.0, 1.5] m/s²
             acc_norm = torch.tanh(raw_output[..., 1])
@@ -223,22 +222,6 @@ class DiscreteIDCAgent:
                         f'target raw mean={tu.mean().item():.2f} min={tu.min().item():.2f} max={tu.max().item():.2f}')
         return total_utility
 
-    def batch_state_to_tensor(self, states):
-        logger.debug(f'将状态对象列表转换为张量表示: batch_size={len(states)},第一个状态={states[0] if len(states) > 0 else "N/A"}')
-        # 一次性将所有状态转为张量
-        states_tensors = [torch.from_numpy(s) for s in states]   # list of [TOTAL_STATE_DIM]
-        
-        ego_tensors = torch.stack([s[:self.DIM_EGO] for s in states_tensors]).to(self.device)  # [batch, DIM_EGO]
-        others_tensors = torch.stack([s[self.DIM_EGO:self.DIM_EGO+self.DIM_OTHERS] for s in states_tensors]).to(self.device)
-        validity_tensors = torch.stack([s[self.DIM_EGO+self.DIM_OTHERS:self.DIM_EGO+self.DIM_OTHERS+self.DIM_VALIDITY] for s in states_tensors]).to(self.device)
-        ref_error_tensors = torch.stack([s[self.DIM_EGO+self.DIM_OTHERS+self.DIM_VALIDITY:self.DIM_EGO+self.DIM_OTHERS+self.DIM_VALIDITY+self.DIM_REF_ERROR] for s in states_tensors]).to(self.device)
-        temporal_tensors = torch.stack([s[self.DIM_EGO+self.DIM_OTHERS+self.DIM_VALIDITY+self.DIM_REF_ERROR:
-                                          self.DIM_EGO+self.DIM_OTHERS+self.DIM_VALIDITY+self.DIM_REF_ERROR+self.DIM_TEMPORAL] for s in states_tensors]).to(self.device)
-        
-        others_flat = others_tensors.view(len(states), -1)
-        state_tensor = torch.cat([ego_tensors, others_flat, validity_tensors, ref_error_tensors, temporal_tensors], dim=-1)
-        return state_tensor
-    
     def f_pred_batch(self, states, actions, w_i, p_i=None):
         """
         states: tensor [batch, TOTAL_STATE_DIM]
@@ -257,7 +240,7 @@ class DiscreteIDCAgent:
         temporal_next = (temporal_idx + 1).long()
         
         # 1. 动力学推演（将Actor原始输出映射为物理量，与select_action保持一致）
-        delta_phy = torch.clamp(actions[..., 0] * 0.4, -0.8, 0.8)
+        delta_phy = torch.clamp(actions[..., 0] * 0.3, -0.6, 0.6)
         acc_norm = torch.tanh(actions[..., 1])
         a_phy = torch.where(acc_norm >= 0,
                             acc_norm * 1.5,
@@ -265,6 +248,10 @@ class DiscreteIDCAgent:
         actions_phy = torch.stack([a_phy, delta_phy], dim=-1)  # [acc, steer]
         ego_next = self.dynamics(ego_tensors[...,:6], actions_phy)
         x_raw, y_raw, theta_next, v_next = ego_next[:, 0], ego_next[:, 1], ego_next[:, 2], ego_next[:, 3]
+
+        # 构建 world_t, path_t 用于 ref_tensor 直接索引
+        wt = torch.tensor(list(w_i), device=x_raw.device, dtype=torch.long)
+        pt = torch.tensor(list(p_i), device=x_raw.device, dtype=torch.long) if p_i is not None else torch.zeros_like(wt)
 
         # 2. 参考点查询（用时序索引替代空间最近点，消除跳变）
         refs = self.state_builder.get_ref_states_batch(
@@ -338,10 +325,16 @@ class DiscreteIDCAgent:
         road_l3 = self.state_builder.get_road_dist_batch(w_i, tl3, self.ego_indices, p_i, x_next.device)
         spd_l3 = refs_l3[:, 2]
 
+        # 指数衰减前视特征（从 ref_tensor 直接读取）
+        curv_ahead = self.state_builder.ref_tensor[wt, 0, pt, temporal_next, 5]
+        spd_ahead = self.state_builder.ref_tensor[wt, 0, pt, temporal_next, 6]
+        road_ahead = self.state_builder.ref_tensor[wt, 0, pt, temporal_next, 7]
+
         ref_error_tensors = torch.stack([delta_p, delta_phi, delta_v,
                                           lat_l1, dphi_l1, road_l1, spd_l1,
                                           lat_l2, dphi_l2, road_l2, spd_l2,
-                                          lat_l3, dphi_l3, road_l3, spd_l3], dim=-1)
+                                          lat_l3, dphi_l3, road_l3, spd_l3,
+                                          curv_ahead, spd_ahead, road_ahead], dim=-1)
         
         # 组合并返回最终状态
         return torch.cat([ego_next_formatted, others_next.view(len(states), -1),
@@ -385,10 +378,6 @@ class DiscreteIDCAgent:
         s_window = windows
         ref_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
         max_penalty = 0.0
-        bc_spd_w = getattr(self.config, 'bc_speed_weight', 0.0)
-        temp_spd = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR
-        temporal_idx = windows[:, -1, temp_spd:temp_spd + self.DIM_TEMPORAL].squeeze(-1).long()
-        speed_bc_total = 0.0
         for t in range(self.horizon):
             u = self.actor(s_window)
             s_next = self.f_pred_batch(s_window[:, -1, :], u, w_i, p_i)
@@ -406,36 +395,26 @@ class DiscreteIDCAgent:
                 logger.debug(f'[DIAG-pen] raw penalty min={p.min().item():.2f} max={p.max().item():.2f} '
                             f'mean={p.mean().item():.2f}  (rho={self.rho:.4f})')
             total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
-            if bc_spd_w > 0:
-                cur_t = torch.clamp(temporal_idx + t + 1, max=90)
-                ref_spd = self.state_builder.get_expert_speed_batch(
-                    w_i, cur_t, self.ego_indices, p_i, s_next.device)
-                ego_spd = torch.hypot(s_next[:, 2], s_next[:, 3])
-                speed_bc_total += ((ego_spd - ref_spd) ** 2).mean()
             s_window = torch.cat([s_window[:, 1:, :], s_next.unsqueeze(1)], dim=1)
 
         actor_loss = total_cost.mean()
         has_violation = max_penalty > 0.5
 
         bc_weight = getattr(self.config, 'bc_weight', 0.0)
-        bc_log_spd = speed_bc_total
         if bc_weight > 0:
             temp_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR
             temporal_idx = windows[:, -1, temp_start:temp_start + self.DIM_TEMPORAL].squeeze(-1).long()
             expert_steer = self.state_builder.get_expert_steer_batch(
                 w_i, temporal_idx, self.ego_indices)
             raw_init = self.actor(windows)
-            actor_steer = torch.clamp(raw_init[:, 0] * 0.4, -0.8, 0.8)
+            actor_steer = torch.clamp(raw_init[:, 0] * 0.3, -0.6, 0.6)
             bc_loss = ((actor_steer - expert_steer.to(actor_steer.device)) ** 2).mean()
             actor_loss = actor_loss + bc_weight * bc_loss
             if self.global_step % 50 == 0:
-                logger.info(f'[DIAG-bc] steer_loss={bc_loss.item():.4f} speed_loss={bc_log_spd:.4f} '
+                logger.info(f'[DIAG-bc] bc_loss={bc_loss.item():.4f} weight={bc_weight} '
                             f'expert_mean={expert_steer.mean().item():.3f}')
         else:
             bc_loss = None
-
-        if bc_spd_w > 0:
-            actor_loss = actor_loss + bc_spd_w * speed_bc_total
 
         # 衰减探索噪声（所有模式统一衰减）
         old_std = self.noise_std
@@ -502,11 +481,6 @@ class DiscreteIDCAgent:
              + self.acc_cost_weight * acc_cost
              + self.lookahead_pos_weight * (s[:, ref_start + 3] ** 2 + s[:, ref_start + 7] ** 2 + s[:, ref_start + 11] ** 2)
              + self.lookahead_heading_weight * (s[:, ref_start + 4] ** 2 + s[:, ref_start + 8] ** 2 + s[:, ref_start + 12] ** 2))
-
-        if self.progress_weight > 0:
-            speed_along_path = ego[:, 2] * torch.cos(s[:, ref_start + 1])  # v_lon along ref direction
-            progress = torch.clamp(speed_along_path, min=0.0) * self.dt
-            l = l - self.progress_weight * progress
 
         # 诊断：每次调用自动抓 pos_err 最大的样本
         max_idx = pos_err.argmax().item()

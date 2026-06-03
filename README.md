@@ -1,8 +1,6 @@
 # IDC-Bridge
 
-把"集成决策与控制"（IDC, Integrated Decision and Control）论文的算法跑在 Waymo 开放数据集 + GPUDrive 模拟器上。
-
-使用单线程训练循环跑 200 条道路场景同时仿真的在线强化学习。
+把"集成决策与控制"（IDC, Integrated Decision and Control）论文的算法跑在 Waymo 开放数据集 + GPUDrive 模拟器上。使用单线程训练循环跑 100 条道路场景同时仿真的在线强化学习。
 
 ## 算法简介
 
@@ -11,28 +9,27 @@ IDC 的核心思想是**一边开一边学**：
 - **PEV（策略评估）**：Critic 网络评估当前 state 的价值，每步更新。
 - **PIM（策略改进）**：每隔 N 步，Actor 通过可微运动学模型推演未来 H 步轨迹，计算跟踪误差 + 碰撞风险的总成本，反向传播改进策略。每次改进放大惩罚系数 ρ。
 
-Actor 为 **TransformerEncoder**（16 步滑窗 + 4 头自注意力），Critic 保持独立 MLP。动作空间为加速度和方向盘转角。
+Actor 为 **TransformerEncoder**（16 步滑窗 + 4 头自注意力），Critic 保持独立 MLP。动作空间为加速度（[-3,1.5] m/s²）和方向盘转角（[-0.6,0.6] rad）。参考路径为 expert 中心轨迹 + 曲率限速，单路径训练。
 
 ## 和原论文的差异
 
 1. **网络结构**：Actor 为 TransformerEncoder（16 步 × 4 头自注意力滑窗），Critic 为独立 MLP（原论文共享 latent embed）
 2. **训练架构**：单线程主循环替代 30 个异步 learner
 3. **环境**：Nocturne → GPUDrive（Waymo 数据）
-4. **候选参考路径**：3 条 expert pos + 曲率限速路径（左/中/右 lateral offset），每 episode 固定选一条。道路宽度从 GPUDrive 动态读取
+4. **参考路径**：expert 中心轨迹 + 曲率限速（单路径，无 lateral offset；Waymo 无私车道级地图，无法生成多条可行驶路径）
 5. **碰撞模型**：前后双圆模型替代单圆
-6. **状态空间**：62 维，含当前误差 + 3 个前瞻点（t+5/t+10/t+15）的横向/航向/道路边界/参考速度预览
+6. **状态空间**：65 维，含当前误差 + 3 个近前视点（t+5/10/15）+ 3 个指数衰减远前视特征（曲率预期/速度预期/道路宽度预期）
 7. **性能优化**：批量 tensor 操作 + GPU `ref_tensor` 预索引，消除 rollout 中的 Python 循环瓶颈
-8. **EMA rho 调节**：ρ 通过指数移动平均跟踪近期违规严重度（非累加器），违规多→快速响应上升，违规少→缓慢遗忘回落，自然均衡无需分阶段训练
-9. **YAML 层级配置**：`base.yaml`（共享）→ `train.yaml`/`eval.yaml` 继承覆盖，CLI 仅需指定差异项
-10. **条件 penalty 放大**：仅在 rollout 中检测到碰撞/越界违规时才放大 ρ，防止噪声梯度污染
-11. **密度范围筛选**：离线扫描 Waymo 场景周车密度，训练/评估可按密度区间 `[min, max]` 选择世界
-12. **道路 penalty 路径化**：`relu(D_road_safe - ego_road_dist)` 替代 edge-based → 只在跨出路外触发
-13. **权重重平衡**：`pos_err_weight=0.03`（原 0.3），heading 与 position 信号量级匹配
-14. **Checkpoint 续训时自动覆盖 optimizer lr**：加载后 `lr_critic`/`lr_actor` 从 config 更新
-15. **PDMS 评估**：CARLA 风格评分（NC×DAC×DDC × weighted avg），训练每 epoch log + 评估雷达图/柱状图/终端表
-16. **Transformer 滑窗 Actor**：16 帧 × 4 头自注意力替代 MLP，训练/推理分布一致，解决 MLP 逐帧盲推的转向平滑问题
-17. **PER Buffer 窗口化**：每个经验存储完整 16 步窗口，SumTree 索引化，~760 MB 额外 CPU 内存
-18. **GEP rho EMA 替代累加器**：rho 通过指数移动平均跟踪违规严重度，早期不爆炸、后期不闷死，自然均衡
+8. **EMA rho 调节**：ρ 通过指数移动平均跟踪近期违规严重度（非累加器），违规多→快速响应上升，违规少→缓慢遗忘回落
+9. **YAML 层级配置**：`base.yaml`（共享）→ `train.yaml`/`eval.yaml` 继承覆盖
+10. **密度范围筛选**：离线扫描 Waymo 场景周车密度
+11. **道路 penalty 路径化**：`relu(D_road_safe - ego_road_dist)` 替代 edge-based
+12. **权重重平衡**：`pos_err_weight=0.03`，heading 与 position 信号量级匹配
+13. **PDMS 评估**：CARLA 风格评分（NC×DAC×DDC × weighted avg）
+14. **Transformer 滑窗 Actor**：16 帧 × 4 头自注意力替代 MLP，训练/推理分布一致
+15. **PER Buffer 窗口化**：每个经验存储完整 16 步窗口，~250 MB CPU 内存（单路径后）
+16. **GEP rho EMA**：rho 通过 EMA 跟踪违规度，自然均衡
+17. **指数衰减前视聚合**：全部未来 90 步的加权平均曲率/速度/道路特征，补足近前视的缺口
 
 ## 快速开始
 
@@ -228,15 +225,15 @@ LK:  车道保持（|lat| / road_width）
 - `pdms_plots/pdms_bar_epoch*.png` — 每个 world 的 Driving Score 柱状图
 - Rollout PDMS：step 0 推演 Horizon 步的预测得分
 
-## State 布局（62 维）
+## State 布局（65 维）
 
 | 区间 | 维度 | 内容 |
 |------|------|------|
 | [0:6] | 6 | 自车: x, y, v_lon, v_lat, phi, omega |
 | [6:38] | 32 | 周车: 8 车 × (x, y, phi, v) |
 | [38:46] | 8 | validity mask |
-| [46:61] | 15 | ref_error: dp/dphi/dv + 3×(lat+dphi+road+spd) @ t+5/10/15 |
-| [61:62] | 1 | temporal index |
+| [46:64] | 18 | ref_error: dp/dphi/dv + 3×(lat+dphi+road+spd) @ t+5/10/15 + curv_ahead/spd_ahead/road_ahead |
+| [64:65] | 1 | temporal index |
 
 ## 文件结构
 
@@ -275,33 +272,14 @@ LK:  车道保持（|lat| / road_width）
 
 完整记录见 `info.md`。关键坑：
 
-1. **动作维度写反**：环境要 `[acc, steer, 0]`，rollout 中通道颠倒 → 车持续画圆
-2. **f_pred_batch 参考点 off-by-one**：动力学推进一步后参考点查询仍用旧索引 → heading error 180° 反向，400+ epoch 不收敛
-3. **delta_phi 是 bearing error 不是 heading error**：`atan2(dy,dx)-ego` 应改为 `ref_h - ego_h`
-4. **Wheelbase 硬编码 4.0m vs 真实车长 5.0m**：模型高估转弯能力 25%
-5. **sqrt 梯度 NaN**：距离=0 时 `1/sqrt(0)=inf` → NaN 级联污染网络
-6. **幽灵车**：GPUDrive 填零车被当真实车 → 虚假 penalty
-7. **每步随机换候选路径**：参考点侧向跳动 7.5m → 追踪信号污染
-8. **tracking_only 噪声不衰减**：σ=0.1 永不降 → 策略永远模糊
-9. **道路 penalty 公式反向**：`F.relu(edge_dist - D_road_safe)` 惩罚路中心（远离边线），奖励靠路边（贴近边线）→ penalty 把自车推向路边，与 tracking 冲突
-10. **heading 权重被 position 淹没 250:1**：`pos_err²×0.3=750` vs `heading_err²×0.3=3` → Actor 忽略朝向，无法学纠正偏离
-11. **Checkpoint 续训 optimizer lr 被覆盖**：`load_checkpoint` 恢复旧 lr，config 中的新 lr 被忽略 → 需手动覆写 `param_groups['lr']`
-12. **GIF fps 与录制间隔混淆**：`gif_fps` 同时控制录制频率和播放速度 → 解耦为 `gif_fps`（播放）和 `gif_record_interval`（录制间隔）
-13. **Rho 乘性膨胀**：`rho *= 1.005` 每 30 步无条件膨胀 → 必然到 cap → penalty 压倒 tracking → 改为线性 `rho += 0.01`，仅违规时增
-14. **Expert 轨迹含 sentinel 坐标**：短轨迹世界 step 58-90 为 `(-11000,-11000)` → 参考点 sentinel 拉偏自车 → `generate_candidate_paths` 自动检测并裁剪填充
-15. **到达终点的世界误标 bad**：`reachedGoal/done` 后 GPUDrive 重置 ego 为 sentinel → filter 误杀 → 引入 `reached_worlds` 集合，用 `done_tensor` 区分正常终点 vs 真实崩溃
-16. **PDMS route completion 低估**：分母用固定 91 步 → 35 步短轨迹完美完成只得 38% → 改为按各世界实际路径长度计算
-17. **Resample 间隔过宽**：50 epoch 才换世界 → 400 epoch 仅见 1500 场景 → 改为 3 epoch 覆盖 20,000+ 场景
-18. **弯道追踪差 — 前瞻 + 速度 + 转向多轮调优**：t+3→t+5/10/15、speed_err_weight 调整、steer_cost 平衡（最终 0.03→0.06）、Actor 输出移除 tanh 改线性 clamp；bias[1]=1.2 设加速度起点
-19. **训练速度优化**：tensor 复用 + good_worlds 缓存 + f_pred_batch cat + 循环合并 → ~20% 提速
-20. **网络容量 + 余弦退火 LR**：2层→3层 (512→512→256)，CosineAnnealingLR 从 1e-4 衰减到 1e-6
-21. **Road width 异常 clamp**：某些世界 segment_width >15m → 候选路径飞出道路 → clamp 上限 15m
-22. **Steer bang-bang 饱和 97%**：多轮参数调优无效 → 新增 BC loss，从 expert heading/pos 差分计算近似 steer：`atan(5.0 × Δh / Δs)`；仅训练时生效
-23. **训练协议优化**：buffer 200k + batch 256 + horizon 16（配合 Transformer 窗口）+ resample 10 + priority 采样（|δp| + |δφ|×5）
-24. **偏移候选路径终点不触发 goal**：左右路径终点偏移 ±3.75m → goal 距离 >2m → done 永不触发 → 最后 ~10% 步收敛到中心终点
-25. **Transformer rollout 窗口退化**：30 步 horizon → window 步 16 后全预测帧 → attention 腐败 → horizon 缩至 16，窗口刚切换即终止
-26. **GEP 累加器死锁**：线性/乘性/双向/scale-cap/warmup 五轮迭代均失败 → 最终改为 EMA（`ρ←0.95ρ+0.05×target`），rho 跟踪近期违规严重度而非历史累加
-27. **Warmup 冻 rho 导致转圈**：100 epoch 冷冻 → 无 penalty 信号 → 模型收敛到"小转向=低成本"坏极值点 → 取消 warmup，rho 从步 1 就参与
+1. **f_pred_batch 参考点 off-by-one**：动力学推进一步后参考点仍用旧索引 → heading error 180° 反向
+2. **delta_phi 是 bearing error 不是 heading error**：`atan2(dy,dx)-ego` → `ref_h - ego_h`
+3. **道路 penalty 公式反向**：旧公式惩罚路中心、奖励靠路边
+4. **Steer bang-bang 饱和 97%**：BC loss 从 expert heading/pos 差分计算 approximate steer 打破饱和
+5. **GEP rho 累加器死锁**：线性/乘性/双向/warmup 五轮迭代 → 最终改为 EMA
+6. **3 条偏移路径降低训练质量**：Waymo 无私车道级地图，lateral offset 路径不是真实可行驶车道 → 改为单 expert center 路径
+7. **碰撞惩罚死区**：relu(2.0-dist)² 仅在 2m 内有梯度 → speed 不敢加速；completion 卡在 60%
+8. **窗口退化**：horizon 从 30 缩至 16 匹配 Transformer 窗口，防止 BPTT 后半段在预测假数据上决策
 
 ## 引用
 

@@ -2,9 +2,9 @@ _base: "base.yaml"
 
 # ---- 环境配置 ----
 env:
-  num_worlds: 75
+  num_worlds: 100
   max_agents: 1
-  epochs: 1500
+  epochs: 300
   seed: 5
   device: "cuda"
 

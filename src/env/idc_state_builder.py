@@ -41,37 +41,20 @@ class GPUDriveObservationBuilder:
         
         logger.debug(f'专家轨迹长度：{self.EXPERT_TRAJ_LEN}')
 
-    def generate_candidate_paths(self, ego_indices, num_paths=3,
+    def generate_candidate_paths(self, ego_indices, num_paths=1,
                                    num_points=91, lane_width=3.75):
-        """为每个 world 生成 3 条候选路径（expert 几何 + 曲率限速）"""
+        """为每个 world 生成专家中心路径（单路径，无 lateral offset）"""
         self.candidate_paths = {}
         self.num_candidate_paths = num_paths
 
-        # 动态获取每个 world 的道路宽度（从 map_observation 的 segment_width）
         road_tensor = self.sim.map_observation_tensor().to_torch().cpu().numpy()
-        WIDTH_IDX = 3
 
         for w in range(self.num_worlds):
-            a = ego_indices[w]
+            a = int(ego_indices[w])
             self.candidate_paths[w] = {}
-
-            sp = self.expert_pos[w, a, 0].cpu().numpy()
-
-            # 从道路图中提取该 world 的实际车道宽度
             world_road = road_tensor[w]
-            dx = world_road[:, 0] - sp[0]
-            dy = world_road[:, 1] - sp[1]
-            nearest = int(np.argmin(dx * dx + dy * dy))
-            dynamic_width = float(world_road[nearest, WIDTH_IDX])
-            if dynamic_width <= 0.0 or not np.isfinite(dynamic_width) or dynamic_width > 15.0:
-                dynamic_width = lane_width  # fallback
-            logger.debug(f'[LANE-WIDTH] world_{w} width={dynamic_width:.2f}m')
 
-            paths = []
-            offsets = [0.0]
-            if num_paths >= 3:
-                offsets = [-dynamic_width, 0.0, dynamic_width]
-
+            # 单路径：expert 中心轨迹 + 曲率限速
             expert_pos_w = self.expert_pos[w, a].cpu().numpy()
             expert_h_w = self.expert_heading[w, a].squeeze(-1).cpu().numpy()
 
@@ -87,59 +70,48 @@ class GPUDriveObservationBuilder:
                 self.expert_heading[w, a, :, :] = torch.from_numpy(expert_h_w.reshape(-1, 1))
                 logger.debug(f'[TRUNCATE] world_{w} agent_{a} expert truncated at step {valid_len}/{num_points}')
 
-            # 先生成中心路径，计算 road_dist 用于约束偏移路径
-            center_pos = expert_pos_w.copy()
-            center_path = {
-                'pos': center_pos.astype(np.float32),
+            paths = []
+            path = {
+                'pos': expert_pos_w.astype(np.float32),
                 'heading': expert_h_w.astype(np.float32),
-                'speed': self._curvature_speed(center_pos),
+                'speed': self._curvature_speed(expert_pos_w),
             }
-            center_road_dist = np.zeros(num_points, dtype=np.float32)
+            road_dists = np.zeros(num_points, dtype=np.float32)
             for j in range(num_points):
-                center_road_dist[j] = self._road_dist_point(
-                    world_road, float(center_pos[j, 0]), float(center_pos[j, 1]))
-            center_path['road_dist'] = center_road_dist
-            paths.append(center_path)
+                road_dists[j] = self._road_dist_point(
+                    world_road, float(expert_pos_w[j, 0]), float(expert_pos_w[j, 1]))
+            path['road_dist'] = road_dists
+            paths.append(path)
 
-            # 偏移路径：用中心路径的 road_dist 约束偏移量，不超出路面
-            for offset in offsets:
-                if abs(offset) < 1e-6:
-                    continue
-                pos = np.zeros((num_points, 2), dtype=np.float32)
-                blend_start = int(num_points * 0.9)
-                sign = 1.0 if offset > 0 else -1.0
-                for j in range(num_points):
-                    eff_offset = offset
-                    if j >= blend_start:
-                        blend = (j - blend_start + 1) / max(1, num_points - blend_start)
-                        eff_offset = offset * (1.0 - blend)
-                    safe_max = max(1.0, center_road_dist[j] * 0.8)
-                    eff_offset = sign * min(abs(eff_offset), safe_max)
-                    h = float(expert_h_w[j])
-                    lx = -math.sin(h); ly = math.cos(h)
-                    pos[j, 0] = float(expert_pos_w[j, 0]) + eff_offset * lx
-                    pos[j, 1] = float(expert_pos_w[j, 1]) + eff_offset * ly
-
-                path = {
-                    'pos': pos.astype(np.float32),
-                    'heading': expert_h_w.astype(np.float32),
-                    'speed': center_path['speed'],
-                }
-                road_dists = np.zeros(num_points, dtype=np.float32)
-                for j in range(num_points):
-                    road_dists[j] = self._road_dist_point(
-                        world_road, float(path['pos'][j, 0]), float(path['pos'][j, 1]))
-                path['road_dist'] = road_dists
-                paths.append(path)
+            # 指数衰减前视聚合：每个路径点的未来曲率/速度/道路预期
+            decay_lam = 20
+            for path in paths:
+                pos_arr = path['pos']; head_arr = path['heading']
+                spd_arr = path['speed']; rd_arr = path['road_dist']
+                cp, sp, rp = np.zeros(91, dtype=np.float32), np.zeros(91, dtype=np.float32), np.zeros(91, dtype=np.float32)
+                for i in range(91):
+                    rem = 91 - i
+                    w = np.exp(-np.arange(rem) / decay_lam)
+                    w /= (w.sum() + 1e-8)
+                    if i < 90:
+                        dh = head_arr[i+1:] - head_arr[i:-1]
+                        steps = np.hypot(np.diff(pos_arr[i:, 0]), np.diff(pos_arr[i:, 1])) + 1e-6
+                        steer_i = np.zeros(rem, dtype=np.float32)
+                        steer_i[0] = float(np.arctan(5.0 * dh[0] / steps[0])) if rem > 1 else 0.0
+                        for k in range(1, rem):
+                            steer_i[k] = float(np.arctan(5.0 * dh[k-1] / max(steps[k-1], 1e-6)))
+                        cp[i] = float(np.sum(w * steer_i))
+                    sp[i] = float(np.sum(w * spd_arr[i:]))
+                    rp[i] = float(np.sum(w * rd_arr[i:]))
+                path['curv_ahead'] = cp
+                path['spd_ahead'] = sp
+                path['road_ahead'] = rp
 
             self.candidate_paths[w][a] = paths
 
         # 构建 GPU ref_tensor 供 rollout 零 Python 循环索引
-        # [num_worlds, 1, num_paths, num_points, 5]: pos_x, pos_y, speed, heading, road_dist
-        num_worlds = self.num_worlds
-        num_paths = self.num_candidate_paths
-        num_points = 91
-        ref_data = np.zeros((num_worlds, 1, num_paths, num_points, 5), dtype=np.float32)
+        # [num_worlds, 1, num_paths, num_points, 8]: pos_x, pos_y, speed, heading, road_dist, curv_ahead, spd_ahead, road_ahead
+        ref_data = np.zeros((num_worlds, 1, num_paths, num_points, 8), dtype=np.float32)
         for w in range(num_worlds):
             a = ego_indices[w]
             for p in range(num_paths):
@@ -150,6 +122,9 @@ class GPUDriveObservationBuilder:
                 ref_data[w, 0, p, :n, 2] = path['speed'][:]
                 ref_data[w, 0, p, :n, 3] = path['heading'][:]
                 ref_data[w, 0, p, :n, 4] = path['road_dist'][:]
+                ref_data[w, 0, p, :n, 5] = path['curv_ahead'][:]
+                ref_data[w, 0, p, :n, 6] = path['spd_ahead'][:]
+                ref_data[w, 0, p, :n, 7] = path['road_ahead'][:]
         self.ref_tensor = torch.from_numpy(ref_data).to(self.expert_pos.device)
 
         # 诊断: 打印候选路径坐标范围，确认与 ego 坐标系对齐
@@ -181,16 +156,16 @@ class GPUDriveObservationBuilder:
         """从路径位置的数值曲率计算曲率限速 [num_points]"""
         n = len(pos)
         speeds = np.full(n, v_max, dtype=np.float32)
-        for i in range(2, n - 2):
-            dx01 = pos[i, 0] - pos[i-2, 0]; dy01 = pos[i, 1] - pos[i-2, 1]
-            dx12 = pos[i+2, 0] - pos[i, 0]; dy12 = pos[i+2, 1] - pos[i, 1]
-            ds01 = float(np.hypot(dx01, dy01)) + 1e-6
-            ds12 = float(np.hypot(dx12, dy12)) + 1e-6
-            kappa = abs(np.arctan2(dy12, dx12) - np.arctan2(dy01, dx01)) / ((ds01 + ds12) / 2.0)
+        for i in range(1, n - 1):
+            dx1 = pos[i, 0] - pos[i-1, 0]; dy1 = pos[i, 1] - pos[i-1, 1]
+            dx2 = pos[i+1, 0] - pos[i, 0]; dy2 = pos[i+1, 1] - pos[i, 1]
+            ds1 = float(np.hypot(dx1, dy1)) + 1e-6
+            ds2 = float(np.hypot(dx2, dy2)) + 1e-6
+            kappa = abs(np.arctan2(dy2, dx2) - np.arctan2(dy1, dx1)) / ((ds1 + ds2) / 2.0)
             speeds[i] = float(np.sqrt(a_lat_max / (kappa + 1e-6)))
         speeds = np.minimum(speeds, v_max)
-        speeds[0] = speeds[2]; speeds[1] = speeds[2]
-        speeds[-1] = speeds[-3]; speeds[-2] = speeds[-3]
+        speeds[0] = speeds[1]
+        speeds[-1] = speeds[-2]
         return speeds
 
     def _setup_expert_data(self):
@@ -221,12 +196,6 @@ class GPUDriveObservationBuilder:
             L = 5.0  # wheelbase
             steers.append(math.atan(L * dh / ds))
         return torch.tensor(steers, dtype=torch.float32)
-
-    def get_expert_speed_batch(self, world_indices, temporal_indices, ego_indices_map, path_indices, device):
-        t_tensor = temporal_indices.long().clamp(0, self.ref_tensor.shape[3] - 1).to(device)
-        w_tensor = torch.tensor(list(world_indices), device=device, dtype=torch.long)
-        p_tensor = torch.tensor(list(path_indices), device=device, dtype=torch.long)
-        return self.ref_tensor[w_tensor, 0, p_tensor, t_tensor, 2]
 
     def clear_cache(self):
         """每集开始时调用，使道路缓存失效。"""
@@ -359,7 +328,8 @@ class GPUDriveObservationBuilder:
 
             lookahead_err = np.array([lat1, dphi_l1, road1, spd1,
                                        lat2, dphi_l2, road2, spd2,
-                                       lat3, dphi_l3, road3, spd3], dtype=np.float32)
+                                       lat3, dphi_l3, road3, spd3,
+                                       path['curv_ahead'][t], path['spd_ahead'][t], path['road_ahead'][t]], dtype=np.float32)
             ref_err = np.concatenate([ref_err, lookahead_err])
 
             # 诊断大偏离: pos_err > 100m 时打印 ego/ref 坐标和路径索引

@@ -1849,3 +1849,48 @@ rho = max(0.99 * rho + 0.01 * init_penalty, init_penalty)
 
 **涉及文件**：`idc_agent.py:update()`、`base.yaml`
 
+---
+
+## 77. 三路径 → 单路径：抛弃 offset 轨迹
+
+**日期**：2026-06-03
+
+**背景**：之前 3 条候选路径（center, ±dynamic_width offset）的设计源自 IDC 原论文的 Lane-Level 地图多车道参考路径生成。但 Waymo + GPUDrive 无私车道级地图数据——`dynamic_width` 来自 `segment_width`，在交叉口可达 50-100m，即使 clamp 到 15m 仍产生偏离路面 15m 的"假"路径。实际 PDMS 按 pid 分解也证实了 path ≠ 0 系统性降低训练质量。
+
+**修复**：改为单 expert center 路径。
+
+| 改动 | 文件 |
+|------|------|
+| `paths.encode()` 和 `offsets` 循环全部删除，仅生成一条 center path | `idc_state_builder.py` |
+| `num_paths=3→1` | `idc-train.py`, `idc-eval.py`, `world_manager.py` |
+| `ref_tensor` 从 `[W,1,3,91,8]` → `[W,1,1,91,8]` | `idc_state_builder.py` |
+
+净效果：代码删 ~60 行，buffer 内存从 ~760 MB → ~250 MB，训练路径选择噪声消除。
+
+---
+
+## 78. 指数衰减前视聚合
+
+**日期**：2026-06-03
+
+**背景**：t+5/10/15 的近前视点覆盖仅 1.5s，弯道减速的信号不够。延长 BPTT 深度（window=32）已验证崩溃。直接在 state 拼接远前视点（t+20/30/45/60）导致量级差异破坏 attention。
+
+**方案**：用指数衰减核 `exp(-i/20)` 将全部未来 90 步聚合为 3 个标量特征：
+
+```
+curv_ahead[t] = Σ w_i × steer_needed[t+i]   (未来曲率预期)
+spd_ahead[t]   = Σ w_i × speed_at[t+i]      (未来速度预期)  
+road_ahead[t]  = Σ w_i × road_dist_at[t+i]  (未来道路宽度预期)
+```
+
+**实现**：
+
+| 文件 | 改动 |
+|------|------|
+| `idc_state_builder.py` | `generate_candidate_paths` 对每个路径点预计算 3 个衰减特征 → 存 path dict → ref_tensor 从 5→8 通道 |
+| `idc_agent.py` | `DIM_REF_ERROR 15→18`，`TOTAL_STATE_DIM 62→65` |
+| `idc_agent.py:f_pred_batch` | 从 ref_tensor 直接读取 3 个新增通道入 ref_error_tensors |
+| `idc_state_builder.py:get_idc_observations_batch` | 从 path dict 读取 3 个 decay 特征到初始 state |
+
+远前视不参与 utility cost（仅信息输入），零 BPTT 深度增加，零额外显存。
+

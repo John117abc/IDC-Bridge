@@ -95,7 +95,7 @@ def evaluate(config):
     max_step = builder.EXPERT_TRAJ_LEN
 
     ego_indices = get_ego_indices(env, config.num_worlds)
-    builder.generate_candidate_paths(ego_indices, num_paths=3)
+    builder.generate_candidate_paths(ego_indices, num_paths=1)
 
     agent = DiscreteIDCAgent(env, config, config.device, builder, ego_indices)
 
