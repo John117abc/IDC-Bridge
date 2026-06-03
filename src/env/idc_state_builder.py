@@ -91,8 +91,8 @@ class GPUDriveObservationBuilder:
                 cp, sp, rp = np.zeros(91, dtype=np.float32), np.zeros(91, dtype=np.float32), np.zeros(91, dtype=np.float32)
                 for i in range(91):
                     rem = 91 - i
-                    w = np.exp(-np.arange(rem) / decay_lam)
-                    w /= (w.sum() + 1e-8)
+                    weights = np.exp(-np.arange(rem) / decay_lam)
+                    weights /= (weights.sum() + 1e-8)
                     if i < 90:
                         dh = head_arr[i+1:] - head_arr[i:-1]
                         steps = np.hypot(np.diff(pos_arr[i:, 0]), np.diff(pos_arr[i:, 1])) + 1e-6
@@ -100,14 +100,18 @@ class GPUDriveObservationBuilder:
                         steer_i[0] = float(np.arctan(5.0 * dh[0] / steps[0])) if rem > 1 else 0.0
                         for k in range(1, rem):
                             steer_i[k] = float(np.arctan(5.0 * dh[k-1] / max(steps[k-1], 1e-6)))
-                        cp[i] = float(np.sum(w * steer_i))
-                    sp[i] = float(np.sum(w * spd_arr[i:]))
-                    rp[i] = float(np.sum(w * rd_arr[i:]))
+                        cp[i] = float(np.sum(weights * steer_i))
+                    sp[i] = float(np.sum(weights * spd_arr[i:]))
+                    rp[i] = float(np.sum(weights * rd_arr[i:]))
                 path['curv_ahead'] = cp
                 path['spd_ahead'] = sp
                 path['road_ahead'] = rp
 
             self.candidate_paths[w][a] = paths
+
+        num_worlds = self.num_worlds
+        num_paths = self.num_candidate_paths
+        num_points = 91
 
         # 构建 GPU ref_tensor 供 rollout 零 Python 循环索引
         # [num_worlds, 1, num_paths, num_points, 8]: pos_x, pos_y, speed, heading, road_dist, curv_ahead, spd_ahead, road_ahead

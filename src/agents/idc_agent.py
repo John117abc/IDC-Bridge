@@ -326,9 +326,10 @@ class DiscreteIDCAgent:
         spd_l3 = refs_l3[:, 2]
 
         # 指数衰减前视特征（从 ref_tensor 直接读取）
-        curv_ahead = self.state_builder.ref_tensor[wt, 0, pt, temporal_next, 5]
-        spd_ahead = self.state_builder.ref_tensor[wt, 0, pt, temporal_next, 6]
-        road_ahead = self.state_builder.ref_tensor[wt, 0, pt, temporal_next, 7]
+        tn = torch.clamp(temporal_next, max=90)
+        curv_ahead = self.state_builder.ref_tensor[wt, 0, pt, tn, 5]
+        spd_ahead = self.state_builder.ref_tensor[wt, 0, pt, tn, 6]
+        road_ahead = self.state_builder.ref_tensor[wt, 0, pt, tn, 7]
 
         ref_error_tensors = torch.stack([delta_p, delta_phi, delta_v,
                                           lat_l1, dphi_l1, road_l1, spd_l1,
