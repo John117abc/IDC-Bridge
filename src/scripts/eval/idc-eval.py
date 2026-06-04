@@ -71,7 +71,7 @@ def evaluate(config):
         dataset_size=config.num_worlds,
         sample_with_replacement=True,
         shuffle=True,
-        seed=config.seed,
+        seed=config.seed if config.seed is not None else random.randint(0, 999999),
     )
 
     env_config = get_env_config()

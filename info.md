@@ -1928,3 +1928,53 @@ road_ahead[t]  = Σ w_i × road_dist_at[t+i]  (未来道路宽度预期)
 
 **涉及文件**：`base.yaml`（window_size, horizon, batch_size）、`train.yaml`（num_worlds）
 
+---
+
+## 80. EP 瓶颈修复：降 speed_err_weight + 加 progress reward
+
+**日期**：2026-06-04
+
+**背景**：window=30/horizon=30 训练 695 epoch，eval PDMS=51.5，DDC 从 6/10→1/10（方向判断大幅改善），LK=0.85，NC=1/10。但 EP=0.42——completion=83% 但进步效率只有 42%，模型以超低速度前进。训练集和测试集 eval 分数完全相同（DS=51.4），证明模型泛化良好，非 memorization。
+
+**根因**：`speed_err²×0.05` 对慢速和超速同等惩罚。在 ego=5m/s, ref=20m/s 时每步惩罚 11.25，30 步 rollout=337。模型选择慢速保安全是 cost function 的数学最优解。
+
+**修复**：
+
+| 参数 | 旧 | 新 | 说明 |
+|------|:---:|:---:|------|
+| `speed_err_weight` | 0.05 | 0.005 | 慢速惩罚降 10 倍 |
+| `progress_weight` | — | 0.02 | 正向奖励前进：`l -= 0.02 × v_lon×cos(δφ)×dt` |
+
+速度成本反转：5m/s cost=1.12 > 20m/s cost=-0.04 → 模型推优从慢速转为高速。
+
+**涉及文件**：`base.yaml`、`idc_agent.py:utility_batch`
+
+---
+
+## 81. 高速转向振荡修复：提高 steer_cost_weight
+
+**日期**：2026-06-04
+
+**症状**：progress reward 推速度到 15m/s 后，直线上 steering 高频抖振。同样 0.1 rad 航向误差在高速下的横向位移是低速的 3 倍 → 过冲修正 → 反向再修 → 振荡。
+
+**修复**：`steer_cost_weight: 0.06 → 0.15`（提高 2.5×），抑制高速下的大幅度转向。
+
+弯曲路段仍有足够转向（steer clamp 保持 0.6 rad），只抑制直线高频抖振。
+
+**涉及文件**：`base.yaml`
+
+---
+
+## 82. 评估随机种子修复
+
+**日期**：2026-06-04
+
+**症状**：两次 eval 生成相同的 GIF 地图——`eval.yaml` 的固定 `seed: 20` 导致 `SceneDataLoader` 永远从 70k 池中采样同一组世界。
+
+**修复**：
+- `eval.yaml`：`seed: 20 → null`
+- `idc-eval.py`：`seed=config.seed if config.seed is not None else random.randint(0, 999999)`
+
+每次 eval 自动用随机种子，GIF 展示不同世界。
+
+**涉及文件**：`eval.yaml`、`idc-eval.py`

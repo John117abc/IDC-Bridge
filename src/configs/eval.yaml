@@ -5,7 +5,7 @@ env:
   num_worlds: 10
   max_agents: 1
   epochs: 1
-  seed: 20
+  seed: null  # 不固定种子，每次评估随机采样不同世界
   device: "cuda"
 
 # ---- 路径 ----

@@ -83,6 +83,7 @@ class DiscreteIDCAgent:
         self.acc_cost_weight = config.acc_cost_weight
         self.lookahead_pos_weight = config.lookahead_pos_weight
         self.lookahead_heading_weight = config.lookahead_heading_weight
+        self.progress_weight = getattr(config, 'progress_weight', 0.0)
 
         # GEP 惩罚
         self.rho = config.init_penalty
@@ -482,6 +483,11 @@ class DiscreteIDCAgent:
              + self.acc_cost_weight * acc_cost
              + self.lookahead_pos_weight * (s[:, ref_start + 3] ** 2 + s[:, ref_start + 7] ** 2 + s[:, ref_start + 11] ** 2)
              + self.lookahead_heading_weight * (s[:, ref_start + 4] ** 2 + s[:, ref_start + 8] ** 2 + s[:, ref_start + 12] ** 2))
+
+        if self.progress_weight > 0:
+            speed_along_path = ego[:, 2] * torch.cos(s[:, ref_start + 1])
+            progress = torch.clamp(speed_along_path, min=0.0) * self.dt
+            l = l - self.progress_weight * progress
 
         # 诊断：每次调用自动抓 pos_err 最大的样本
         max_idx = pos_err.argmax().item()

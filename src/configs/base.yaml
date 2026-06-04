@@ -25,9 +25,9 @@ training:
 # ---- Agent 参数 ----
 agent:
   pos_err_weight: 0.03            # utility 中位置跟踪误差的权重（|ego - ref|²）
-  speed_err_weight: 0.05          # utility 中速度跟踪误差的权重（|v_ego - v_ref|²）
+  speed_err_weight: 0.005         # utility 中速度跟踪误差权重（降 10× 打破龟速最优解）
   heading_err_weight: 0.3         # utility 中航向误差的权重（delta_phi²）
-  steer_cost_weight: 0.06         # 转向控制代价权重（steer_raw²），正则化转向剧烈程度
+  steer_cost_weight: 0.15         # 转向控制代价权重（提高 2.5× 抑制高速抖动）
   acc_cost_weight: 0.01           # 加速控制代价权重（acc_raw²），正则化加速度剧烈程度
   lookahead_pos_weight: 0.05      # 前瞻点横向误差权重（t+5/10/15 的 lat_err² ×3）
   lookahead_heading_weight: 0.05  # 前瞻点航向误差权重（t+5/10/15 的 dphi² ×3）
@@ -35,6 +35,7 @@ agent:
   noise_decay_rate: 0.95          # 每次 PIM 后噪声衰减倍率：σ ← max(σ×0.95, noise_std_min)
   noise_std_min: 0.03             # 噪声下限——保证后期仍有少量探索
   bc_weight: 0.1                  # 转向 BC loss 在 actor loss 中的权重
+  progress_weight: 0.02           # 沿路径前进奖励（utility 负项：前进越多 cost 越低）
   init_penalty: 0.01              # ρ 初始值 + 无违规时的 EMA 锚点
   max_penalty: 3.0                # ρ 上限，防止 penalty 完全淹没 utility
   amplifier_c: 0.002              # 已弃用（EMA 方案不再依赖此参数），保留兼容
