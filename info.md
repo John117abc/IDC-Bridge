@@ -1894,3 +1894,37 @@ road_ahead[t]  = Σ w_i × road_dist_at[t+i]  (未来道路宽度预期)
 
 远前视不参与 utility cost（仅信息输入），零 BPTT 深度增加，零额外显存。
 
+---
+
+## 79. BPTT 延长尝试：Window=30 / Horizon=30 / Batch=128
+
+**日期**：2026-06-04
+
+**背景**：1200+ epoch 训练收敛到 PDMS~55，但 eval PDMS=19.7——DDC=6/10（60% 方向错误）、DAC=6/10（60% 偏路失效）。DDC 平均 37 步/世界（3.7 秒持续错误方向），非数据 artifact，是模型在路口无法做正确方向决策。16 步 horizon（1.6s）不足以规划 2-3 秒的转弯操作。
+
+**heading 环绕排查**：BC expert_mean 统计无异常尖峰（min=-0.059, max=0.111, mean=0.017 rad），DDC 失效为持续性错误非单帧 artifact → 排除 heading wrap-around bug 为主要根因。
+
+**方案**：扩大 BPTT 深度以增加模型前瞻。
+
+| 参数 | 旧 | 新 | 说明 |
+|------|:---:|:---:|------|
+| `window_size` | 16 | 30 | 3.0s 历史上下文 |
+| `horizon` | 16 | 30 | 3.0s 模型推演前瞻 |
+| `batch_size` | 256 | 128 | 控制 BPTT 激活显存 |
+| `transformer_num_layers` | 2 | **2** | 不动——上次崩溃（32/24/3）的主因是 layers=3 |
+| `num_worlds` | 100 | 50 | GPUDrive 模拟显存限制 |
+
+**与上次崩溃对比**：
+
+| | 上次（window=32/hor=24/layers=3） | 本次（window=30/hor=30/layers=2） |
+|------|:---:|:---:|
+| BPTT 深度 | 72 层 | 60 层 |
+| window 退化末端 | 全假帧 | 1 帧真实 |
+| layers | 3 | **2**（关键） |
+| rho 机制 | 累加器 | EMA 双向 |
+| 路径 | 3 条 offset | 1 条 center |
+
+**失败标准**：至少训练 200 epoch 才评估。PDMS < 30 才判定失败回滚。
+
+**涉及文件**：`base.yaml`（window_size, horizon, batch_size）、`train.yaml`（num_worlds）
+

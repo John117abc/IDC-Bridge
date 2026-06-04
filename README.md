@@ -1,35 +1,33 @@
 # IDC-Bridge
 
-把"集成决策与控制"（IDC, Integrated Decision and Control）论文的算法跑在 Waymo 开放数据集 + GPUDrive 模拟器上。使用单线程训练循环跑 100 条道路场景同时仿真的在线强化学习。
+把"集成决策与控制"（IDC, Integrated Decision and Control）论文的算法跑在 Waymo 开放数据集 + GPUDrive 模拟器上。使用单线程训练循环跑 90 条道路场景同时仿真的在线强化学习。
 
 ## 算法简介
 
 IDC 的核心思想是**一边开一边学**：
 
 - **PEV（策略评估）**：Critic 网络评估当前 state 的价值，每步更新。
-- **PIM（策略改进）**：每隔 N 步，Actor 通过可微运动学模型推演未来 H 步轨迹，计算跟踪误差 + 碰撞风险的总成本，反向传播改进策略。每次改进放大惩罚系数 ρ。
+- **PIM（策略改进）**：每隔 N 步，Actor 通过可微运动学模型推演未来 H 步轨迹，计算跟踪误差 + 碰撞风险的总成本，反向传播改进策略。ρ 通过 EMA 指数移动平均跟踪近期违规度，自动均衡。
 
-Actor 为 **TransformerEncoder**（16 步滑窗 + 4 头自注意力），Critic 保持独立 MLP。动作空间为加速度（[-3,1.5] m/s²）和方向盘转角（[-0.6,0.6] rad）。参考路径为 expert 中心轨迹 + 曲率限速，单路径训练。
+Actor 为 **TransformerEncoder**（30 步滑窗 + 4 头自注意力，3.0s 历史上下文），Critic 保持独立 MLP。动作空间为加速度（[-3,1.5] m/s²）和方向盘转角（[-0.6,0.6] rad）。参考路径为 expert 中心轨迹 + 曲率限速，单路径训练。
 
 ## 和原论文的差异
 
-1. **网络结构**：Actor 为 TransformerEncoder（16 步 × 4 头自注意力滑窗），Critic 为独立 MLP（原论文共享 latent embed）
+1. **网络结构**：Actor 为 TransformerEncoder（30 帧 × 4 头自注意力滑窗，3.0s 历史），Critic 为独立 MLP（原论文共享 latent embed）
 2. **训练架构**：单线程主循环替代 30 个异步 learner
 3. **环境**：Nocturne → GPUDrive（Waymo 数据）
 4. **参考路径**：expert 中心轨迹 + 曲率限速（单路径，无 lateral offset；Waymo 无私车道级地图，无法生成多条可行驶路径）
 5. **碰撞模型**：前后双圆模型替代单圆
-6. **状态空间**：65 维，含当前误差 + 3 个近前视点（t+5/10/15）+ 3 个指数衰减远前视特征（曲率预期/速度预期/道路宽度预期）
-7. **性能优化**：批量 tensor 操作 + GPU `ref_tensor` 预索引，消除 rollout 中的 Python 循环瓶颈
-8. **EMA rho 调节**：ρ 通过指数移动平均跟踪近期违规严重度（非累加器），违规多→快速响应上升，违规少→缓慢遗忘回落
-9. **YAML 层级配置**：`base.yaml`（共享）→ `train.yaml`/`eval.yaml` 继承覆盖
-10. **密度范围筛选**：离线扫描 Waymo 场景周车密度
+6. **状态空间**：65 维，含近前视点（t+5/10/15）+ 指数衰减远前视聚合特征（曲率/速度/道路宽度预期）
+7. **性能优化**：批量 tensor 操作 + GPU `ref_tensor` 预索引
+8. **EMA rho 调节**：ρ 通过指数移动平均（`ρ←0.95ρ+0.05×target`）跟踪违规度，自然均衡
+9. **Steer BC loss**：从 expert heading/pos 差分计算近似转向监督（`atan(L×Δh/Δs)`），打破 RL 转向饱和
+10. **YAML 层级配置**：`base.yaml`（共享）→ `train.yaml`/`eval.yaml` 继承覆盖
 11. **道路 penalty 路径化**：`relu(D_road_safe - ego_road_dist)` 替代 edge-based
 12. **权重重平衡**：`pos_err_weight=0.03`，heading 与 position 信号量级匹配
 13. **PDMS 评估**：CARLA 风格评分（NC×DAC×DDC × weighted avg）
-14. **Transformer 滑窗 Actor**：16 帧 × 4 头自注意力替代 MLP，训练/推理分布一致
-15. **PER Buffer 窗口化**：每个经验存储完整 16 步窗口，~250 MB CPU 内存（单路径后）
-16. **GEP rho EMA**：rho 通过 EMA 跟踪违规度，自然均衡
-17. **指数衰减前视聚合**：全部未来 90 步的加权平均曲率/速度/道路特征，补足近前视的缺口
+14. **PER Buffer 窗口化**：每个经验存储完整 30 步窗口，~470 MB CPU 内存（单路径后）
+15. **指数衰减前视聚合**：全部未来 90 步的加权平均曲率/速度/道路特征，补足近前视的缺口
 
 ## 快速开始
 
@@ -45,8 +43,8 @@ pip install gpudrive torch numpy matplotlib pyyaml
 
 ```
 src/configs/
-├── base.yaml      # training/agent/dynamics/world/diag — 共享
-├── train.yaml     # _base: base.yaml + env(epochs=600)/paths/viz(gif=false)
+├── base.yaml      # training/agent/dynamics/world/diag/metrics — 共享
+├── train.yaml     # _base: base.yaml + env(epochs=300, num_worlds=90)/paths/viz(gif=false)
 └── eval.yaml      # _base: base.yaml + env(epochs=1)/paths/viz(gif=true)
 ```
 
@@ -77,7 +75,7 @@ python src/scripts/train/idc-train.py \
 # 覆盖 YAML 参数
 python src/scripts/train/idc-train.py \
     --data-dir /path/to/waymo/data \
-    --num-worlds 200 --lr-actor 5e-5
+    --num-worlds 90 --lr-actor 5e-5
 
 ### 评估
 
@@ -165,8 +163,8 @@ CLI 值非空时覆盖 YAML 中的同名参数，以下为常用覆盖项：
 
 | 文件 | 说明 |
 |------|------|
-| `base.yaml` | 7 个共享分组（`training`/`agent`/`dynamics`/`world`/`diag`/`viz`/`metrics`） |
-| `train.yaml` | `_base: base.yaml` + `env`(epochs=600) + `paths`(load_model=true) + `viz`(gif=false) |
+| `base.yaml` | 6 个共享分组（`training`/`agent`/`dynamics`/`world`/`diag`/`metrics`） |
+| `train.yaml` | `_base: base.yaml` + `env`(epochs=300)+ `paths` + `viz`(gif=false) |
 | `eval.yaml` | `_base: base.yaml` + `env`(epochs=1, num_worlds=10) + `paths` + `viz`(gif=true) |
 
 ### GIF 可视化
@@ -279,7 +277,7 @@ LK:  车道保持（|lat| / road_width）
 5. **GEP rho 累加器死锁**：线性/乘性/双向/warmup 五轮迭代 → 最终改为 EMA
 6. **3 条偏移路径降低训练质量**：Waymo 无私车道级地图，lateral offset 路径不是真实可行驶车道 → 改为单 expert center 路径
 7. **碰撞惩罚死区**：relu(2.0-dist)² 仅在 2m 内有梯度 → speed 不敢加速；completion 卡在 60%
-8. **窗口退化**：horizon 从 30 缩至 16 匹配 Transformer 窗口，防止 BPTT 后半段在预测假数据上决策
+8. **BPTT 延长**：horizon/window 从 16→30（3.0s 前瞻），batch 256→128 控制显存，上次 window=32/layers=3 崩溃的经验教训：三层叠加过量 → 本次只扩两步、保持 layers=2
 
 ## 引用
 
