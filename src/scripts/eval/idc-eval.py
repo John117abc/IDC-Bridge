@@ -102,11 +102,10 @@ def evaluate(config):
     all_files = []
     wm = WorldManager(env, builder, agent, all_files, config, logger, compute_density=False)
     wm.filter_initial(ego_indices)
+    logger.info(f'[EVAL] {wm.good_count}/{config.num_worlds} worlds pass filter')
 
     logger.info(f'正在加载模型: {config.model_path}')
     agent.load(config.model_path)
-    agent.rho = config.init_penalty
-    agent.max_penalty = config.max_penalty
     logger.info(f'评估模式: rho={agent.rho}, max_penalty={agent.max_penalty}')
 
     logger.info('正在生成损失曲线图...')

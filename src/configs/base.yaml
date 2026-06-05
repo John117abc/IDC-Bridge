@@ -39,7 +39,7 @@ agent:
   init_penalty: 0.01              # ρ 初始值 + 无违规时的 EMA 锚点
   max_penalty: 3.0                # ρ 上限，防止 penalty 完全淹没 utility
   amplifier_c: 0.002              # 已弃用（EMA 方案不再依赖此参数），保留兼容
-  D_veh_safe: 2.0                 # 车辆碰撞安全距离（m）：自车-周车圆心距 < 此值时产生 penalty
+  D_veh_safe: 3.5                 # 车辆碰撞安全距离（m）：自车-周车圆心距 < 此值时产生 penalty
   D_road_safe: 1.5                # 道路安全距离（m）：自车到路边距离 < 此值时产生 penalty
   half_length: 2.25               # 半车长（m），用于双圆模型的圆心偏移
   half_width: 1.0                 # 半车宽（m），暂未直接使用
@@ -52,7 +52,7 @@ dynamics:
 
 # ---- 世界管理 ----
 world:
-  min_partner_density: 30         # 周车密度下限（平均 partner 数 ≥ 此值才入选）
+  min_partner_density: 2          # 周车密度下限（平均 partner 数 ≥ 此值才入选）
   max_partner_density: 99         # 周车密度上限
   dense_sample_size: 10000        # 稠密场景候选池大小（优先从密度区间采样）
   max_bad_worlds: 60              # 坏 world 数超过此值触发 resample（保留 ≥ num_worlds-max 个 good）

@@ -112,6 +112,21 @@ class WorldManager:
 
         for w in range(self.num_worlds):
             a = ego_indices[w]
+            pos = self.builder.candidate_paths[w][a][0]['pos']
+            num_pts = len(pos)
+            # 从尾部找到最后有效点，检查起点到终点的距离
+            last_valid = num_pts - 1
+            for j in range(num_pts - 1, 0, -1):
+                if np.allclose(pos[j], pos[j-1], atol=1e-3):
+                    last_valid = j - 1
+                else:
+                    break
+            dist = float(np.hypot(pos[0, 0] - pos[last_valid, 0],
+                                   pos[0, 1] - pos[last_valid, 1]))
+            if num_pts - 1 - last_valid >= 5 and dist < 10.0:
+                self.bad_worlds.add(w)
+                self.logger.debug(f'[FILTER-short] world_{w} dist={dist:.1f}m last_valid={last_valid}/{num_pts} — excluding')
+                continue
             for pid in range(self.builder.num_candidate_paths):
                 pos = self.builder.candidate_paths[w][a][pid]['pos']
                 if np.max(np.abs(pos[:, 0])) > self.filter_threshold or np.max(np.abs(pos[:, 1])) > self.filter_threshold:
@@ -213,6 +228,19 @@ class WorldManager:
         self._good_cache = None
         for w in range(self.num_worlds):
             a = new_ego[w]
+            pos = self.builder.candidate_paths[w][a][0]['pos']
+            num_pts = len(pos)
+            last_valid = num_pts - 1
+            for j in range(num_pts - 1, 0, -1):
+                if np.allclose(pos[j], pos[j-1], atol=1e-3):
+                    last_valid = j - 1
+                else:
+                    break
+            dist = float(np.hypot(pos[0, 0] - pos[last_valid, 0],
+                                   pos[0, 1] - pos[last_valid, 1]))
+            if num_pts - 1 - last_valid >= 5 and dist < 10.0:
+                self.bad_worlds.add(w)
+                continue
             for pid in range(self.builder.num_candidate_paths):
                 pos = self.builder.candidate_paths[w][a][pid]['pos']
                 if np.max(np.abs(pos[:, 0])) > self.filter_threshold or np.max(np.abs(pos[:, 1])) > self.filter_threshold:

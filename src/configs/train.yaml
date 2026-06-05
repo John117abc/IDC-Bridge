@@ -4,16 +4,16 @@ _base: "base.yaml"
 env:
   num_worlds: 75
   max_agents: 1
-  epochs: 1300
+  epochs: 2400
   seed: 5
   device: "cuda"
 
 # ---- 路径/保存 ----
 paths:
   file_dir: "/workspace/data"
-  model_path: "/workspace/data/checkpoints/20260604/idc-waymo-v1.0_examples_085058_episode=695.pth"
+  model_path: "/workspace/data/checkpoints/20260605/idc-waymo-v1.0_examples_014410_episode=2300.pth"
   save_freq: 5
-  load_model: true
+  load_model: false
 
 # ---- 可视化/GIF 配置（训练默认关闭） ----
 viz:
@@ -23,5 +23,5 @@ viz:
   gif_max_worlds: 10
   gif_save_dir: "/workspace/data/gifs"
   gif_world_selection: "first"     # "first" | "random"
-  gif_view_mode: "bird_2d"     # "bird_2d" | "bird_3d" | "agent_pov"
+  gif_view_mode: "agent_pov"     # "bird_2d" | "bird_3d" | "agent_pov"
   gif_zoom_radius: 70
