@@ -35,7 +35,7 @@ agent:
   noise_decay_rate: 0.95          # 每次 PIM 后噪声衰减倍率：σ ← max(σ×0.95, noise_std_min)
   noise_std_min: 0.03             # 噪声下限——保证后期仍有少量探索
   bc_weight: 0.1                  # 转向 BC loss 在 actor loss 中的权重
-  progress_weight: 0.02           # 沿路径前进奖励（utility 负项：前进越多 cost 越低）
+  progress_weight: 0.05           # 沿路径前进奖励（utility 负项：前进越多 cost 越低）
   init_penalty: 0.01              # ρ 初始值 + 无违规时的 EMA 锚点
   max_penalty: 3.0                # ρ 上限，防止 penalty 完全淹没 utility
   amplifier_c: 0.002              # 已弃用（EMA 方案不再依赖此参数），保留兼容
@@ -52,7 +52,7 @@ dynamics:
 
 # ---- 世界管理 ----
 world:
-  min_partner_density: 2          # 周车密度下限（平均 partner 数 ≥ 此值才入选）
+  min_partner_density: 0          # 周车密度下限（平均 partner 数 ≥ 此值才入选）
   max_partner_density: 99         # 周车密度上限
   dense_sample_size: 10000        # 稠密场景候选池大小（优先从密度区间采样）
   max_bad_worlds: 60              # 坏 world 数超过此值触发 resample（保留 ≥ num_worlds-max 个 good）
