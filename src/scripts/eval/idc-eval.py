@@ -243,7 +243,7 @@ def evaluate(config):
             bar_data = [{'world_idx': w, **scorers[w].compute()}
                         for w in range(config.num_worlds)
                         if w not in wm.bad_worlds and scorers[w].steps > 0]
-            plot_pdms_bar(bar_data[:20],
+            plot_pdms_bar(bar_data,
                          os.path.join(pdms_plot_dir, f'pdms_bar_epoch{epoch+1}.png'),
                          title=f'Per-World Driving Score Epoch {epoch+1}')
 
