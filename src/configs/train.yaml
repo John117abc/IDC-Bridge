@@ -4,14 +4,14 @@ _base: "base.yaml"
 env:
   num_worlds: 75
   max_agents: 1
-  epochs: 3000
+  epochs: 3500
   seed: 5
   device: "cuda"
 
 # ---- 路径/保存 ----
 paths:
   file_dir: "/workspace/data"
-  model_path: "/workspace/data/checkpoints/20260606/idc-waymo-v1.0_examples_060357_episode=2400.pth"
+  model_path: "/workspace/data/checkpoints/20260606/idc-waymo-v1.0_examples_131203_episode=2660.pth"
   save_freq: 5
   load_model: true
 

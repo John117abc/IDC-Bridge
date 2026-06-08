@@ -153,11 +153,11 @@ def evaluate(config):
             path_indices = [0 for _ in range(config.num_worlds)]
             states = builder.get_idc_observations_batch(ego_indices, path_indices=path_indices)
 
-            # Rollout PDMS — 仅在 step 0 对前 3 个 good world 做一次前向推演
+            # Rollout PDMS — 仅在 step 0 对所有 good world 做一次前向推演
             if step == 0 and epoch == 0:
                 rollout_scores = {}
                 roll_scorer = RolloutPDMSScorer(agent, config, path_idx=0)
-                for w in wm.good_worlds[:3]:
+                for w in wm.good_worlds:
                     try:
                         roll = roll_scorer.compute_rollout_pdms(states[w], w, ego_indices[w])
                         rollout_scores[w] = roll

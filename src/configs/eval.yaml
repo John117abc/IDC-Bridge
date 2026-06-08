@@ -2,7 +2,7 @@ _base: "base.yaml"
 
 # ---- 环境配置 ----
 env:
-  num_worlds: 30
+  num_worlds: 40
   max_agents: 1
   epochs: 1
   seed: null  # 不固定种子，每次评估随机采样不同世界
