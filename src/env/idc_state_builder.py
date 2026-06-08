@@ -83,39 +83,13 @@ class GPUDriveObservationBuilder:
             path['road_dist'] = road_dists
             paths.append(path)
 
-            # 指数衰减前视聚合：每个路径点的未来曲率/速度/道路预期
-            decay_lam = 20
-            for path in paths:
-                pos_arr = path['pos']; head_arr = path['heading']
-                spd_arr = path['speed']; rd_arr = path['road_dist']
-                cp, sp, rp = np.zeros(91, dtype=np.float32), np.zeros(91, dtype=np.float32), np.zeros(91, dtype=np.float32)
-                for i in range(91):
-                    rem = 91 - i
-                    weights = np.exp(-np.arange(rem) / decay_lam)
-                    weights /= (weights.sum() + 1e-8)
-                    if i < 90:
-                        dh = head_arr[i+1:] - head_arr[i:-1]
-                        steps = np.hypot(np.diff(pos_arr[i:, 0]), np.diff(pos_arr[i:, 1])) + 1e-6
-                        steer_i = np.zeros(rem, dtype=np.float32)
-                        steer_i[0] = float(np.arctan(5.0 * dh[0] / steps[0])) if rem > 1 else 0.0
-                        for k in range(1, rem):
-                            steer_i[k] = float(np.arctan(5.0 * dh[k-1] / max(steps[k-1], 1e-6)))
-                        cp[i] = float(np.sum(weights * steer_i))
-                    sp[i] = float(np.sum(weights * spd_arr[i:]))
-                    rp[i] = float(np.sum(weights * rd_arr[i:]))
-                path['curv_ahead'] = cp
-                path['spd_ahead'] = sp
-                path['road_ahead'] = rp
-
             self.candidate_paths[w][a] = paths
 
+        # 构建 GPU ref_tensor (基线: 5 通道)
         num_worlds = self.num_worlds
         num_paths = self.num_candidate_paths
         num_points = 91
-
-        # 构建 GPU ref_tensor 供 rollout 零 Python 循环索引
-        # [num_worlds, 1, num_paths, num_points, 8]: pos_x, pos_y, speed, heading, road_dist, curv_ahead, spd_ahead, road_ahead
-        ref_data = np.zeros((num_worlds, 1, num_paths, num_points, 8), dtype=np.float32)
+        ref_data = np.zeros((num_worlds, 1, num_paths, num_points, 5), dtype=np.float32)
         for w in range(num_worlds):
             a = ego_indices[w]
             for p in range(num_paths):
@@ -126,10 +100,8 @@ class GPUDriveObservationBuilder:
                 ref_data[w, 0, p, :n, 2] = path['speed'][:]
                 ref_data[w, 0, p, :n, 3] = path['heading'][:]
                 ref_data[w, 0, p, :n, 4] = path['road_dist'][:]
-                ref_data[w, 0, p, :n, 5] = path['curv_ahead'][:]
-                ref_data[w, 0, p, :n, 6] = path['spd_ahead'][:]
-                ref_data[w, 0, p, :n, 7] = path['road_ahead'][:]
-        self.ref_tensor = torch.from_numpy(ref_data).to(self.expert_pos.device)
+        # baseline: 不构建 GPU ref_tensor，走 CPU 回退路径避免 GPU indexing bug
+        self.ref_tensor = None
 
         # 诊断: 打印候选路径坐标范围，确认与 ego 坐标系对齐
         for w in range(min(self.num_worlds, 3)):
@@ -332,8 +304,7 @@ class GPUDriveObservationBuilder:
 
             lookahead_err = np.array([lat1, dphi_l1, road1, spd1,
                                        lat2, dphi_l2, road2, spd2,
-                                       lat3, dphi_l3, road3, spd3,
-                                       path['curv_ahead'][t], path['spd_ahead'][t], path['road_ahead'][t]], dtype=np.float32)
+                                       lat3, dphi_l3, road3, spd3,], dtype=np.float32)
             ref_err = np.concatenate([ref_err, lookahead_err])
 
             # 诊断大偏离: pos_err > 100m 时打印 ego/ref 坐标和路径索引
@@ -526,9 +497,9 @@ class GPUDriveObservationBuilder:
     def get_road_dist_batch(self, world_indices, temporal_indices,
                              ego_indices_map, path_indices, device) -> torch.Tensor:
         """批量查询预计算的道路边界距离 [batch]"""
-        if hasattr(self, 'ref_tensor'):
+        if self.ref_tensor is not None:
             w_tensor = torch.tensor(list(world_indices), device=self.ref_tensor.device, dtype=torch.long)
-            p_tensor = torch.tensor(list(path_indices), device=self.ref_tensor.device, dtype=torch.long)
+            p_tensor = torch.as_tensor(np.asarray(path_indices, dtype=np.int64), device=self.ref_tensor.device)
             t_tensor = temporal_indices.long().clamp(0, self.ref_tensor.shape[3] - 1).to(self.ref_tensor.device)
             return self.ref_tensor[w_tensor, 0, p_tensor, t_tensor, 4].to(device)
         # CPU 回退
@@ -537,7 +508,7 @@ class GPUDriveObservationBuilder:
             w = world_indices[i]
             a = ego_indices_map[w]
             pid = path_indices[i]
-            t = int(temporal_indices[i])
+            t = temporal_indices[i].item() if isinstance(temporal_indices, torch.Tensor) else int(temporal_indices[i])
             path = self.candidate_paths[w][a][pid]
             t = max(0, min(t, len(path['road_dist']) - 1))
             dists.append(float(path['road_dist'][t]))
@@ -566,10 +537,11 @@ class GPUDriveObservationBuilder:
         列：[rx, ry, rs, 0, rh, 0, nearest_idx]
         当 temporal_indices 传入时，优先走 GPU tensor 索引（零 Python 循环）。
         """
-        if temporal_indices is not None and path_indices is not None and hasattr(self, 'ref_tensor'):
+        if (temporal_indices is not None and path_indices is not None
+                and self.ref_tensor is not None):
             # GPU 快速路径：tensor 索引替代 Python 循环
             w_tensor = torch.tensor(list(world_indices), device=self.ref_tensor.device, dtype=torch.long)
-            p_tensor = torch.tensor(list(path_indices), device=self.ref_tensor.device, dtype=torch.long)
+            p_tensor = torch.as_tensor(np.asarray(path_indices, dtype=np.int64), device=self.ref_tensor.device)
             t_tensor = temporal_indices.long().clamp(0, self.ref_tensor.shape[3] - 1).to(self.ref_tensor.device)
             vals = self.ref_tensor[w_tensor, 0, p_tensor, t_tensor]
             rx, ry, rs, rh, rd = vals[:, 0], vals[:, 1], vals[:, 2], vals[:, 3], vals[:, 4]
@@ -582,7 +554,7 @@ class GPUDriveObservationBuilder:
             a = ego_indices_map[w]
             pid = path_indices[i] if path_indices is not None else 0
             if temporal_indices is not None:
-                t = int(temporal_indices[i])
+                t = temporal_indices[i].item() if isinstance(temporal_indices, torch.Tensor) else int(temporal_indices[i])
                 path = self.candidate_paths[w][a][pid]
                 t = max(0, min(t, len(path['pos']) - 1))
                 rx, ry = float(path['pos'][t, 0]), float(path['pos'][t, 1])

@@ -4,7 +4,7 @@ _base: "base.yaml"
 env:
   num_worlds: 75
   max_agents: 1
-  epochs: 3500
+  epochs: 1500
   seed: 5
   device: "cuda"
 
@@ -13,7 +13,7 @@ paths:
   file_dir: "/workspace/data"
   model_path: "/workspace/data/checkpoints/20260606/idc-waymo-v1.0_examples_131203_episode=2660.pth"
   save_freq: 5
-  load_model: true
+  load_model: false
 
 # ---- 可视化/GIF 配置（训练默认关闭） ----
 viz:

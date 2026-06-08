@@ -1,0 +1,94 @@
+# ============================================================
+# IDC-Bridge 基线配置文件（原论文方法）
+# 无 Transformer、无 BC loss、无辅助 loss、经典 GEP
+# ============================================================
+
+# ---- 环境配置 ----
+env:
+  num_worlds: 75
+  max_agents: 1
+  epochs: 1500
+  seed: 5
+  device: "cuda"
+
+# ---- 训练超参 ----
+training:
+  dt: 0.1
+  horizon: 30
+  batch_size: 256
+  hidden_dim: 512
+  lr_actor_max: 1.0e-4
+  lr_actor_min: 1.0e-6
+  lr_critic_max: 3.0e-4
+  lr_critic_min: 1.0e-5
+  pim_interval: 30
+  gamma: 0.99
+  buffer_capacity: 200000
+
+# ---- Agent 参数 ----
+agent:
+  pos_err_weight: 0.03
+  speed_err_weight: 0.05
+  heading_err_weight: 0.3
+  steer_cost_weight: 0.06
+  acc_cost_weight: 0.01
+  noise_std: 0.1
+  noise_decay_rate: 0.95
+  noise_std_min: 0.03
+  init_penalty: 0.01
+  max_penalty: 3.0
+  amplifier_c: 0.005
+  D_veh_safe: 2.0
+  D_road_safe: 1.5
+  half_length: 2.25
+  half_width: 1.0
+
+# ---- 车辆动力学 ----
+dynamics:
+  wheelbase: 5.0
+  lr_ratio: 0.5
+  v_max: 30.0
+
+# ---- 世界管理 ----
+world:
+  min_partner_density: 2
+  max_partner_density: 99
+  dense_sample_size: 10000
+  max_bad_worlds: 60
+  resample_interval: 10
+  filter_threshold: 200
+  dataset_size: 0
+  density_cache_file: "/workspace/data/logs/density_full.json"
+
+# ---- 诊断开关 ----
+diag:
+  fix_speed: false
+  fix_heading: false
+  no_sign: false
+  no_road_penalty: false
+  no_veh_penalty: false
+
+# ---- PDMS 评分 ----
+metrics:
+  pdms:
+    nc_weight: 0.0
+    dac_threshold: 3
+    ttc_horizon: 4.0
+    jerk_max: 10.0
+    ep_weight: 5
+    ttc_weight: 5
+    comfort_weight: 2
+    lk_weight: 2
+
+# ---- 路径/保存 ----
+paths:
+  file_dir: "/workspace/data"
+  save_freq: 5
+  load_model: false
+  model_path: ""
+
+# ---- 可视化/GIF 配置（训练默认关闭） ----
+viz:
+  gif_enabled: false
+  gif_fps: 15
+  gif_save_dir: "/workspace/data/gifs"

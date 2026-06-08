@@ -1978,3 +1978,41 @@ road_ahead[t]  = Σ w_i × road_dist_at[t+i]  (未来道路宽度预期)
 每次 eval 自动用随机种子，GIF 展示不同世界。
 
 **涉及文件**：`eval.yaml`、`idc-eval.py`
+
+---
+
+## 83. 基线版本 (baseline branch)
+
+**日期**：2026-06-08
+
+**目标**：严格按 IDC 原论文实现一个基线版本，用于和改进版的对比实验。
+
+**核心差异**：
+
+| 组件 | baseline（原论文） | main（改进版） |
+|------|:---:|:---:|
+| Actor | MLP 3层 (ContinuousActor) | Transformer 30帧 |
+| GEP rho | 经典累加 `rho += amplifier_c` | EMA |
+| 前视 | dp/dphi/dv/lat (4维有效) | 15维含衰减聚合 |
+| BC/Speed/Progress | 全无 | 有 |
+| Buffer | 单帧 window=1 | 30帧窗口 |
+| GPU ref_tensor | CPU fallback (None) | GPU 预索引 |
+
+**新建文件**：
+
+| 文件 | 说明 |
+|------|------|
+| `src/agents/idc_agent_baseline.py` | MLP Actor + 经典 GEP（~370 行） |
+| `src/scripts/train/idc-train-baseline.py` | 训练脚本（单帧 buffer，无窗口维护） |
+| `src/configs/base_baseline.yaml` | 基线配置（无 Transformer/BC/progress 参数） |
+
+**共享文件修改**（仅 baseline 分支）：
+- `src/env/idc_state_builder.py`：ref_tensor 不构建（走 CPU fallback），移除衰减前视预计算
+- `src/env/world_manager.py`：距离过滤 + 短轨迹排除（与 main 同步）
+
+**技术决策**：
+- 保持单条 expert 路径（Waymo 无私车道级地图，无法生成原论文的 Lane-Level 多条候选路径）
+- 放弃 GPU ref_tensor（baseline 版索引 shape 兼容性问题，CPU fallback 对 75 worlds 性能影响 < 5%）
+- DIM_REF_ERROR 仍为 15（与 state_builder 对齐），仅使用前 4 维
+
+**涉及文件**：`idc_agent_baseline.py`、`idc-train-baseline.py`、`base_baseline.yaml`、`idc_state_builder.py`
