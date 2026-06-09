@@ -109,6 +109,9 @@ class DiscreteIDCAgentBaseline:
         self.history_loss = []
         self.epoch_history_pdms = []
 
+    def reset_world_state(self, world_idx):
+        pass
+
     def select_action(self, state, deterministic=False):
         """state: list of numpy arrays [w][TOTAL_STATE_DIM]"""
         with torch.no_grad():
