@@ -129,7 +129,7 @@ def evaluate(config):
             builder.reset_world_step(w, 0)
             agent.reset_world_state(w)
         builder.clear_cache()
-        wm.reached_worlds.clear()
+        wm.begin_epoch()
 
         done_np = env.get_dones().cpu().numpy()
         for w in range(config.num_worlds):
@@ -148,6 +148,7 @@ def evaluate(config):
 
         scorers = [PDMSScorer(config) for _ in range(config.num_worlds)]
         ref_start_agent = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
+        temp_idx_pos = ref_start_agent + agent.DIM_REF_ERROR
 
         for step in range(max_step):
             logger.info(f'回合 {epoch+1}/{config.epochs}, 步数 {step+1}/{max_step}')
@@ -201,7 +202,8 @@ def evaluate(config):
                 off_road = float(info_np[w, a, 0]) > 0
                 collision = (float(info_np[w, a, 1]) + float(info_np[w, a, 2])) > 0
                 pid = 0
-                t = builder.step_counter[w]
+                # 用"投影进度索引"而不是步数时钟
+                t = int(round(float(states[w][temp_idx_pos])))
                 path = builder.candidate_paths[w][a][pid]
                 road_dist_ref = float(path['road_dist'][min(t, len(path['road_dist']) - 1)])
                 scorers[w].update_step(

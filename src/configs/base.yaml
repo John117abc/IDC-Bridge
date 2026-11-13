@@ -91,7 +91,10 @@ world:
   max_partner_density: 99         # 周车密度上限
   dense_sample_size: 10000        # 稠密场景候选池大小（优先从密度区间采样）
   max_bad_worlds: 60              # 坏 world 数超过此值触发 resample（保留 ≥ num_worlds-max 个 good）
-  resample_interval: 10           # 每 N 个 epoch 检查一次是否需 resample
+  resample_interval: 10           # 每 N 个 epoch 做一次"滚动替换"（0 = 关闭）
+  resample_ratio: 0.4             # 每次替换的 world 比例。滚动替换而非全换：
+                                  # 全换会让整个 buffer 作废，且换一次要 30~40 秒，
+                                  # 而一个 epoch 只有 19 秒。
   use_expert_path: true           # true: 使用 expert 轨迹生成参考路径; false: 从道路图生成
   filter_threshold: 200           # ego 坐标超过 ±200m 视为坏 world
   dataset_size: 0                 # 数据池大小，0=自动检测 data_dir 下 tfrecord 文件数

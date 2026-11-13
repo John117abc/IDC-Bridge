@@ -133,7 +133,7 @@ def train(config):
             builder.reset_world_step(w, 0)
             agent.reset_world_state(w)
         builder.clear_cache()
-        wm.reached_worlds.clear()
+        wm.begin_epoch()
 
         # 检测 epoch 开头已 done 的世界（轨迹数据异常/已到终点）
         done_np = env.get_dones().cpu().numpy()
@@ -157,6 +157,8 @@ def train(config):
 
         scorers = [PDMSScorer(config) for _ in range(config.num_worlds)]
         ref_start_agent = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
+        # 投影进度索引在 state 里的位置（temporal 维）
+        temp_idx_pos = ref_start_agent + agent.DIM_REF_ERROR
 
         for step in range(max_step):
             if step % 10 == 0:
@@ -233,7 +235,8 @@ def train(config):
                 off_road = float(info_np[w, a, 0]) > 0
                 collision = (float(info_np[w, a, 1]) + float(info_np[w, a, 2])) > 0
                 pid = episode_path_indices[w]
-                t = builder.step_counter[w]
+                # 用"投影进度索引"而不是步数时钟：否则 completion 还是时间进度
+                t = int(round(float(states[w][temp_idx_pos])))
                 path = builder.candidate_paths[w][a][pid]
                 road_dist_ref = float(path['road_dist'][min(t, len(path['road_dist']) - 1)])
                 scorers[w].update_step(
@@ -331,6 +334,10 @@ if __name__ == "__main__":
     parser.add_argument('--lr-critic', type=float, default=None)
     parser.add_argument('--dataset-size', type=int, default=None)
     parser.add_argument('--max-bad-worlds', type=int, default=None)
+    parser.add_argument('--resample-interval', type=int, default=None,
+                        help='每 N 个 epoch 触发一次滚动替换（0=关闭）')
+    parser.add_argument('--resample-ratio', type=float, default=None,
+                        help='每次替换的 world 比例（0~1，默认 0.4）')
     parser.add_argument('--min-partner-density', type=float, default=None)
     parser.add_argument('--max-partner-density', type=int, default=None,
                         help='密度上限，min=0+max=30 表示全量')
@@ -371,6 +378,8 @@ if __name__ == "__main__":
         'lr_critic': args.lr_critic,
         'dataset_size': args.dataset_size,
         'max_bad_worlds': args.max_bad_worlds,
+        'resample_interval': args.resample_interval,
+        'resample_ratio': args.resample_ratio,
         'min_partner_density': args.min_partner_density,
         'max_partner_density': args.max_partner_density,
         'dense_sample_size': args.dense_sample_size,

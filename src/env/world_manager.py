@@ -209,6 +209,16 @@ class WorldManager:
         if modified:
             self._good_cache = None
 
+    def begin_epoch(self):
+        """每个 epoch 开始时调用：清空 reached 并让 good 缓存失效。
+
+        原来只做 `reached_worlds.clear()`，而 `good_worlds` 是带缓存的 property，
+        即便 `modified` 没置位缓存也会保留上一轮的集合 —— 实测出现
+        `good=60` 但 `bad=0/reached=0` 的自相矛盾，等于有 15 个 world 整轮不参与训练。
+        """
+        self.reached_worlds.clear()
+        self._good_cache = None
+
     def should_resample(self):
         if len(self.bad_worlds) > self.args.max_bad_worlds:
             return True
@@ -227,33 +237,46 @@ class WorldManager:
             if hasattr(self.builder, attr):
                 delattr(self.builder, attr)
         torch.cuda.empty_cache()
+        self.logger.info('[RESAMPLE] step1: builder 缓存已清')
 
-        candidate_pool = (
-            self.dense_files
-            if self.agent.rho > 0 and len(self.dense_files) >= self.num_worlds * 2
-            else self.all_files
-        )
-        # 只替换"坏掉/已到终点"的 world，其余 world 的场景文件保持不变 ——
-        # 这样它们的缓冲区经验依然有效（配合 agent.world_gen 的代际拒采）。
-        replace_w = sorted(self.bad_worlds | self.reached_worlds)
-        if not replace_w:
-            replace_w = list(range(self.num_worlds))
+        # 候选池：用全量池均匀抽（与初始批的抽样方式一致）。
+        # 原先 rho>0 时用 dense_files（按密度降序的前 1 万个最稠密场景），
+        # 换批会系统性切到最拥挤的场景，实测会触发
+        # CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES（set_maps 内部 kernel 启动超限）。
+        candidate_pool = self.all_files if len(self.all_files) >= self.num_worlds else self.dense_files
+        # 每次固定替换 ~ratio 比例的 world：坏/到终点的优先，不足用健康 world 补足。
+        # 这样场景轮换是确定性的，不会因为"这几天没坏 world"就不换场景。
+        ratio = float(getattr(self.args, 'resample_ratio', 0.4))
+        max_n = max(1, int(round(self.num_worlds * ratio)))
+        forced = sorted(self.bad_worlds | self.reached_worlds)
+        others = [w for w in range(self.num_worlds) if w not in set(forced)]
+        random.shuffle(others)
+        replace_w = (forced + others)[:max_n]
         cur_files = list(self.env.data_batch)
-        picked = random.sample(candidate_pool, min(len(replace_w), len(candidate_pool)))
+        cand = [f for f in candidate_pool if f not in set(cur_files)]
+        if len(cand) < len(replace_w):
+            cand = list(candidate_pool)
+        picked = random.sample(cand, len(replace_w))
         batch_files = list(cur_files)
         for w, f in zip(replace_w, picked):
             batch_files[w] = f
+        if len(set(batch_files)) != len(batch_files):
+            raise RuntimeError('[RESAMPLE] 数据批里出现重复场景文件，拒绝 swap')
         self.env.swap_data_batch(data_batch=batch_files)
+        self.logger.info(f'[RESAMPLE] step2: swap 完成（替换 {len(replace_w)}/{self.num_worlds} 个 world）')
 
         new_ego = []
         for w in range(self.num_worlds):
             ctrl = self.env.cont_agent_mask[w].nonzero(as_tuple=True)[0]
             new_ego.append(ctrl[0].item() if len(ctrl) > 0 else 0)
+        self.logger.info('[RESAMPLE] step3: new_ego 计算完成')
 
         self.builder._setup_expert_data()
         self.builder.clear_cache()
+        self.logger.info('[RESAMPLE] step4: expert data 重建完成')
         self.builder.generate_candidate_paths(new_ego, num_paths=1,
                                                 use_expert_path=getattr(self.args, 'use_expert_path', True))
+        self.logger.info('[RESAMPLE] step5: 候选路径重建完成')
 
         self.bad_worlds.clear()
         self.reached_worlds.clear()
