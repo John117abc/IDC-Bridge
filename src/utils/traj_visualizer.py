@@ -25,7 +25,7 @@ COLORS = {
     'road_edge':     '#b15928',
 }
 
-PATH_LABELS = ['left (-3.75m)', 'center (0m)', 'right (+3.75m)']
+PATH_LABELS = ['Reference Path']
 
 
 class TrajectoryVisualizer:
@@ -56,23 +56,27 @@ class TrajectoryVisualizer:
             return self._roads_cached
         rt = self.builder.sim.map_observation_tensor().to_torch().cpu().numpy()
         pts = rt[self.world_idx]  # [R, 9]
-        # column indices for map_observation_tensor
+        # col6 type mapping (verified via cross-table with col8 VBD types):
+        #   1 = ROAD_EDGE (道路边界)
+        #   2 = ROAD_LINE (车道标线)
+        #   3 = LANE_CENTER (车道中心线)
         TYPE_IDX = 6
-        ROADLINE = 1
-        ROADEDGE = 2
-        LANECENTER = 3
+        ROAD_EDGE = 1
+        ROAD_LINE = 2
+        LANE_CENTER = 3
 
         self._roads_cached = {
-            'road_line':   pts[pts[:, TYPE_IDX] == ROADLINE],
-            'road_edge':   pts[pts[:, TYPE_IDX] == ROADEDGE],
-            'lane_center': pts[pts[:, TYPE_IDX] == LANECENTER],
+            'road_edge':   pts[pts[:, TYPE_IDX] == ROAD_EDGE],
+            'road_line':   pts[pts[:, TYPE_IDX] == ROAD_LINE],
+            'lane_center': pts[pts[:, TYPE_IDX] == LANE_CENTER],
         }
         return self._roads_cached
 
     # ---- main plot ----
 
     def plot(self, save_path: str = None, title: str = None,
-             show_road: bool = True, figsize=(12, 10), dpi=120):
+             show_road: bool = True, use_expert_path: bool = True,
+             figsize=(12, 10), dpi=120):
         fig, ax = plt.subplots(figsize=figsize)
         ax.set_aspect('equal')
 
@@ -90,21 +94,24 @@ class TrajectoryVisualizer:
                                c=color, s=2, alpha=alpha, zorder=0,
                                label=f'road ({key})')
 
-        # --- expert trajectory ---
-        expert_pos = self.builder.expert_pos[self.world_idx, self.agent_idx].cpu().numpy()
-        ax.plot(expert_pos[:, 0], expert_pos[:, 1],
-                color=COLORS['expert'], linewidth=2.0, linestyle='-',
-                label='Expert trajectory', zorder=3)
-
-        # --- candidate Bezier paths ---
+        # --- reference path ---
         paths = self.builder.candidate_paths[self.world_idx][self.agent_idx]
         for i, path in enumerate(paths):
             bp = path['pos']
+            ref_label = PATH_LABELS[i] if i < len(PATH_LABELS) else f'Path {i}'
+            if not use_expert_path:
+                ref_label = f'Road Graph {ref_label}'
             ax.plot(bp[:, 0], bp[:, 1],
                     color=COLORS['candidate'][i % len(COLORS['candidate'])],
                     linewidth=1.2, linestyle='--', alpha=0.8,
-                    label=f'Candidate {PATH_LABELS[i] if i < len(PATH_LABELS) else i}',
-                    zorder=2)
+                    label=ref_label, zorder=2)
+
+        # --- expert trajectory (only when relevant) ---
+        if use_expert_path:
+            expert_pos = self.builder.expert_pos[self.world_idx, self.agent_idx].cpu().numpy()
+            ax.plot(expert_pos[:, 0], expert_pos[:, 1],
+                    color=COLORS['expert'], linewidth=2.0, linestyle='-',
+                    label='Expert trajectory', zorder=3)
 
         # --- actual trajectory ---
         if len(self.actual_x) > 0:
@@ -113,22 +120,31 @@ class TrajectoryVisualizer:
                     marker='.', markersize=2, alpha=0.9,
                     label='Actual trajectory', zorder=5)
 
-        # --- start / end ---
-        sx, sy = float(expert_pos[0, 0]), float(expert_pos[0, 1])
-        ex, ey = float(expert_pos[-1, 0]), float(expert_pos[-1, 1])
+        # --- start / end markers ---
+        if use_expert_path:
+            expert_pos = self.builder.expert_pos[self.world_idx, self.agent_idx].cpu().numpy()
+            sx, sy = float(expert_pos[0, 0]), float(expert_pos[0, 1])
+            ex, ey = float(expert_pos[-1, 0]), float(expert_pos[-1, 1])
+        else:
+            cp = paths[0]['pos']
+            sx, sy = float(cp[0, 0]), float(cp[0, 1])
+            ex, ey = float(cp[-1, 0]), float(cp[-1, 1])
+
         ax.scatter(sx, sy, c=COLORS['start'], s=80, marker='o', zorder=6,
                    edgecolors='white', linewidths=0.5, label='Start')
         ax.scatter(ex, ey, c=COLORS['end'], s=80, marker='s', zorder=6,
                    edgecolors='white', linewidths=0.5, label='End')
 
         # --- heading arrows at start / end ---
-        h0 = float(self.builder.expert_heading[self.world_idx, self.agent_idx, 0].item())
-        if len(self.actual_x) > 0:
+        if use_expert_path:
+            expert_pos = self.builder.expert_pos[self.world_idx, self.agent_idx].cpu().numpy()
+            h0 = float(self.builder.expert_heading[self.world_idx, self.agent_idx, 0].item())
             ha = float(self.builder.expert_heading[self.world_idx, self.agent_idx,
-                                                    min(len(self.actual_x) - 1,
-                                                        self.builder.EXPERT_TRAJ_LEN - 1)].item())
+                                                     min(len(self.actual_x) - 1 if len(self.actual_x) > 0 else 0,
+                                                         self.builder.EXPERT_TRAJ_LEN - 1)].item())
         else:
-            ha = h0
+            h0 = float(paths[0]['heading'][0])
+            ha = float(paths[0]['heading'][-1])
         arrow_len = 2.5
         self._draw_arrow(ax, sx, sy, h0, arrow_len, COLORS['start'])
         self._draw_arrow(ax, ex, ey, ha, arrow_len, COLORS['end'])
@@ -145,7 +161,7 @@ class TrajectoryVisualizer:
             fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
         plt.close(fig)
 
-    def save_plot(self, base_dir: str, epoch: int) -> str:
+    def save_plot(self, base_dir: str, epoch: int, use_expert_path: bool = True) -> str:
         """封装保存：自动创建日期子目录 + 时间戳文件名。"""
         logger.debug(f'自动创建日期子目录 + 时间戳文件名')
         now = datetime.now()
@@ -156,7 +172,7 @@ class TrajectoryVisualizer:
                     f'{now.strftime("%H%M%S")}.png')
         save_path = os.path.join(date_dir, filename)
 
-        self.plot(save_path=save_path,
+        self.plot(save_path=save_path, use_expert_path=use_expert_path,
                   title=f'Epoch {epoch:03d} | World {self.world_idx}')
         return save_path
 

@@ -12,6 +12,7 @@ from models.kinematic_bicycle import KinematicBicycleModel
 from buffer import PERBuffer
 from utils import get_logger
 from utils import save_checkpoint, load_checkpoint
+from utils.running_norm import RunningNorm
 
 logger = get_logger('idc-agent')
 
@@ -35,8 +36,30 @@ class DiscreteIDCAgent:
         self.DIM_VALIDITY = 8
         self.DIM_REF_ERROR = 18           # [dp, dphi, dv, lat+dphi+road+spd ×3(t+5/10/15) + curvahead+spdahead+rdahead]
         self.DIM_TEMPORAL = 1
-        self.TOTAL_STATE_DIM = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR + self.DIM_TEMPORAL
+        self.DIM_VEH = 1                  # 该车的 size.length（GPUDrive 拿它当轴距，逐车不同）
+        self.TOTAL_STATE_DIM = (self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
+                                + self.DIM_REF_ERROR + self.DIM_TEMPORAL + self.DIM_VEH)
         self.DIM_ROAD = 80
+
+        # ---- 状态表示 / 参考点 / 归一化（决策 1 + 2）----
+        # state_mode: 'ego' = 自车系表达（逐帧把自车放原点、航向 0，默认）
+        #             'abs' = 旧行为，直接喂绝对坐标（消融用）
+        self.state_mode = str(getattr(config, 'state_mode', 'ego'))
+        # ref_mode:   'nearest' = 窗口内最近点投影，参考点随位置推进（默认）
+        #             'index'   = 逐帧 +1，参考点随时钟推进（旧行为，消融用）
+        self.ref_mode = str(getattr(config, 'ref_mode', 'nearest'))
+        self.ref_window = int(getattr(config, 'ref_window', 25))
+        self.obs_norm = bool(getattr(config, 'obs_norm', True))
+        # 网络输入维度：ego 只保留 [x?, y?, v_lon, phi?]，丢掉 v_lat/omega
+        # （GPUDrive 不提供这两个量，实测恒为 0，占着输入位纯属浪费）
+        self.ENCODED_EGO = 4
+        self.ENCODED_DIM = (self.ENCODED_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
+                            + self.DIM_REF_ERROR + self.DIM_TEMPORAL + self.DIM_VEH)
+        self.input_norm = RunningNorm(self.ENCODED_DIM)
+        # 把参考点模式同步给 state builder（obs 构建时也要按同一规则推进索引）
+        if hasattr(state_builder, 'ref_mode'):
+            state_builder.ref_mode = self.ref_mode
+            state_builder.ref_window = self.ref_window
 
         # 超参
         self.dt = config.dt
@@ -46,14 +69,14 @@ class DiscreteIDCAgent:
         # 网络
         self.window_size = int(getattr(config, 'window_size', 16))
         self.actor = TransformerActor(
-            state_dim=self.TOTAL_STATE_DIM,
+            state_dim=self.ENCODED_DIM,
             d_model=int(getattr(config, 'transformer_d_model', 256)),
             nhead=int(getattr(config, 'transformer_nhead', 4)),
             num_layers=int(getattr(config, 'transformer_num_layers', 2)),
             window_size=self.window_size,
             dropout=float(getattr(config, 'transformer_dropout', 0.1)),
         ).to(device)
-        self.critic = ContinuousCritic(self.TOTAL_STATE_DIM, config.hidden_dim).to(device)
+        self.critic = ContinuousCritic(self.ENCODED_DIM, config.hidden_dim).to(device)
         self.dynamics = KinematicBicycleModel(
             dt=self.dt,
             L=config.wheelbase,
@@ -66,14 +89,26 @@ class DiscreteIDCAgent:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.lr_critic_max)
 
         # 余弦退火调度器
-        steps_per_epoch = 91
-        buffer_fill = max(1, self.batch_size // self.num_worlds)
-        pev_per_epoch = max(1, steps_per_epoch - buffer_fill)
-        total_u_steps = pev_per_epoch * config.epochs
+        # 【修正 S4】原来 actor/critic 共用 total_u_steps = 每 epoch 步数 × epochs，
+        # 但 actor_scheduler 只在 PIM 里 step（每 pim_interval 个 env step 一次），
+        # critic_scheduler 每个 env step 都 step。共用一个 T_max 会让 actor 的 LR
+        # 全程只走完 cos 曲线的 1/pim_interval（约 3%），等于几乎不衰减。
+        # 这里按"调度器实际被 step 的次数"分别标定。
+        steps_per_epoch = int(getattr(state_builder, 'EXPERT_TRAJ_LEN', None) or 91)
+        # 缓冲填满之前不训练，前 buffer_fill 个 env step 不产生 update()
+        buffer_fill = max(1, int(math.ceil(self.batch_size / max(self.num_worlds, 1))))
+        update_per_epoch = max(1, steps_per_epoch - buffer_fill)
+        total_env_updates = update_per_epoch * config.epochs
+        # 注意：self.pev_interval 在下面"目标函数一致性"块才定义，这里先就地取一次
+        pev_iv = max(int(getattr(config, 'pev_interval', 1)), 1)
+        total_pev_steps = max(1, total_env_updates // pev_iv)
+        total_pim_steps = max(1, total_env_updates // max(config.pim_interval, 1))
         self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.actor_optimizer, T_max=total_u_steps, eta_min=config.lr_actor_min)
+            self.actor_optimizer, T_max=total_pim_steps, eta_min=config.lr_actor_min)
         self.critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.critic_optimizer, T_max=total_u_steps, eta_min=config.lr_critic_min)
+            self.critic_optimizer, T_max=total_pev_steps, eta_min=config.lr_critic_min)
+        logger.info(f'[LR] steps/ep={steps_per_epoch} update/ep={update_per_epoch} '
+                    f'T_max(actor)={total_pim_steps} T_max(critic)={total_pev_steps}')
 
         # IDC 成本权重
         self.pos_err_weight = config.pos_err_weight
@@ -84,6 +119,11 @@ class DiscreteIDCAgent:
         self.lookahead_pos_weight = config.lookahead_pos_weight
         self.lookahead_heading_weight = config.lookahead_heading_weight
         self.progress_weight = getattr(config, 'progress_weight', 0.0)
+        self.ttc_weight = getattr(config, 'ttc_weight', 0.0)
+        self.jerk_weight = getattr(config, 'jerk_weight', 0.0)
+        self.jerk_max = getattr(config, 'jerk_max', 120.0)
+        self.penalty_scale = getattr(config, 'penalty_scale', 1.0)
+        self.road_weight = getattr(config, 'road_weight', 0.0)
 
         # GEP 惩罚
         self.rho = config.init_penalty
@@ -92,6 +132,32 @@ class DiscreteIDCAgent:
         self.gamma = config.gamma
         self.pev_step = 0
         self.pim_interval = config.pim_interval
+        self._upd_step = 0
+
+        # ---- 罚因子调度 ----
+        # 'ema' : 现状（有界自适应，可升可降）
+        # 'gep' : 论文 Algorithm 1 原版，每 m 次 PIM 后无条件 rho <- c*rho（单调放大）
+        self.penalty_schedule = getattr(config, 'penalty_schedule', 'ema')
+        self.gep_amplifier = float(getattr(config, 'gep_amplifier', 1.1))
+
+        # ---- 目标函数一致性 ----
+        # 截断作用在**物理偏差**上（而不是总代价）：超过阈值的偏差在 3 s 时域内
+        # 本来就不可能弥补，继续加大只会污染梯度。utility_clamp 只作发散保护。
+        self.pos_err_clamp = float(getattr(config, 'pos_err_clamp', 50.0))
+        self.lat_err_clamp = float(getattr(config, 'lat_err_clamp', 20.0))
+        self.utility_clamp = float(getattr(config, 'utility_clamp', 1.0e4))
+        self.penalty_clamp = float(getattr(config, 'penalty_clamp', 100.0))
+        # 训练节奏：PEV / PIM 各按 env step 计数
+        self.pev_interval = max(int(getattr(config, 'pev_interval', 1)), 1)
+
+        # ---- 采样权重 / 约束归属 / 安全域形状 ----
+        self.use_is_weights = bool(getattr(config, 'use_is_weights', True))
+        # True: 道路约束进 φ（论文 (1) 第三式是安全约束）；False: 退回 J_actor 软代价
+        self.road_in_penalty = bool(getattr(config, 'road_in_penalty', True))
+        # False: 双圆中心距标量阈值（现状）；True: 论文 (1) 的 Mahalanobis 椭圆
+        self.veh_safe_ellipse = bool(getattr(config, 'veh_safe_ellipse', False))
+        self.veh_safe_long = float(getattr(config, 'veh_safe_long', 5.0))
+        self.veh_safe_lat = float(getattr(config, 'veh_safe_lat', 2.2))
 
         # 安全距离
         self.D_veh_safe = config.D_veh_safe
@@ -107,6 +173,10 @@ class DiscreteIDCAgent:
             state_dim=self.TOTAL_STATE_DIM,
         )
         self.global_step = 1
+        # 每个 world 的"代际"：resample 换掉某些 world 时递增，缓冲区据此拒掉陈旧样本，
+        # 这样其余 world 的经验不会被整体清空。
+        self.world_gen = {w: 0 for w in range(self.num_worlds)}
+        self.buffer.world_gen = self.world_gen
 
         # per-world 状态窗口（训练/推理时维护，不持久化）
         self.state_windows: Dict[int, Any] = {}
@@ -135,6 +205,80 @@ class DiscreteIDCAgent:
         self.epoch_history_pdms = []
 
 
+    # ==========================================================
+    # 动作映射：网络 raw 输出 -> 物理量（唯一实现）
+    # select_action / f_pred_batch / utility_batch 必须共用同一份，
+    # 否则"训练里用的动作"和"下发到环境的动作"会漂移（原实现抄了两份）。
+    # ==========================================================
+    STEER_SCALE = 0.3     # raw -> δ 的线性系数
+    STEER_MAX = 0.6       # δ 上限 (rad)，与 GPUDrive 连续动作空间对齐
+    ACC_MAX_POS = 1.5     # 正加速度上限 (m/s²)
+    ACC_MAX_NEG = 3.0     # 制动上限 (m/s²)
+
+    def _physical_action(self, u_raw: torch.Tensor):
+        """u_raw: [..., 2] = [steer_raw, acc_raw] -> (a_phy, delta_phy)"""
+        delta_phy = torch.clamp(u_raw[..., 0] * self.STEER_SCALE,
+                                -self.STEER_MAX, self.STEER_MAX)
+        acc_norm = torch.tanh(u_raw[..., 1])
+        a_phy = torch.where(acc_norm >= 0,
+                            acc_norm * self.ACC_MAX_POS,
+                            acc_norm * self.ACC_MAX_NEG)
+        return a_phy, delta_phy
+
+    def _clamp_l(self, l: torch.Tensor) -> torch.Tensor:
+        """单步 utility 截断。actor 与 critic 必须调用同一个函数。"""
+        return torch.clamp(l, -self.utility_clamp, self.utility_clamp)
+
+    def _clamp_p(self, p: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(p, max=self.penalty_clamp)
+
+    # ==========================================================
+    # 状态表示：绝对坐标 -> 自车系（逐帧）
+    # ==========================================================
+    def _encode(self, s: torch.Tensor) -> torch.Tensor:
+        """绝对坐标状态 -> 网络特征（ENCODED_DIM 维）。
+
+        - state_mode='ego'：逐帧把自车放原点、航向置 0，周车转成该帧自车系相对量
+        - 丢掉 v_lat / omega（GPUDrive 不提供这两个量，实测恒为 0，占输入位无用）
+        - validity / ref_error / 进度索引 / 车长 本来就与坐标系无关，原样保留
+
+        s: [..., TOTAL_STATE_DIM] -> [..., ENCODED_DIM]
+        """
+        lead = s.shape[:-1]
+        x, y, phi = s[..., 0], s[..., 1], s[..., 4]
+        o = s[..., self.DIM_EGO:self.DIM_EGO + self.DIM_OTHERS].reshape(*lead, 8, 4)
+        if self.state_mode == 'ego':
+            c, sn = torch.cos(phi), torch.sin(phi)
+            ex = torch.zeros_like(x)
+            ey = torch.zeros_like(y)
+            ephi = torch.zeros_like(phi)
+            dx = o[..., 0] - x.unsqueeze(-1)
+            dy = o[..., 1] - y.unsqueeze(-1)
+            rx = dx * c.unsqueeze(-1) + dy * sn.unsqueeze(-1)
+            ry = -dx * sn.unsqueeze(-1) + dy * c.unsqueeze(-1)
+            dphi = o[..., 2] - phi.unsqueeze(-1)
+            dphi = torch.atan2(torch.sin(dphi), torch.cos(dphi))
+        else:
+            ex, ey, ephi = x, y, phi
+            rx, ry, dphi = o[..., 0], o[..., 1], o[..., 2]
+
+        ego_enc = torch.stack([ex, ey, s[..., 2], ephi], dim=-1)      # 4 维
+        others_enc = torch.stack([rx, ry, dphi, o[..., 3]], dim=-1).reshape(
+            *lead, self.DIM_OTHERS)                                   # 32 维
+        rest = s[..., self.DIM_EGO + self.DIM_OTHERS:]                # 28 维
+        return torch.cat([ego_enc, others_enc, rest], dim=-1)
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        return self.input_norm(x) if self.obs_norm else x
+
+    def _policy(self, s_window: torch.Tensor) -> torch.Tensor:
+        """actor 的唯一入口：编码 -> 归一化 -> 前向。所有调用点都必须走这里。"""
+        return self.actor(self._norm(self._encode(s_window)))
+
+    def _value(self, s: torch.Tensor) -> torch.Tensor:
+        """critic 的唯一入口。"""
+        return self.critic(self._norm(self._encode(s)))
+
     def select_action(self, state, deterministic=False):
         """
         state: list of state objects (batch)，按世界索引排列
@@ -153,26 +297,20 @@ class DiscreteIDCAgent:
 
             window_tensor = torch.from_numpy(
                 np.stack(batch_windows)).to(self.device)
-            raw_output = self.actor(window_tensor)
+            enc_window = self._encode(window_tensor)
+            # 用"策略实际访问到的状态分布"更新归一化统计（只取当前帧）
+            self.input_norm.update(enc_window[:, -1, :])
+            raw_output = self.actor(self._norm(enc_window))
             batch_size = raw_output.shape[0]
             raw_output = raw_output.view(batch_size, self.max_agents, 2)
 
             if not deterministic:
-                noise = torch.normal(0, self.noise_std * 0.3, size=raw_output.shape,
+                noise = torch.normal(0, self.noise_std, size=raw_output.shape,
                                      device=raw_output.device)
                 raw_output = raw_output + noise
 
-            # 转向：线性映射 + clamp → [-0.6, 0.6] rad
-            delta_phy = torch.clamp(raw_output[..., 0] * 0.3, -0.6, 0.6)
-
-            # 加速度：tanh → 非对称映射 → [-3.0, 1.5] m/s²
-            acc_norm = torch.tanh(raw_output[..., 1])
-            a_phy = torch.where(
-                acc_norm >= 0,
-                acc_norm * 1.5,
-                acc_norm * 3.0
-            )
-
+            # raw -> 物理量（与 rollout / 代价计算共用同一实现）
+            a_phy, delta_phy = self._physical_action(raw_output)
             action = torch.stack([a_phy, delta_phy], dim=-1)
 
             if self.global_step % 10 == 0:
@@ -204,7 +342,7 @@ class DiscreteIDCAgent:
         s_window = windows
         l_min_log, l_max_log = float('inf'), float('-inf')
         for t in range(self.horizon):
-            u = self.actor(s_window)
+            u = self._policy(s_window)
             if torch.isnan(u).any():
                 logger.warning(f'[NaN] actor output at rollout step {t}')
             s_next = self.f_pred_batch(s_window[:, -1, :], u, world_indices, path_indices)
@@ -215,7 +353,7 @@ class DiscreteIDCAgent:
                 logger.warning(f'[NaN] utility at rollout step {t}')
             l_min_log = min(l_min_log, l.min().item())
             l_max_log = max(l_max_log, l.max().item())
-            total_utility = total_utility + (self.gamma ** t) * torch.clamp(l, -50.0, 50.0)
+            total_utility = total_utility + (self.gamma ** t) * self._clamp_l(l)
             s_window = torch.cat([s_window[:, 1:, :], s_next.unsqueeze(1)], dim=1)
         if self.global_step % 50 == 0:
             tu = total_utility
@@ -235,30 +373,35 @@ class DiscreteIDCAgent:
         # 提取 validity mask 并在推演中保持不变
         val_start = self.DIM_EGO + self.DIM_OTHERS
         validity_tensors = states[:, val_start:val_start + self.DIM_VALIDITY]
-        # 提取时序索引并累加（模拟时间推进）
+        # 路径进度索引（nearest 模式下会被"投影到最近点"更新；index 模式下逐帧 +1）
         temp_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY + self.DIM_REF_ERROR
         temporal_idx = states[:, temp_start:temp_start + self.DIM_TEMPORAL].squeeze(-1).long()
-        temporal_next = (temporal_idx + 1).long()
         
-        # 1. 动力学推演（将Actor原始输出映射为物理量，与select_action保持一致）
-        delta_phy = torch.clamp(actions[..., 0] * 0.3, -0.6, 0.6)
-        acc_norm = torch.tanh(actions[..., 1])
-        a_phy = torch.where(acc_norm >= 0,
-                            acc_norm * 1.5,
-                            acc_norm * 3.0)
+        # 1. 动力学推演（raw -> 物理量，与 select_action 共用同一实现）
+        a_phy, delta_phy = self._physical_action(actions)
         actions_phy = torch.stack([a_phy, delta_phy], dim=-1)  # [acc, steer]
-        ego_next = self.dynamics(ego_tensors[...,:6], actions_phy)
+        # 轴距逐车取：GPUDrive 用 size.length 当轴距，逐车不同（实测 4.80~5.29 m）
+        veh_len = states[:, self.TOTAL_STATE_DIM - 1:self.TOTAL_STATE_DIM]
+        ego_next = self.dynamics(ego_tensors[..., :6], actions_phy, wheelbase=veh_len)
         x_raw, y_raw, theta_next, v_next = ego_next[:, 0], ego_next[:, 1], ego_next[:, 2], ego_next[:, 3]
 
         # 构建 world_t, path_t 用于 ref_tensor 直接索引
         wt = torch.tensor(list(w_i), device=x_raw.device, dtype=torch.long)
         pt = torch.tensor(list(p_i), device=x_raw.device, dtype=torch.long) if p_i is not None else torch.zeros_like(wt)
 
-        # 2. 参考点查询（用时序索引替代空间最近点，消除跳变）
+        # 2. 参考点查询
+        #    nearest: 在上一进度索引的窗口内做最近点投影 -> 参考点随"位置"推进，
+        #             不会因为 ego 慢下来就跑到前面去（修 S6）
+        #    index  : 旧行为，逐帧 +1（参考点随时钟推进）
         refs = self.state_builder.get_ref_states_batch(
             w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
-            temporal_indices=temporal_next)
+            temporal_indices=temporal_idx, ref_mode=self.ref_mode,
+            window=self.ref_window)
         ref_x, ref_y = refs[:, 0], refs[:, 1]
+        if self.ref_mode == 'nearest':
+            temporal_next = torch.clamp(refs[:, 6].long(), max=90)
+        else:
+            temporal_next = (temporal_idx + 1).long()
 
         # 3. 直接使用动力学输出（坏world已由训练脚本过滤，不再需要clamp）
         x_next = x_raw
@@ -298,15 +441,18 @@ class DiscreteIDCAgent:
         delta_v = ego_speed - refs[:, 2]
 
         # 6. 前瞻参考点：给 Actor 前方弯道/道路信息（t+5, t+10, t+15）
-        tl1 = torch.clamp(temporal_next + 5, max=91)
-        tl2 = torch.clamp(temporal_next + 10, max=91)
-        tl3 = torch.clamp(temporal_next + 15, max=91)
+        tl1 = torch.clamp(temporal_next + 5, max=90)
+        tl2 = torch.clamp(temporal_next + 10, max=90)
+        tl3 = torch.clamp(temporal_next + 15, max=90)
         refs_l1 = self.state_builder.get_ref_states_batch(
-            w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i, temporal_indices=tl1)
+            w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
+            temporal_indices=tl1, ref_mode='index')
         refs_l2 = self.state_builder.get_ref_states_batch(
-            w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i, temporal_indices=tl2)
+            w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
+            temporal_indices=tl2, ref_mode='index')
         refs_l3 = self.state_builder.get_ref_states_batch(
-            w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i, temporal_indices=tl3)
+            w_i, x_raw.detach(), y_raw.detach(), self.ego_indices, p_i,
+            temporal_indices=tl3, ref_mode='index')
 
         lat_l1 = (refs_l1[:, 1] - y_next) * torch.cos(refs_l1[:, 4]) - (refs_l1[:, 0] - x_next) * torch.sin(refs_l1[:, 4])
         dphi_l1 = refs_l1[:, 4] - theta_next
@@ -341,9 +487,9 @@ class DiscreteIDCAgent:
         # 组合并返回最终状态
         return torch.cat([ego_next_formatted, others_next.view(len(states), -1),
                           validity_tensors, ref_error_tensors,
-                          temporal_next.unsqueeze(-1).float()], dim=-1)
+                          temporal_next.unsqueeze(-1).float(), veh_len], dim=-1)
     
-    def update_critic(self, windows, world_indices, path_indices=None):
+    def update_critic(self, windows, world_indices, path_indices=None, is_weights=None):
         logger.debug(f'更新 Critic: windows shape={windows.shape}')
         with torch.no_grad():
             targets = self.compute_rollout_target(windows, world_indices, path_indices).detach()
@@ -351,12 +497,20 @@ class DiscreteIDCAgent:
 
         if torch.isnan(targets).any():
             logger.warning(f'Target 包含 NaN，跳过本次 Critic 更新')
-            return float('nan')
+            return float('nan'), None
 
-        values = self.critic(windows[:, -1, :])
+        values = self._value(windows[:, -1, :])
         logger.debug(f"[DEBUG] value stats: min={values.min().item():.2f}, max={values.max().item():.2f}, mean={values.mean().item():.2f}, has_nan={torch.isnan(values).any()}")
 
-        loss = F.mse_loss(values, targets.unsqueeze(1))
+        # 逐样本残差：既用于 MSE，也用于 PER 优先级回写（只做优先采样不做偏差
+        # 校正会引入估计偏差，见 per_buffer.sample_batch 的 IS 权重）
+        with torch.no_grad():
+            td_abs = (targets.unsqueeze(1) - values).abs().view(-1)
+        loss_per = (values - targets.unsqueeze(1)) ** 2
+        if is_weights is not None:
+            loss = (is_weights * loss_per.view(-1)).mean()
+        else:
+            loss = loss_per.mean()
         logger.debug(f"[DEBUG] loss = {loss.item():.4f}")
 
         self.critic_optimizer.zero_grad()
@@ -373,25 +527,40 @@ class DiscreteIDCAgent:
 
         self.critic_optimizer.step()
         self.critic_scheduler.step()
-        return loss.detach().item()
+        return loss.detach().item(), td_abs.cpu().numpy()
 
-    def update_actor(self, windows, w_i, p_i=None):
+    def update_actor(self, windows, w_i, p_i=None, is_weights=None):
         total_cost = torch.zeros(windows.shape[0], device=self.device)
         s_window = windows
         ref_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
         max_penalty = 0.0
+        prev_raw_acc = torch.zeros(windows.shape[0], device=self.device)
         for t in range(self.horizon):
-            u = self.actor(s_window)
+            u = self._policy(s_window)
             s_next = self.f_pred_batch(s_window[:, -1, :], u, w_i, p_i)
             l = self.utility_batch(s_next, u, w_i, p_i)
+
+            # Jerk 惩罚：抑制加速度高频跳动
+            if self.jerk_weight > 0 and t > 0:
+                curr_raw_acc = torch.tanh(u[:, 1])
+                jerk = (curr_raw_acc - prev_raw_acc) / self.dt
+                l = l + self.jerk_weight * (jerk / self.jerk_max) ** 2
+            prev_raw_acc = torch.tanh(u[:, 1])
             if t == 0:
                 logger.info(f'[LA-DIAG] l1(lat={s_next[0, ref_start+3]:.2f} dphi={s_next[0, ref_start+4]:.3f} road={s_next[0, ref_start+5]:.1f} spd={s_next[0, ref_start+6]:.1f}) '
                             f'l2(lat={s_next[0, ref_start+7]:.2f} dphi={s_next[0, ref_start+8]:.3f} road={s_next[0, ref_start+9]:.1f} spd={s_next[0, ref_start+10]:.1f}) '
                             f'l3(lat={s_next[0, ref_start+11]:.2f} dphi={s_next[0, ref_start+12]:.3f} road={s_next[0, ref_start+13]:.1f} spd={s_next[0, ref_start+14]:.1f}) '
                             f'delta_p={s_next[0, ref_start]:.2f} delta_phi={s_next[0, ref_start+1]:.3f} spd={s_next[0, ref_start+2]:.1f}')
-            l = torch.clamp(l, -5000.0, 5000.0)
-            p = self.penalty_batch(s_next, w_i, p_i)
-            p = torch.clamp(p, max=100.0)
+            l = self._clamp_l(l)
+            p = self._clamp_p(self.penalty_batch(s_next, w_i, p_i))
+            if not torch.isfinite(l).all() or not torch.isfinite(p).all():
+                logger.warning(
+                    f'[NaN-src] t={t} u={bool(torch.isfinite(u).all())} '
+                    f's_next={bool(torch.isfinite(s_next).all())} '
+                    f'l={bool(torch.isfinite(l).all())} p={bool(torch.isfinite(p).all())} '
+                    f'ego={bool(torch.isfinite(s_next[:, :6]).all())} '
+                    f'oth={bool(torch.isfinite(s_next[:, 6:38]).all())} '
+                    f'ref={bool(torch.isfinite(s_next[:, 46:64]).all())}')
             max_penalty = max(max_penalty, p.max().item())
             if t == 0:
                 logger.debug(f'[DIAG-pen] raw penalty min={p.min().item():.2f} max={p.max().item():.2f} '
@@ -399,7 +568,10 @@ class DiscreteIDCAgent:
             total_cost = total_cost + (self.gamma ** t) * (l + self.rho * p)
             s_window = torch.cat([s_window[:, 1:, :], s_next.unsqueeze(1)], dim=1)
 
-        actor_loss = total_cost.mean()
+        if is_weights is not None:
+            actor_loss = (is_weights * total_cost).mean()
+        else:
+            actor_loss = total_cost.mean()
         has_violation = max_penalty > 0.5
 
         bc_weight = getattr(self.config, 'bc_weight', 0.0)
@@ -408,9 +580,13 @@ class DiscreteIDCAgent:
             temporal_idx = windows[:, -1, temp_start:temp_start + self.DIM_TEMPORAL].squeeze(-1).long()
             expert_steer = self.state_builder.get_expert_steer_batch(
                 w_i, temporal_idx, self.ego_indices)
-            raw_init = self.actor(windows)
-            actor_steer = torch.clamp(raw_init[:, 0] * 0.3, -0.6, 0.6)
+            raw_init = self._policy(windows)
+            _, actor_steer = self._physical_action(raw_init)
             bc_loss = ((actor_steer - expert_steer.to(actor_steer.device)) ** 2).mean()
+            if not torch.isfinite(bc_loss):
+                logger.warning(f'[NaN-src] bc_loss 非有限: actor_steer_finite='
+                               f'{bool(torch.isfinite(actor_steer).all())} '
+                               f'expert_finite={bool(torch.isfinite(expert_steer).all())}')
             actor_loss = actor_loss + bc_weight * bc_loss
             if self.global_step % 50 == 0:
                 logger.info(f'[DIAG-bc] bc_loss={bc_loss.item():.4f} weight={bc_weight} '
@@ -444,9 +620,9 @@ class DiscreteIDCAgent:
             with torch.no_grad():
                 for name, param in self.actor.named_parameters():
                     param.copy_(backup[name])
-            self.pev_step = max(0, self.pev_step - 1)
-            self.gep_iteration = max(0, self.gep_iteration - 1)
-            self.rho = max(0.0, self.rho - self.amplifier_c)
+            # rho 是乘性罚因子，回滚时保持不动即可。
+            # （原实现先 pev_step -= 1、再 gep_iteration -= 1、再 rho -= amplifier_c，
+            #  三者语义都不成立：pev_step 在进函数前已被清零，rho 是倍数不是增量。）
             actor_loss = float('nan')
             has_violation = False
             max_penalty = 0.0
@@ -467,27 +643,49 @@ class DiscreteIDCAgent:
 
         pos_err = torch.sqrt((ego[:, 0] - refs[:, 0]) ** 2
                             + (ego[:, 1] - refs[:, 1]) ** 2 + 1e-8)
+        pos_err = torch.clamp(pos_err, max=self.pos_err_clamp)
         # 直接读 state 中的 delta_phi（与 f_pred_batch 和 _calc_ref_error 含义一致）
         ref_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
-        heading_err = s[:, ref_start + 1]
+        heading_err = torch.clamp(s[:, ref_start + 1], -math.pi, math.pi)
         speed_err = torch.sqrt((ego[:, 2] - refs[:, 2]) ** 2
                               + (ego[:, 3] - refs[:, 3]) ** 2 + 1e-8)
+        speed_err = torch.clamp(speed_err, max=30.0)
 
-        steer_cost = u[:, 0] ** 2
-        acc_cost = u[:, 1] ** 2
+        # 前瞻横向偏差同样按物理量截断
+        lat1 = torch.clamp(s[:, ref_start + 3], -self.lat_err_clamp, self.lat_err_clamp)
+        lat2 = torch.clamp(s[:, ref_start + 7], -self.lat_err_clamp, self.lat_err_clamp)
+        lat3 = torch.clamp(s[:, ref_start + 11], -self.lat_err_clamp, self.lat_err_clamp)
+
+        # 控制代价必须作用在物理量 δ(rad) / a(m/s²) 上（论文 R = diag(0.1, 0.005)）。
+        # 不能用网络 raw 输出：raw 在动作饱和后仍无界增长，会把"已经饱和的动作"
+        # 继续往 0 推，制造 steer bang-bang（满舵时原实现约比论文重 17 倍）。
+        a_phy, delta_phy = self._physical_action(u)
+        steer_cost = delta_phy ** 2
+        acc_cost = a_phy ** 2
 
         l = (self.pos_err_weight * pos_err ** 2
              + (0.0 if self.fix_speed else self.speed_err_weight) * speed_err ** 2
              + (0.0 if self.fix_heading else self.heading_err_weight) * heading_err ** 2
              + self.steer_cost_weight * steer_cost
              + self.acc_cost_weight * acc_cost
-             + self.lookahead_pos_weight * (s[:, ref_start + 3] ** 2 + s[:, ref_start + 7] ** 2 + s[:, ref_start + 11] ** 2)
+             + self.lookahead_pos_weight * (lat1 ** 2 + lat2 ** 2 + lat3 ** 2)
              + self.lookahead_heading_weight * (s[:, ref_start + 4] ** 2 + s[:, ref_start + 8] ** 2 + s[:, ref_start + 12] ** 2))
 
         if self.progress_weight > 0:
             speed_along_path = ego[:, 2] * torch.cos(s[:, ref_start + 1])
             progress = torch.clamp(speed_along_path, min=0.0) * self.dt
             l = l - self.progress_weight * progress
+
+        # 道路约束默认已移到 penalty_batch（论文 (1) 把路沿当安全约束，需要被 rho
+        # 放大）。这里保留 road_in_penalty=False 时的旧软代价路径，便于做消融。
+        if (not self.road_in_penalty) and self.road_weight > 0 \
+                and not getattr(self.config, 'no_road_penalty', False):
+            lat = s[:, ref_start + 3]
+            road_dist_ref = torch.clamp(self.state_builder.get_road_dist_batch(
+                w_i, temporal_idx, self.ego_indices,
+                p_i if p_i is not None else [0]*len(w_i), s.device), max=50.0)
+            ego_road_dist = torch.clamp(road_dist_ref - torch.abs(lat), min=0.0)
+            l = l + self.road_weight * F.relu(self.D_road_safe - ego_road_dist)
 
         # 诊断：每次调用自动抓 pos_err 最大的样本
         max_idx = pos_err.argmax().item()
@@ -531,55 +729,116 @@ class DiscreteIDCAgent:
         # 4 组距离: ego[2] × other[8,2] → [batch, 8, 2, 2]
         diff = ego_circles[:, None, :, None, :] - oth_circles[:, :, None, :, :]
         dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # [batch, 8, 2, 2]
-        pair_pen = F.relu(self.D_veh_safe - dist).pow(2)          # [batch, 8, 2, 2]
+
+        if self.veh_safe_ellipse:
+            # 论文 (1) 的 Mahalanobis 形式：(x-xj)ᵀ M (x-xj) >= D_safe。
+            # 把圆心差投影到周车自身坐标系，纵横半轴分别归一化 -> 椭圆安全域，
+            # 解决"单标量阈值在纵向过保守、在横向贴着车道线就报警"的问题。
+            cphi = torch.cos(others[:, :, 2]).unsqueeze(2).unsqueeze(2)   # [batch, 8, 1, 1]
+            sphi = torch.sin(others[:, :, 2]).unsqueeze(2).unsqueeze(2)
+            dx, dy = diff[..., 0], diff[..., 1]
+            long_n = (dx * cphi + dy * sphi) / max(self.veh_safe_long, 1e-6)
+            lat_n = (-dx * sphi + dy * cphi) / max(self.veh_safe_lat, 1e-6)
+            norm_dist = torch.sqrt(long_n ** 2 + lat_n ** 2 + 1e-8)  # =1 即贴在安全椭圆上
+            pair_pen = F.relu(1.0 - norm_dist)                        # 一次方，与现状同阶
+        else:
+            pair_pen = F.relu(self.D_veh_safe - dist)                # 一次方：边界附近连续梯度
+
         per_veh_max = pair_pen.flatten(2).max(dim=2).values       # [batch, 8]
         veh_violation = (per_veh_max * validity).sum(dim=1)       # [batch]
 
-        # 道路边界惩罚：基于参考路径的 road_dist + 自车 lateral error
-        # road_dist_ref: 参考点到最近道路边线的距离（≈半幅路宽）
-        # lat: 自车相对参考路径的横向偏移
-        # ego_road_dist = road_dist_ref - |lat|: 为负数时说明已跨出路外
-        ref_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
-        lat = s[:, ref_start + 3]  # 当前步横向偏移（从 state ref_error 取 lat_l1）
-        temp_start = ref_start + self.DIM_REF_ERROR
-        temporal_idx = s[:, temp_start:temp_start + self.DIM_TEMPORAL].squeeze(-1).long()
-        road_dist_ref = torch.clamp(self.state_builder.get_road_dist_batch(
-            w_i, temporal_idx, self.ego_indices, p_i if p_i is not None else [0]*len(w_i), s.device), max=50.0)
-        ego_road_dist = road_dist_ref - torch.abs(lat)
-        road_violation = F.relu(self.D_road_safe - ego_road_dist)
+        # TTC 连续惩罚：给碰撞前的逼近-减速梯度
+        ttc_violation = torch.zeros_like(veh_violation)
+        if self.ttc_weight > 0:
+            ego_v = ego[:, 2]
+            ego_h = ego[:, 4]
+            rel_x = others[:, :, 0] - ego[:, 0].unsqueeze(1)
+            rel_y = others[:, :, 1] - ego[:, 1].unsqueeze(1)
+            ttc_dist = torch.sqrt(rel_x ** 2 + rel_y ** 2 + 1e-8)
+            fwd_x = torch.cos(ego_h).unsqueeze(1)
+            fwd_y = torch.sin(ego_h).unsqueeze(1)
+            fwd_align = (rel_x * fwd_x + rel_y * fwd_y) / (ttc_dist + 1e-8)
+            other_v = others[:, :, 3]
+            ttc_closing = torch.clamp(ego_v.unsqueeze(1) - other_v * fwd_align, min=0.0)
+            ttc = ttc_dist / (ttc_closing + 1e-4)
+            ttc_pen = torch.clamp(4.0 - ttc, min=0.0, max=4.0) / 4.0
+            ttc_violation = (ttc_pen * validity).sum(dim=1) * self.ttc_weight
 
         if getattr(self.config, 'no_veh_penalty', False):
             veh_violation = torch.zeros_like(veh_violation)
-        if getattr(self.config, 'no_road_penalty', False):
-            road_violation = torch.zeros_like(road_violation)
 
-        return veh_violation + road_violation
+        # ---- 道路边界约束（论文 (1) 第三式，属于安全约束 -> 进 φ 被 rho 放大）----
+        road_violation = torch.zeros_like(veh_violation)
+        if self.road_in_penalty and not getattr(self.config, 'no_road_penalty', False):
+            ref_start = self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
+            temp_start = ref_start + self.DIM_REF_ERROR
+            temporal_idx = s[:, temp_start:temp_start + self.DIM_TEMPORAL].squeeze(-1).long()
+            lat = s[:, ref_start + 3]                       # 前瞻点 (t+5) 的横向偏移
+            road_dist_ref = torch.clamp(self.state_builder.get_road_dist_batch(
+                w_i, temporal_idx, self.ego_indices,
+                p_i if p_i is not None else [0] * len(w_i), s.device), max=50.0)
+            ego_road_dist = torch.clamp(road_dist_ref - lat.abs(), min=0.0)
+            road_violation = F.relu(self.D_road_safe - ego_road_dist) * self.road_weight
+
+        return veh_violation + ttc_violation + road_violation
     
     def update(self):
-        windows, word_indexs, path_indices = self.buffer.sample_batch(self.batch_size)
+        # PEV / PIM 各自按 env step 计数：原来 critic 每步都算一次 30 步 rollout，
+        # 而 critic 目前没有任何消费者，等于白烧绝大部分算力。
+        self._upd_step += 1
+        do_pev = (self._upd_step % self.pev_interval == 0)
+        do_pim = (self._upd_step % max(self.pim_interval, 1) == 0)
+        if not (do_pev or do_pim):
+            return None, None
+
+        windows, word_indexs, path_indices, is_weights_np = self.buffer.sample_batch(self.batch_size)
         if len(windows) == 0:
             return None, None
         windows_tensor = torch.from_numpy(windows).to(self.device)
+        # 兜底：坏场景的哨兵值会让整条 rollout 变 NaN，先清一遍
+        bad = ~torch.isfinite(windows_tensor)
+        if bad.any():
+            n_bad = int(bad.any(dim=(1, 2)).sum())
+            logger.warning(f'[NaN-guard] {n_bad}/{len(windows)} 个样本含 inf/nan，已置零')
+            windows_tensor = torch.nan_to_num(windows_tensor, nan=0.0,
+                                              posinf=0.0, neginf=0.0)
+        if self.use_is_weights:
+            is_weights = torch.from_numpy(is_weights_np).to(self.device).float()
+        else:
+            is_weights = None
 
-        # PEV: 每次 update 都更新 critic
-        critic_loss = self.update_critic(windows_tensor, word_indexs, path_indices)
-        self.pev_step += 1
+        # PEV（策略评估）
+        critic_loss, td_abs = None, None
+        if do_pev:
+            critic_loss, td_abs = self.update_critic(
+                windows_tensor, word_indexs, path_indices, is_weights)
 
-        # PIM: 积累足够 PEV 步后才更新 actor
-        # rho 使用 EMA 跟踪近期违规严重度（非累加器，旧违规自动遗忘）
+        # PIM（策略改进）
         actor_loss = None
-        if self.pev_step >= self.pim_interval:
-            self.pev_step = 0
-            actor_loss, has_violation, max_p = self.update_actor(windows_tensor, word_indexs, path_indices)
+        if do_pim:
+            actor_loss, has_violation, max_p = self.update_actor(
+                windows_tensor, word_indexs, path_indices, is_weights)
             self.gep_iteration += 1
-            if has_violation:
+
+            if self.penalty_schedule == 'gep':
+                # 论文 Algorithm 1：每 m 次策略改进后无条件 rho <- c*rho（单调放大）
+                old_rho = self.rho
+                self.rho = min(self.rho * self.gep_amplifier, self.max_penalty)
+                logger.info(f'[GEP-gep] rho {old_rho:.4f} -> {self.rho:.4f} '
+                            f'gep={self.gep_iteration} max_p={max_p:.2f}')
+            elif has_violation:
                 target = self.config.init_penalty + min(max_p, 50.0) * 0.02
                 self.rho = min(0.95 * self.rho + 0.05 * target, self.max_penalty)
-                logger.info(f'[GEP] violation, max_p={max_p:.0f} target={target:.3f} rho={self.rho:.4f} gep={self.gep_iteration}')
+                logger.info(f'[GEP-ema] violation, max_p={max_p:.0f} target={target:.3f} '
+                            f'rho={self.rho:.4f} gep={self.gep_iteration}')
             else:
                 self.rho = max(0.99 * self.rho + 0.01 * self.config.init_penalty,
                                self.config.init_penalty)
-                logger.info(f'[GEP] clean PIM, rho={self.rho:.4f} gep={self.gep_iteration}')
+                logger.info(f'[GEP-ema] clean PIM, rho={self.rho:.4f} gep={self.gep_iteration}')
+
+        # PER 优先级回写（原实现从未调用，优先级只在插入时按跟踪误差定一次）
+        if td_abs is not None:
+            self.buffer.update_last_batch_priorities(td_abs)
 
         return critic_loss, actor_loss
         
@@ -593,6 +852,13 @@ class DiscreteIDCAgent:
             window_size=self.window_size,
             state_dim=self.TOTAL_STATE_DIM,
         )
+        self.buffer.world_gen = self.world_gen
+
+    def bump_world_gen(self, worlds):
+        """resample 换掉了哪些 world，就把它们的代际 +1（其余保持不变）。"""
+        for w in worlds:
+            self.world_gen[int(w)] = self.world_gen.get(int(w), 0) + 1
+        self.buffer.world_gen = self.world_gen
 
     def save(self, save_info: Dict[str, Any]) -> None:
         if self.globe_eps % self.config.save_freq == 0:
@@ -607,6 +873,9 @@ class DiscreteIDCAgent:
                 'state_dim': self.TOTAL_STATE_DIM,
                 'rho': self.rho,
                 'gep_iteration': self.gep_iteration,
+                'state_mode': self.state_mode,
+                'ref_mode': self.ref_mode,
+                'input_norm': self.input_norm.state_dict(),
                 'actor_scheduler_last_epoch': self.actor_scheduler.last_epoch,
                 'critic_scheduler_last_epoch': self.critic_scheduler.last_epoch,
             }
@@ -636,6 +905,18 @@ class DiscreteIDCAgent:
         self.global_step = checkpoint['global_step']
         self.rho = checkpoint['rho'] == 0.0 and self.config.init_penalty or checkpoint['rho']
         self.gep_iteration = checkpoint['gep_iteration']
+        # 归一化统计（换了表示层时维度不匹配会自动跳过）
+        self.input_norm.load_state_dict(checkpoint.get('input_norm'))
+        # 表示层必须跟着 checkpoint 走：用 ego 编码训的权重，评估时若按 abs 喂会静默错配
+        for key in ('state_mode', 'ref_mode'):
+            saved = checkpoint.get(key)
+            if saved is not None and saved != getattr(self, key):
+                logger.warning(f'checkpoint 里的 {key}={saved} 覆盖当前配置 '
+                               f'{getattr(self, key)}')
+                setattr(self, key, saved)
+        if hasattr(self.state_builder, 'ref_mode'):
+            self.state_builder.ref_mode = self.ref_mode
+            self.state_builder.ref_window = self.ref_window
 
         for pg in self.actor_optimizer.param_groups:
             pg['lr'] = self.config.lr_actor_max

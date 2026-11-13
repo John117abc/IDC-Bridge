@@ -34,6 +34,7 @@ class PDMSScorer:
         self.ddc_steps = 0
 
         self.ep_sum = 0.0
+        self.last_temporal = 0
         self.ttc_sum = 0.0
         self.comfort_sum = 0.0
         self.lk_sum = 0.0
@@ -70,7 +71,8 @@ class PDMSScorer:
         if abs(delta_phi) > math.pi / 2:
             self.ddc_steps += 1
 
-        ep = min(1.0, temporal_idx / max(max_step, 1))
+        ep = min(1.0, temporal_idx / max(max_step - 1, 1))
+        self.last_temporal = max(self.last_temporal, int(temporal_idx))
 
         ttc = self._compute_ttc(ego_pos, ego_vel, ego_heading, partners)
         ttc_score = min(1.0, ttc / self.ttc_horizon) if ttc < 1e9 else 1.0
@@ -137,7 +139,9 @@ class PDMSScorer:
         dac = 0.0 if has_off_road else 1.0
         ddc = 0.0 if has_ddc else 1.0
 
-        ep_avg = self.ep_sum / s
+        # EP：末步路线完成度。原实现对"全程瞬时进度"取平均，走完全程也只有 ~0.5，
+        # 等于把总分系统性砍半（我们 README 里 PDMS 卡在 50 左右就是这个原因）。
+        ep_avg = min(1.0, self.last_temporal / max(self.total_steps - 1, 1))
         ttc_avg = self.ttc_sum / s
         comfort_avg = self.comfort_sum / s
         lk_avg = self.lk_sum / s
@@ -165,7 +169,7 @@ class PDMSScorer:
                 'off_road_steps': self.off_road_steps,
                 'ddc_steps': self.ddc_steps,
             },
-            'route_completion': self.steps / max(self.total_steps, 1),
+            'route_completion': ep_avg,
         }
 
 
@@ -202,7 +206,7 @@ class RolloutPDMSScorer:
 
         with torch.no_grad():
             for t in range(horizon):
-                u = agent.actor(s_window)
+                u = agent._policy(s_window)
                 s_next = agent.f_pred_batch(s_window[:, -1, :], u, w_i, p_i)
                 s_window = torch.cat([s_window[:, 1:, :], s_next.unsqueeze(1)], dim=1)
 

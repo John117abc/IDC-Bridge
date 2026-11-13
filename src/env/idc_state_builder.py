@@ -26,8 +26,18 @@ class GPUDriveObservationBuilder:
 
         # 步数计数器
         self.step_counter = {w: 0 for w in range(self.num_worlds)}
+        # 每 world 的"上一帧投影索引"。投影必须以它为种子；若用 step_counter 当种子，
+        # max(prev, best) 会让索引永远不小于时钟，等于没改（参考点仍旧随时钟推进）。
+        self._ref_idx = {w: 0 for w in range(self.num_worlds)}
+        # 每 world 的 size.length（GPUDrive 拿它当轴距，逐车不同）
+        self._ego_len = {w: 5.0 for w in range(self.num_worlds)}
         # 道路张量缓存（一集不变，避免 rollout 中重复 GPU→CPU 传输）
         self._road_cache = None
+        # 参考点推进方式：
+        #   'nearest' = 在上一进度索引附近做最近点投影（参考点随"位置"推进，默认）
+        #   'index'   = 逐帧 +1（旧行为，保留做消融）
+        self.ref_mode = 'nearest'
+        self.ref_window = 25
 
         # ==========================================
         # 1. 初始化部分 (在类的 __init__ 或 reset 中)
@@ -42,8 +52,15 @@ class GPUDriveObservationBuilder:
         logger.debug(f'专家轨迹长度：{self.EXPERT_TRAJ_LEN}')
 
     def generate_candidate_paths(self, ego_indices, num_paths=1,
-                                   num_points=91, lane_width=3.75):
-        """为每个 world 生成专家中心路径（单路径，无 lateral offset）"""
+                                   num_points=91, lane_width=3.75,
+                                   use_expert_path=True,
+                                   trace_logs_out=None):
+        """为每个 world 生成候选路径。
+
+        use_expert_path=True:  使用 expert 轨迹（训练用）
+        use_expert_path=False: 从道路图车道中心线生成（无 expert 部署用）
+        trace_logs_out:        dict[world_idx -> list], 仅 use_expert_path=False 时使用
+        """
         self.candidate_paths = {}
         self.num_candidate_paths = num_paths
 
@@ -54,34 +71,49 @@ class GPUDriveObservationBuilder:
             self.candidate_paths[w] = {}
             world_road = road_tensor[w]
 
-            # 单路径：expert 中心轨迹 + 曲率限速
-            expert_pos_w = self.expert_pos[w, a].cpu().numpy()
-            expert_h_w = self.expert_heading[w, a].squeeze(-1).cpu().numpy()
+            if use_expert_path:
+                # ---- Expert 路径 ----
+                expert_pos_w = self.expert_pos[w, a].cpu().numpy()
+                expert_h_w = self.expert_heading[w, a].squeeze(-1).cpu().numpy()
 
-            valid_len = num_points
-            for j in range(1, num_points):
-                if abs(expert_pos_w[j, 0]) > 5000 or abs(expert_pos_w[j, 1]) > 5000:
-                    valid_len = j
-                    break
-            if valid_len < num_points:
-                expert_pos_w[valid_len:, :] = expert_pos_w[valid_len - 1, :]
-                expert_h_w[valid_len:] = expert_h_w[valid_len - 1]
-                self.expert_pos[w, a] = torch.from_numpy(expert_pos_w)
-                self.expert_heading[w, a, :, :] = torch.from_numpy(expert_h_w.reshape(-1, 1))
-                logger.debug(f'[TRUNCATE] world_{w} agent_{a} expert truncated at step {valid_len}/{num_points}')
+                valid_len = num_points
+                for j in range(1, num_points):
+                    if abs(expert_pos_w[j, 0]) > 5000 or abs(expert_pos_w[j, 1]) > 5000:
+                        valid_len = j
+                        break
+                if valid_len < num_points:
+                    expert_pos_w[valid_len:, :] = expert_pos_w[valid_len - 1, :]
+                    expert_h_w[valid_len:] = expert_h_w[valid_len - 1]
+                    self.expert_pos[w, a] = torch.from_numpy(expert_pos_w)
+                    self.expert_heading[w, a, :, :] = torch.from_numpy(expert_h_w.reshape(-1, 1))
+                    logger.debug(f'[TRUNCATE] world_{w} agent_{a} expert truncated at step {valid_len}/{num_points}')
 
-            paths = []
-            path = {
-                'pos': expert_pos_w.astype(np.float32),
-                'heading': expert_h_w.astype(np.float32),
-                'speed': self._curvature_speed(expert_pos_w),
-            }
-            road_dists = np.zeros(num_points, dtype=np.float32)
-            for j in range(num_points):
-                road_dists[j] = self._road_dist_point(
-                    world_road, float(expert_pos_w[j, 0]), float(expert_pos_w[j, 1]))
-            path['road_dist'] = road_dists
-            paths.append(path)
+                paths = []
+                path = {
+                    'pos': expert_pos_w.astype(np.float32),
+                    'heading': expert_h_w.astype(np.float32),
+                    'speed': self._curvature_speed(expert_pos_w),
+                }
+                road_dists = np.zeros(num_points, dtype=np.float32)
+                for j in range(num_points):
+                    road_dists[j] = self._road_dist_point(
+                        world_road, float(expert_pos_w[j, 0]), float(expert_pos_w[j, 1]))
+                path['road_dist'] = road_dists
+                paths.append(path)
+
+            else:
+                # ---- 道路图路径 ----
+                ego_x = float(self.expert_pos[w, a, 0, 0].item())
+                ego_y = float(self.expert_pos[w, a, 0, 1].item())
+                ego_heading = float(self.expert_heading[w, a, 0, 0].item())
+
+                tl = [] if trace_logs_out is not None else None
+                path = self._generate_path_from_road_graph(
+                    world_road, ego_x, ego_y, ego_heading, num_points,
+                    trace_log_out=tl)
+                if trace_logs_out is not None and tl is not None:
+                    trace_logs_out[w] = tl
+                paths = [path]
 
             # 指数衰减前视聚合：每个路径点的未来曲率/速度/道路预期
             decay_lam = 20
@@ -151,6 +183,506 @@ class GPUDriveObservationBuilder:
         self._last_ego = {}
 
     # ========================================
+    # 道路图路径生成（col6 type 3 = 车道中心线, type 1 = 道路边界）
+    # ========================================
+
+    @staticmethod
+    def _group_road_segments(pts, type_col=6):
+        """按 id (column 7) 分组道路点，组内按距离排序为连续折线。
+        返回 {id: np.ndarray[N_i, 9]}。
+        """
+        ids = np.unique(pts[:, 7])
+        groups = {}
+        for gid in ids:
+            mask = pts[:, 7] == gid
+            group = pts[mask].copy()
+            if len(group) > 1:
+                order = [0]
+                used = {0}
+                while len(order) < len(group):
+                    last = group[order[-1], [0, 1]]
+                    best_i, best_dist = -1, float("inf")
+                    for i in range(len(group)):
+                        if i in used:
+                            continue
+                        d = math.hypot(group[i, 0] - last[0], group[i, 1] - last[1])
+                        if d < best_dist:
+                            best_dist, best_i = d, i
+                    order.append(best_i)
+                    used.add(best_i)
+                group = group[np.array(order, dtype=int)]
+            groups[int(gid)] = group
+        return groups
+
+    @staticmethod
+    def _find_nearest_on_segments(segments, qx, qy, q_heading=None):
+        """在所有车道段的所有点中找到离查询点最近的点。
+        先硬过滤方向偏差 >45° 的段，再搜最近点（带边端惩罚 + 航向对齐）。
+        返回 (seg_id, point_index, distance_m) 或 (None, 0, inf)。
+        """
+        # 阶段 1：硬过滤 —— 只保留与 ego 航向偏差 < 45° 的段
+        if q_heading is not None and len(segments) > 3:
+            aligned = {}
+            for seg_id, pts in segments.items():
+                mean_sin = np.sin(pts[:, 5]).mean()
+                mean_cos = np.cos(pts[:, 5]).mean()
+                mean_h = math.atan2(float(mean_sin), float(mean_cos))
+                diff = abs(math.atan2(math.sin(mean_h - q_heading),
+                                       math.cos(mean_h - q_heading)))
+                if diff < math.radians(45):
+                    aligned[seg_id] = pts
+            if len(aligned) >= 3:
+                segments = aligned
+
+        best_seg, best_idx, best_score = None, 0, float("inf")
+        for seg_id, pts in segments.items():
+            dx = pts[:, 0] - qx
+            dy = pts[:, 1] - qy
+            dists = np.hypot(dx, dy)
+            n = len(pts)
+            for i in range(n):
+                d = float(dists[i])
+                # 边缘惩罚：偏向段中部，避免入口剩余点数太少
+                if i == n - 1:
+                    d += 15.0       # 段尾：最差
+                elif i == n - 2:
+                    d += 5.0        # 倒数第二：勉强
+                elif i == 0:
+                    d += 2.0        # 段首：可接受但非最优
+                elif i == 1 and n > 3:
+                    d += 0.5        # 第二点：稍弱
+
+                # 航向对齐奖励
+                if q_heading is not None:
+                    seg_h = float(pts[i, 5])
+                    h_diff = abs(math.atan2(math.sin(seg_h - q_heading),
+                                             math.cos(seg_h - q_heading)))
+                    d += h_diff * 15.0  # ~25° diff = ~6.5m penalty
+
+                if d < best_score:
+                    best_score = d
+                    best_seg = seg_id
+                    best_idx = i
+        return best_seg, best_idx, best_score
+
+    def _trace_lane_forward(self, segments, entry_seg_id, entry_idx,
+                               max_pts=300, trace_log=None,
+                               original_heading=None):
+        """从入口点沿车道图向前追踪，返回 raw_trace: [(x, y, heading), ...]
+
+        original_heading: ego 初始航向，用于全局方向漂移惩罚。
+        trace_log: 传入 list 即收集每步追踪信息供诊断用；传入 None 则零开销。
+        """
+        raw = []
+        current_seg = entry_seg_id
+        current_idx = entry_idx
+        recent_visited = []    # 最近 5 个段，防止短期循环
+        fully_consumed = set() # 消费 ≥5 点的段永久禁止重入（防止长期循环）
+
+        while len(raw) < max_pts:
+            pts = segments[current_seg]
+            seg_start_x = float(pts[current_idx, 0])
+            seg_start_y = float(pts[current_idx, 1])
+            seg_start_h = float(pts[current_idx, 5])
+
+            # 从 current_idx 走到段尾
+            seg_consumed = 0
+            for i in range(current_idx, len(pts)):
+                raw.append((float(pts[i, 0]), float(pts[i, 1]), float(pts[i, 5])))
+                seg_consumed += 1
+
+            # 如果消费了足够多的点，标记为永久禁止重入
+            if seg_consumed >= 5:
+                fully_consumed.add(current_seg)
+                if current_seg in recent_visited:
+                    recent_visited.remove(current_seg)
+
+            # 段尾坐标
+            end_x, end_y = float(pts[-1, 0]), float(pts[-1, 1])
+            end_heading = float(pts[-1, 5])
+
+            # 段内长度（从入口到段尾）
+            seg_dx = pts[current_idx:, 0] - np.roll(pts[current_idx:, 0], 1)
+            seg_dy = pts[current_idx:, 1] - np.roll(pts[current_idx:, 1], 1)
+            seg_dx[0] = 0.0
+            seg_dy[0] = 0.0
+            seg_length = float(np.sum(np.hypot(seg_dx, seg_dy)))
+
+            # 段内总转向
+            seg_turn = float(np.degrees(math.atan2(
+                math.sin(end_heading - seg_start_h),
+                math.cos(end_heading - seg_start_h))))
+
+            step_info = {
+                "step": len(trace_log) if trace_log is not None else 0,
+                "seg_id": current_seg,
+                "seg_entry_idx": current_idx,
+                "seg_total_pts": len(pts),
+                "seg_consumed": seg_consumed,
+                "seg_length": seg_length,
+                "seg_start_h_deg": float(np.degrees(seg_start_h)),
+                "seg_end_h_deg": float(np.degrees(end_heading)),
+                "seg_turn_deg": seg_turn,
+                "end_x": end_x, "end_y": end_y,
+                "end_h_deg": float(np.degrees(end_heading)),
+                "cumulated_pts": len(raw),
+                "next_seg": None,
+                "next_idx": None,
+                "next_dist": None,
+                "next_dh_deg": None,
+                "next_fwd_score": None,
+                "candidates": [],
+                "best_score": None,
+                "dead_end": False,
+                "extrapolated_pts": 0,
+            }
+
+            recent_visited.append(current_seg)
+            if len(recent_visited) > 5:
+                recent_visited.pop(0)
+
+            # 段尾 → 找下一段（两阶段搜索）
+            candidate_log = [] if trace_log is not None else None
+            visited_ids = set(recent_visited) | fully_consumed
+
+            # 阶段一：标准搜索（max 20m, dh < 60°）
+            next_seg, next_idx, _ = self._find_continuation(
+                segments, end_x, end_y, end_heading,
+                visited_ids=visited_ids,
+                candidate_log=candidate_log,
+                original_heading=original_heading,
+                max_dist=20.0, max_dh=math.radians(60))
+
+            # 阶段二：宽域搜索（max 50m, dh < 30°），仅当阶段一未找到
+            if next_seg is None:
+                far_log = [] if trace_log is not None else None
+                next_seg, next_idx, _ = self._find_continuation(
+                    segments, end_x, end_y, end_heading,
+                    visited_ids=visited_ids,
+                    candidate_log=far_log,
+                    original_heading=original_heading,
+                    max_dist=50.0, max_dh=math.radians(30))
+                if trace_log is not None and far_log is not None:
+                    candidate_log.extend(far_log)
+
+            if next_seg is None:
+                # 死路：不外推，让重采样自然收紧到最后一个有效道路点
+                step_info["dead_end"] = True
+                step_info["extrapolated_pts"] = 0
+                step_info["candidates"] = candidate_log or []
+                if trace_log is not None:
+                    trace_log.append(step_info)
+                break
+
+            # Gap 插值（段尾 → 下一段入口）
+            next_start_x = float(segments[next_seg][next_idx, 0])
+            next_start_y = float(segments[next_seg][next_idx, 1])
+            gap_dist = math.hypot(next_start_x - end_x, next_start_y - end_y)
+            gap_heading = math.atan2(next_start_y - end_y, next_start_x - end_x)
+
+            step_info["next_seg"] = next_seg
+            step_info["next_idx"] = next_idx
+            step_info["next_dist"] = float(gap_dist)
+            step_info["next_dh_deg"] = float(np.degrees(math.atan2(
+                math.sin(float(segments[next_seg][next_idx, 5]) - end_heading),
+                math.cos(float(segments[next_seg][next_idx, 5]) - end_heading))))
+            step_info["candidates"] = candidate_log or []
+
+            # 择出 best 候选的分数
+            best_score = -float("inf")
+            for c in (candidate_log or []):
+                if not any([c.get("skipped_dist"), c.get("skipped_fwd"),
+                            c.get("skipped_dh"), c.get("skipped_visited")]):
+                    best_score = max(best_score, c["score"])
+            step_info["best_score"] = best_score if best_score > -float("inf") else None
+
+            if trace_log is not None:
+                trace_log.append(step_info)
+
+            n_gap = max(1, int(gap_dist / 0.5))
+            for k in range(1, n_gap):
+                t = k / n_gap
+                raw.append((end_x + t * (next_start_x - end_x),
+                             end_y + t * (next_start_y - end_y),
+                             gap_heading))
+
+            current_seg = next_seg
+            current_idx = next_idx
+
+        return raw
+
+    @staticmethod
+    def _find_continuation(segments, end_x, end_y, end_heading,
+                             visited_ids=None, candidate_log=None,
+                             original_heading=None,
+                             max_dist=20.0, max_dh=math.radians(60)):
+        """在未访问的段中搜索最佳的下一个段。
+        评分加权：距离 + 方向连续性 + 前方验证 + 全局方向漂移惩罚。
+        返回 (seg_id, entry_idx, score) 或 (None, 0, -inf)。
+
+        original_heading: ego 初始航向，用于惩罚全局方向漂移（防止绕圈）。
+        max_dist: 候选段入口距离上限 (m)。
+        max_dh: 段入口方向与段尾方向差上限 (rad)。
+        candidate_log: 传入 list 即收集每个候选信息供诊断用；传入 None 则零开销。
+        """
+        best = (None, 0, -float("inf"))
+        cos_h = math.cos(end_heading)
+        sin_h = math.sin(end_heading)
+
+        for seg_id, pts in segments.items():
+            seg_visited = visited_ids and seg_id in visited_ids
+            if seg_visited:
+                if candidate_log is not None:
+                    candidate_log.append({
+                        "seg_id": seg_id, "entry_idx": 0,
+                        "dist": -1, "fwd": -1, "dh_deg": -1, "score": -1,
+                        "drift_deg": -1,
+                        "skipped_dist": False, "skipped_fwd": False,
+                        "skipped_dh": False, "skipped_visited": True,
+                    })
+                continue
+
+            for i in range(min(3, len(pts))):
+                sx, sy = float(pts[i, 0]), float(pts[i, 1])
+                dx, dy = sx - end_x, sy - end_y
+                dist = math.hypot(dx, dy)
+                skipped_dist = dist > max_dist
+                if skipped_dist:
+                    continue
+
+                fwd = dx * cos_h + dy * sin_h
+                skipped_fwd = fwd < -3.0
+                if skipped_fwd:
+                    continue
+
+                seg_h = float(pts[i, 5])
+                dh = abs(math.atan2(math.sin(seg_h - end_heading),
+                                     math.cos(seg_h - end_heading)))
+                skipped_dh = dh > max_dh
+                if skipped_dh:
+                    continue
+
+                score = 10.0 / (dist + 0.1) - dh / math.pi + 0.5 * (fwd > 0.0)
+
+                # 全局方向漂移惩罚：累积偏离原始方向越大，惩罚越重
+                drift_deg = 0.0
+                if original_heading is not None:
+                    drift_deg = float(np.degrees(abs(math.atan2(
+                        math.sin(seg_h - original_heading),
+                        math.cos(seg_h - original_heading)))))
+                    score -= drift_deg / 360.0 * 5.0
+
+                if candidate_log is not None:
+                    candidate_log.append({
+                        "seg_id": seg_id, "entry_idx": i,
+                        "dist": float(dist), "fwd": float(fwd),
+                        "dh_deg": float(np.degrees(dh)), "score": float(score),
+                        "drift_deg": drift_deg,
+                        "skipped_dist": False, "skipped_fwd": False,
+                        "skipped_dh": False, "skipped_visited": False,
+                    })
+
+                if score > best[2]:
+                    best = (seg_id, i, score)
+
+        return best
+
+    @staticmethod
+    def _resample_equal_arc(raw_trace, num_points):
+        """等弧长重采样 raw_trace 到 num_points 个点。
+        raw_trace: [(x, y, heading), ...]
+        返回 pos (N,2), heading (N,)。
+        """
+        if len(raw_trace) < 2:
+            pos = np.tile(np.array([raw_trace[0][0], raw_trace[0][1]], dtype=np.float32),
+                           (num_points, 1))
+            heading = np.full(num_points, raw_trace[0][2], dtype=np.float32)
+            return pos, heading
+
+        pts = np.array([[p[0], p[1]] for p in raw_trace], dtype=np.float64)
+        heads = np.array([p[2] for p in raw_trace], dtype=np.float32)
+        diffs = np.diff(pts, axis=0)
+        dists = np.hypot(diffs[:, 0], diffs[:, 1])
+        cumulative = np.zeros(len(pts), dtype=np.float64)
+        cumulative[1:] = np.cumsum(dists)
+        total_len = cumulative[-1]
+
+        if total_len < 0.1:
+            pos = np.tile(pts[0].astype(np.float32), (num_points, 1))
+            heading = np.full(num_points, heads[0], dtype=np.float32)
+            return pos, heading
+
+        sample_arcs = np.linspace(0, total_len, num_points)
+        out_pos = np.zeros((num_points, 2), dtype=np.float32)
+        out_head = np.zeros(num_points, dtype=np.float32)
+
+        seg_idx = 0
+        for i, arc in enumerate(sample_arcs):
+            while seg_idx < len(cumulative) - 1 and cumulative[seg_idx + 1] < arc:
+                seg_idx += 1
+            if seg_idx >= len(cumulative) - 1:
+                out_pos[i] = pts[-1].astype(np.float32)
+                out_head[i] = heads[-1]
+                continue
+
+            seg_len = cumulative[seg_idx + 1] - cumulative[seg_idx]
+            t = (arc - cumulative[seg_idx]) / (seg_len + 1e-8)
+            t = max(0.0, min(1.0, t))
+            out_pos[i, 0] = float(pts[seg_idx, 0] + t * (pts[seg_idx + 1, 0] - pts[seg_idx, 0]))
+            out_pos[i, 1] = float(pts[seg_idx, 1] + t * (pts[seg_idx + 1, 1] - pts[seg_idx, 1]))
+            out_head[i] = heads[seg_idx] + t * (heads[seg_idx + 1] - heads[seg_idx])
+
+        return out_pos, out_head
+
+    @staticmethod
+    def _min_dist_to_pts(ref_pts, qx, qy):
+        """查询点到参考点集的最小距离（用于 road_dist 计算）。"""
+        if len(ref_pts) == 0:
+            return 10.0
+        dx = ref_pts[:, 0] - qx
+        dy = ref_pts[:, 1] - qy
+        return float(np.sqrt((dx * dx + dy * dy).min()))
+
+    def _generate_path_from_road_graph(self, world_road, ego_x, ego_y,
+                                          ego_heading, num_points=91,
+                                          trace_log_out=None):
+        """从道路图车道中心线 (col6=3) 生成一条参考路径。
+        返回 dict: {pos, heading, speed, road_dist}。
+
+        trace_log_out: 传入 list 即收集追踪日志供诊断用；传入 None 则零开销。
+        """
+        # 1. 提取车道中心线 (col6=3) 和道路边界 (col6=1)
+        lane_mask = world_road[:, 6] == 3
+        edge_mask = world_road[:, 6] == 1
+        lane_pts = world_road[lane_mask]
+        edge_pts = world_road[edge_mask]
+
+        if len(lane_pts) == 0:
+            # 降级：直线外推
+            logger.warning(f'[RG-PATH] 无车道中心线点，使用直线外推回退')
+            cos_h = math.cos(ego_heading)
+            sin_h = math.sin(ego_heading)
+            pos = np.array([[ego_x + i * cos_h, ego_y + i * sin_h]
+                             for i in range(num_points)], dtype=np.float32)
+            heading = np.full(num_points, ego_heading, dtype=np.float32)
+            speed = self._curvature_speed(pos)
+            road_dists = np.full(num_points, 10.0, dtype=np.float32)
+            if trace_log_out is not None:
+                trace_log_out.append({"error": "no_lane_pts", "fallback": "linear_extrapolation"})
+            return {'pos': pos, 'heading': heading, 'speed': speed, 'road_dist': road_dists}
+
+        # 2. 按 id 分组车道段
+        lane_segments = self._group_road_segments(lane_pts)
+        logger.debug(f'[RG-PATH] 车道段: {len(lane_segments)}, 车道点: {len(lane_pts)}')
+
+        # 3. 找到 ego 最近的车道点作为入口
+        entry_seg_id, entry_idx, entry_dist = self._find_nearest_on_segments(
+            lane_segments, ego_x, ego_y, ego_heading)
+
+        # 入口段信息
+        entry_seg_pts = lane_segments[entry_seg_id]
+        entry_seg_len = float(np.sum(np.hypot(
+            np.diff(entry_seg_pts[:, 0]), np.diff(entry_seg_pts[:, 1]))))
+        entry_h_diff = float(np.degrees(math.atan2(
+            math.sin(float(entry_seg_pts[entry_idx, 5]) - ego_heading),
+            math.cos(float(entry_seg_pts[entry_idx, 5]) - ego_heading))))
+        entry_residual = len(entry_seg_pts) - entry_idx
+
+        logger.debug(f'[RG-PATH] 入口: seg={entry_seg_id} idx={entry_idx}/{len(entry_seg_pts)} '
+                     f'dist={entry_dist:.1f}m seg_len={entry_seg_len:.1f}m '
+                     f'h_diff={entry_h_diff:.1f}° residual={entry_residual}pts')
+
+        # 4. 向前追踪
+        trace_log = [] if trace_log_out is not None else None
+        raw_trace = self._trace_lane_forward(
+            lane_segments, entry_seg_id, entry_idx,
+            max_pts=max(200, num_points * 2),
+            trace_log=trace_log,
+            original_heading=ego_heading)
+
+        # 路径起点补回 ego 位置，让重采样自动对齐
+        raw_trace.insert(0, (float(ego_x), float(ego_y), float(ego_heading)))
+
+        # 路径过短时填充到最低可用长度（~30m）
+        if len(raw_trace) >= 2:
+            arc_total = sum(math.hypot(raw_trace[i][0] - raw_trace[i-1][0],
+                                       raw_trace[i][1] - raw_trace[i-1][1])
+                           for i in range(1, len(raw_trace)))
+            if arc_total < 30.0:
+                need_m = 30.0 - arc_total
+                avg_sin = sum(math.sin(p[2]) for p in raw_trace) / len(raw_trace)
+                avg_cos = sum(math.cos(p[2]) for p in raw_trace) / len(raw_trace)
+                avg_h = math.atan2(avg_sin, avg_cos)
+                last_x, last_y = raw_trace[-1][0], raw_trace[-1][1]
+                for k in range(1, int(need_m) + 1):
+                    raw_trace.append((last_x + k * 1.0 * math.cos(avg_h),
+                                       last_y + k * 1.0 * math.sin(avg_h),
+                                       avg_h))
+                logger.debug(f'[RG-PATH] 路径过短 ({arc_total:.0f}m)，填充至 {30.0:.0f}m')
+
+        # 5. 等弧长重采样
+        pos, heading = self._resample_equal_arc(raw_trace, num_points)
+
+        # 6. 曲率限速
+        speed = self._curvature_speed(pos)
+
+        # 7. 道路距离
+        road_dists = np.zeros(num_points, dtype=np.float32)
+        for j in range(num_points):
+            road_dists[j] = self._min_dist_to_pts(edge_pts, float(pos[j, 0]), float(pos[j, 1]))
+
+        # 8. 导出追踪日志
+        if trace_log_out is not None and trace_log is not None:
+            real_pts = sum(1 for si in trace_log for _ in [] if True)  # placeholder — computed below
+            real_pts = sum(si["seg_consumed"] for si in trace_log
+                           if not si.get("dead_end"))
+            extrap_pts = (trace_log[-1].get("extrapolated_pts", 0)
+                          if trace_log and trace_log[-1].get("dead_end") else 0)
+            max_gap = 0.0
+            for j in range(1, num_points):
+                g = float(np.hypot(pos[j, 0] - pos[j-1, 0],
+                                   pos[j, 1] - pos[j-1, 1]))
+                max_gap = max(max_gap, g)
+
+            trace_log_out.append({
+                "world_meta": {
+                    "ego_x": float(ego_x), "ego_y": float(ego_y),
+                    "ego_h_deg": float(np.degrees(ego_heading)),
+                    "lane_pts": len(lane_pts), "edge_pts": len(edge_pts),
+                    "segments": len(lane_segments),
+                },
+                "entry": {
+                    "seg_id": entry_seg_id, "entry_idx": entry_idx,
+                    "seg_total_pts": len(entry_seg_pts),
+                    "seg_length": entry_seg_len,
+                    "dist_to_ego": float(entry_dist),
+                    "h_diff_deg": entry_h_diff,
+                    "residual_pts": entry_residual,
+                },
+                "trace": trace_log,
+                "quality": {
+                    "raw_total_pts": len(raw_trace),
+                    "real_pts": real_pts,
+                    "extrapolated_pts": extrap_pts,
+                    "extrapolated_pct": extrap_pts / len(raw_trace) * 100 if len(raw_trace) > 0 else 0,
+                    "path_start": (float(pos[0, 0]), float(pos[0, 1])),
+                    "path_end": (float(pos[-1, 0]), float(pos[-1, 1])),
+                    "path_length": float(np.sum(np.hypot(
+                        np.diff(pos[:, 0]), np.diff(pos[:, 1])))),
+                    "max_gap": max_gap,
+                    "path_h_start_deg": float(np.degrees(heading[0])),
+                    "path_h_end_deg": float(np.degrees(heading[-1])),
+                },
+            })
+
+        return {
+            'pos': pos,
+            'heading': heading,
+            'speed': speed,
+            'road_dist': road_dists,
+        }
+
+    # ========================================
     # 曲率限速（纯静态，无专家决策信息）
     # ========================================
 
@@ -197,7 +729,8 @@ class GPUDriveObservationBuilder:
             dy = float(self.expert_pos[w, a, t + 1, 1] - self.expert_pos[w, a, t, 1])
             ds = math.hypot(dx, dy) + 1e-6
             # kinematic bicycle model: δ = atan(L × Δθ / Δs)
-            L = 5.0  # wheelbase
+            # L 用该车自己的 size.length（GPUDrive 拿车长当轴距，逐车不同）
+            L = float(self._ego_len.get(w, 5.0))
             steers.append(math.atan(L * dh / ds))
         return torch.tensor(steers, dtype=torch.float32)
 
@@ -207,6 +740,7 @@ class GPUDriveObservationBuilder:
 
     def reset_world_step(self, world_idx: int, step: int = 0):
         self.step_counter[world_idx] = step
+        self._ref_idx[world_idx] = step
 
     def increment_step(self, world_idx: int):
         self.step_counter[world_idx] += 1
@@ -260,7 +794,16 @@ class GPUDriveObservationBuilder:
             y = float(abs_np[w, aidx, 1])
             heading = float(abs_np[w, aidx, 7])
             speed = float(rel_np[w, aidx, 0])
+            if not (np.isfinite(x) and np.isfinite(y)
+                    and np.isfinite(heading) and np.isfinite(speed)):
+                logger.warning(f'world_{w} 自车观测含 inf/nan，整条置零')
+                x = y = heading = speed = 0.0
             ego = np.array([x, y, speed, 0.0, heading, 0.0], dtype=np.float32)
+            # GPUDrive 用 size.length 当轴距，实测就等于 abs_obs[...,10]
+            veh_len = float(abs_np[w, aidx, 10])
+            if not np.isfinite(veh_len) or not (1.0 < veh_len < 15.0):
+                veh_len = 5.286          # 实测中位数兜底
+            self._ego_len[w] = veh_len
 
             partners = partner_np[w, aidx]
             cos_h = np.cos(heading)
@@ -275,6 +818,12 @@ class GPUDriveObservationBuilder:
                 # 跳过 GPUDrive 空槽位: speed=0, rel_x=0, rel_y=0 的 phantom 车
                 if p_speed == 0.0 and rel_x == 0.0 and rel_y == 0.0:
                     continue
+                # 空槽位/损坏场景可能带 inf 或哨兵值；这类样本会让整条 rollout 变 NaN
+                if not (np.isfinite(p_speed) and np.isfinite(rel_x)
+                        and np.isfinite(rel_y) and np.isfinite(rel_h)):
+                    continue
+                if abs(rel_x) > 1e3 or abs(rel_y) > 1e3 or abs(p_speed) > 1e2:
+                    continue
                 abs_h = heading + rel_h
                 gx = x + rel_x * cos_h - rel_y * sin_h
                 gy = y + rel_x * sin_h + rel_y * cos_h
@@ -282,19 +831,32 @@ class GPUDriveObservationBuilder:
                 others_list.append((dist, [gx, gy, abs_h, p_speed]))
             others_list.sort(key=lambda t: t[0])
             others = np.array([d[1] for d in others_list[:num_other_vehicles]], dtype=np.float32)
-            if others.shape[0] < num_other_vehicles:
-                n_pad = num_other_vehicles - others.shape[0]
-                pad = np.zeros((n_pad, 4), dtype=np.float32)
-                others = np.vstack([others, pad]) if others.shape[0] > 0 else pad
-            n_real = min(others.shape[0], num_other_vehicles)
+            # 【修正 S1】真实车数量必须在补零之前统计。原实现先 vstack 补成
+            # num_other_vehicles 行、再算 n_real，导致 n_real 恒等于 8、validity 全 1，
+            # 于是 (0,0) 上的零填充"幽灵车"被当成真车进入双圆碰撞约束。
+            n_real = int(others.shape[0]) if others.ndim == 2 else 0
             validity = np.zeros(num_other_vehicles, dtype=np.float32)
-            validity[:n_real] = 1.0  # 前 n_real 个是真实车
+            validity[:n_real] = 1.0
+            if n_real == 0:
+                others = np.zeros((num_other_vehicles, 4), dtype=np.float32)
+            elif n_real < num_other_vehicles:
+                others = np.vstack([others, np.zeros((num_other_vehicles - n_real, 4),
+                                                     dtype=np.float32)])
 
             pid = path_indices[w] if path_indices is not None else 0
-            # 用时序索引替代空间最近点，消除跳变
-            t = self.step_counter[w]
+            # 进度索引：'nearest' 模式在上一索引窗口内做最近点投影（参考点随位置推进），
+            #             'index' 模式直接用步数计数器（旧行为，做消融用）
             path = self.candidate_paths[w][aidx][pid]
-            t = max(0, min(t, len(path['pos']) - 1))
+            t_raw = max(0, min(self.step_counter[w], len(path['pos']) - 1))
+            if getattr(self, 'ref_mode', 'nearest') == 'nearest':
+                # 以"上一帧投影索引"为种子做窗口内最近点投影（不以时钟为种子）
+                prev_idx = self._ref_idx.get(w, 0)
+                t = self._project_index_np(path['pos'], x, y, prev_idx,
+                                           getattr(self, 'ref_window', 25))
+                self._ref_idx[w] = t
+            else:
+                t = t_raw
+                self._ref_idx[w] = t_raw
             rx, ry = float(path['pos'][t, 0]), float(path['pos'][t, 1])
             rh, rs = float(path['heading'][t]), float(path['speed'][t])
             ref = np.array([rx, ry, rs, 0.0, rh, 0.0], dtype=np.float32)
@@ -347,6 +909,7 @@ class GPUDriveObservationBuilder:
                 validity.astype(np.float32),
                 ref_err.astype(np.float32),
                 np.array([float(t)], dtype=np.float32),
+                np.array([veh_len], dtype=np.float32),
             ])
             states.append(state)
         return states
@@ -557,23 +1120,74 @@ class GPUDriveObservationBuilder:
         delta_v = math.hypot(ego_state[2], ego_state[3]) - ref_state[2]
         return np.array([delta_p, delta_phi, delta_v], dtype=np.float32)
 
+    # ========================================
+    # 参考点投影（按位置推进，而不是按时间推进）
+    # ========================================
+
+    @staticmethod
+    def _project_index_np(pos: np.ndarray, x: float, y: float,
+                          prev_idx: int, window: int) -> int:
+        """在 pos[prev-window : prev+window] 内找最近点，且不倒退。"""
+        n = len(pos)
+        prev = int(max(0, min(int(prev_idx), n - 1)))
+        lo = max(0, prev - int(window))
+        hi = min(n - 1, prev + int(window))
+        seg = pos[lo:hi + 1]
+        d = (seg[:, 0] - x) ** 2 + (seg[:, 1] - y) ** 2
+        best = lo + int(np.argmin(d))
+        return max(prev, best)
+
+    def _project_index_torch(self, w_t, p_t, x, y, prev_idx, window):
+        """GPU 版：在 ref_tensor 上做窗口内最近点搜索，返回 [B] long（不倒退）。"""
+        rt = self.ref_tensor
+        T = rt.shape[3]
+        idx = torch.arange(T, device=rt.device).view(1, T)
+        prev = prev_idx.long().clamp(0, T - 1)
+        lo = (prev - int(window)).clamp(0, T - 1).view(-1, 1)
+        hi = (prev + int(window)).clamp(0, T - 1).view(-1, 1)
+        mask = (idx >= lo) & (idx <= hi)
+        pos = rt[w_t, 0, p_t]                      # [B, T, 8]
+        dx = pos[..., 0] - x.view(-1, 1)
+        dy = pos[..., 1] - y.view(-1, 1)
+        d2 = dx * dx + dy * dy
+        d2 = d2.masked_fill(~mask, float('inf'))
+        best = d2.argmin(dim=1)
+        return torch.maximum(best, prev)
+
     def get_ref_states_batch(self, world_indices, ego_xs, ego_ys,
                                ego_indices_map: list,
                                path_indices=None,
-                               temporal_indices=None) -> torch.Tensor:
+                               temporal_indices=None,
+                               ref_mode: str = 'index',
+                               window: int = 25) -> torch.Tensor:
         """
         批量获取参考状态，返回 [batch, 7] tensor。
-        列：[rx, ry, rs, 0, rh, 0, nearest_idx]
-        当 temporal_indices 传入时，优先走 GPU tensor 索引（零 Python 循环）。
+        列：[rx, ry, rs, 0, rh, 0, ref_idx]
+        - temporal_indices: 当前进度索引（nearest 模式下作为搜索窗口中心）
+        - ref_mode='nearest': 在窗口内做最近点投影 -> 参考点随位置推进
+        - ref_mode='index'  : 直接按索引取（旧行为）
         """
         if temporal_indices is not None and path_indices is not None and hasattr(self, 'ref_tensor'):
             # GPU 快速路径：tensor 索引替代 Python 循环
+            if not torch.is_tensor(temporal_indices):
+                temporal_indices = torch.as_tensor(temporal_indices)
             w_tensor = torch.tensor(list(world_indices), device=self.ref_tensor.device, dtype=torch.long)
             p_tensor = torch.tensor(list(path_indices), device=self.ref_tensor.device, dtype=torch.long)
             t_tensor = temporal_indices.long().clamp(0, self.ref_tensor.shape[3] - 1).to(self.ref_tensor.device)
-            vals = self.ref_tensor[w_tensor, 0, p_tensor, t_tensor]
+
+            if ref_mode == 'nearest':
+                xs = ego_xs if torch.is_tensor(ego_xs) else torch.as_tensor(ego_xs)
+                ys = ego_ys if torch.is_tensor(ego_ys) else torch.as_tensor(ego_ys)
+                xs = xs.to(self.ref_tensor.device).float().view(-1)
+                ys = ys.to(self.ref_tensor.device).float().view(-1)
+                t_proj = self._project_index_torch(w_tensor, p_tensor, xs, ys, t_tensor, window)
+            else:
+                t_proj = t_tensor
+
+            vals = self.ref_tensor[w_tensor, 0, p_tensor, t_proj]
             rx, ry, rs, rh, rd = vals[:, 0], vals[:, 1], vals[:, 2], vals[:, 3], vals[:, 4]
-            return torch.stack([rx, ry, rs, torch.zeros_like(rx), rh, torch.zeros_like(rx), t_tensor.float()], dim=-1)
+            return torch.stack([rx, ry, rs, torch.zeros_like(rx), rh, torch.zeros_like(rx),
+                                t_proj.float()], dim=-1)
 
         # CPU 回退路径
         refs = []
@@ -585,6 +1199,9 @@ class GPUDriveObservationBuilder:
                 t = int(temporal_indices[i])
                 path = self.candidate_paths[w][a][pid]
                 t = max(0, min(t, len(path['pos']) - 1))
+                if ref_mode == 'nearest':
+                    t = self._project_index_np(path['pos'], float(ego_xs[i]),
+                                               float(ego_ys[i]), t, window)
                 rx, ry = float(path['pos'][t, 0]), float(path['pos'][t, 1])
                 rh, rs = float(path['heading'][t]), float(path['speed'][t])
                 nearest = t

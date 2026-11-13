@@ -9,7 +9,7 @@ import torch
 from gpudrive.env.env_torch import GPUDriveTorchEnv
 from gpudrive.env.dataset import SceneDataLoader
 
-sys.path.insert(0, '/workspace/idc/src')
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from env.env_utils import extend_action_to_3d, get_env_config, load_scenes, get_ego_indices
 from env.world_manager import WorldManager
 from env.idc_state_builder import GPUDriveObservationBuilder
@@ -33,7 +33,7 @@ def _diag_init_step(config, agent, builder, ego_indices, episode_path_indices,
         batch_windows.append(win)
     window_tensor = torch.from_numpy(np.stack(batch_windows)).to(agent.device)
     with torch.no_grad():
-        norm_action_raw = agent.actor(window_tensor)
+        norm_action_raw = agent._policy(window_tensor)
         norm_2d = norm_action_raw.view(2, 1, 2)
 
     for i in [0, 1]:
@@ -105,7 +105,8 @@ def train(config):
     max_step = builder.EXPERT_TRAJ_LEN if builder.EXPERT_TRAJ_LEN is not None else 91
 
     ego_indices = get_ego_indices(env, config.num_worlds)
-    builder.generate_candidate_paths(ego_indices, num_paths=1)
+    builder.generate_candidate_paths(ego_indices, num_paths=1,
+                                       use_expert_path=getattr(config, 'use_expert_path', True))
 
     agent = DiscreteIDCAgent(env, config, config.device, builder, ego_indices)
 
@@ -145,7 +146,10 @@ def train(config):
 
         epoch_history = []
 
-        VIZ_WORLDS = wm.good_worlds[:10]
+        # 轨迹图：只对少量 world 记录，且按间隔落盘（原实现每个 epoch × 10 个 world，
+        # 1500 epoch 会产出 1.5 万张图）
+        n_viz = max(int(getattr(config, 'traj_plot_max_worlds', 4)), 0)
+        VIZ_WORLDS = wm.good_worlds[:n_viz] if n_viz > 0 else []
         viz_list = [TrajectoryVisualizer(builder, w, ego_indices[w])
                     for w in VIZ_WORLDS]
 
@@ -252,10 +256,14 @@ def train(config):
                 critic_loss, actor_loss = agent.update()
                 logger.debug(f'训练完成: global_step={agent.global_step}')
 
-                if actor_loss is not None:
-                    logger.info(f'Critic Loss: {critic_loss:.4f}, Actor Loss: {actor_loss:.4f}, '
+                if critic_loss is not None or actor_loss is not None:
+                    # None = 本步没轮到 PEV/PIM（pev_interval / pim_interval），不是 NaN
+                    _cl = '   -   ' if critic_loss is None else f'{critic_loss:9.4f}'
+                    _al = '   -   ' if actor_loss is None else f'{actor_loss:9.4f}'
+                    logger.info(f'Critic Loss: {_cl}, Actor Loss: {_al}, '
                                 f'Penalty Coefficient (rho): {agent.rho:.4f}')
-                    epoch_history.append((critic_loss, actor_loss, agent.rho))
+                    if actor_loss is not None:
+                        epoch_history.append((critic_loss, actor_loss, agent.rho))
 
             agent.global_step += 1
 
@@ -276,10 +284,13 @@ def train(config):
                         f'(surviving: {len(pdms_scores)}/{config.num_worlds})')
             agent.epoch_history_pdms.append(pdms_scores)
 
-        logger.info(f'开始保存轨迹图像')
-        for viz in viz_list:
-            if len(viz.actual_x) > 0:
-                viz.save_plot(viz_dir, epoch + 1)
+        plot_interval = max(int(getattr(config, 'traj_plot_interval', 20)), 1)
+        if viz_list and ((epoch + 1) % plot_interval == 0 or (epoch + 1) == 1):
+            logger.info(f'保存轨迹图像 (epoch={epoch + 1}, 每 {plot_interval} 轮)')
+            use_expert = getattr(config, 'use_expert_path', True)
+            for viz in viz_list:
+                if len(viz.actual_x) > 0:
+                    viz.save_plot(viz_dir, epoch + 1, use_expert_path=use_expert)
 
         save_info = {'env_name': 'examples'}
         agent.save(save_info=save_info)
@@ -300,7 +311,11 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(
         description='IDC-Bridge 训练脚本。所有默认值从 YAML 配置文件读取，CLI 参数可覆盖。')
-    parser.add_argument('--config', type=str, default='/workspace/idc/src/configs/train.yaml',
+    # 默认配置路径按脚本位置推导（原来硬编码 /workspace/idc/src/configs/train.yaml，
+    # 换目录即失效）
+    _default_cfg = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), '..', '..', 'configs', 'train.yaml'))
+    parser.add_argument('--config', type=str, default=_default_cfg,
                         help='YAML 配置文件路径')
     parser.add_argument('--data-dir', type=str, default='/workspace/wayo_data/data_json/training/',
                         help='Waymo tfrecord 数据目录')
@@ -332,6 +347,14 @@ if __name__ == "__main__":
     parser.add_argument('--no-sign', action='store_true', default=None)
     parser.add_argument('--no-road-penalty', action='store_true', default=None)
     parser.add_argument('--no-veh-penalty', action='store_true', default=None)
+    # ---- 表示层消融开关 ----
+    parser.add_argument('--state-mode', type=str, default=None,
+                        choices=['ego', 'abs'], help='ego=自车系(默认) / abs=绝对坐标')
+    parser.add_argument('--ref-mode', type=str, default=None,
+                        choices=['nearest', 'index'],
+                        help='nearest=按位置投影(默认) / index=逐帧+1')
+    parser.add_argument('--obs-norm', type=str, default=None,
+                        help='true/false，输入在线归一化')
     args = parser.parse_args()
 
     # 加载 YAML 配置并用 CLI 覆盖
@@ -361,6 +384,10 @@ if __name__ == "__main__":
         'no_sign': args.no_sign,
         'no_road_penalty': args.no_road_penalty,
         'no_veh_penalty': args.no_veh_penalty,
+        'state_mode': args.state_mode,
+        'ref_mode': args.ref_mode,
+        'obs_norm': (None if args.obs_norm is None
+                     else args.obs_norm.lower() == 'true'),
     }
     config = build_config(args.config, cli_overrides)
     train(config)

@@ -9,7 +9,7 @@ from gpudrive.env.env_torch import GPUDriveTorchEnv
 from gpudrive.env.dataset import SceneDataLoader
 from gpudrive.visualize.utils import img_from_fig
 
-sys.path.insert(0, '/workspace/idc/src')
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from env.env_utils import extend_action_to_3d, get_env_config, load_scenes, get_ego_indices
 from env.world_manager import WorldManager
 from env.idc_state_builder import GPUDriveObservationBuilder
@@ -95,7 +95,8 @@ def evaluate(config):
     max_step = builder.EXPERT_TRAJ_LEN
 
     ego_indices = get_ego_indices(env, config.num_worlds)
-    builder.generate_candidate_paths(ego_indices, num_paths=1)
+    builder.generate_candidate_paths(ego_indices, num_paths=1,
+                                       use_expert_path=getattr(config, 'use_expert_path', True))
 
     agent = DiscreteIDCAgent(env, config, config.device, builder, ego_indices)
 
@@ -138,9 +139,10 @@ def evaluate(config):
             if done_np[w, a] > 0.5:
                 wm.reached_worlds.add(w)
 
+        n_viz = max(int(getattr(config, 'traj_plot_max_worlds', 4)), 0)
+        VIZ_WORLDS = list(wm.good_worlds)[:n_viz] if n_viz > 0 else []
         viz_list = [TrajectoryVisualizer(builder, w, ego_indices[w])
-                    for w in wm.good_worlds]
-        VIZ_WORLDS = list(wm.good_worlds)
+                    for w in VIZ_WORLDS]
 
         gif_worlds = _select_gif_worlds(config, VIZ_WORLDS)
 
@@ -221,10 +223,10 @@ def evaluate(config):
                 _record_gif_frame(env, recorder, config, epoch, step,
                                   ego_indices, wm, gif_worlds)
 
+        use_expert = getattr(config, 'use_expert_path', True)
         for viz in viz_list:
             if len(viz.actual_x) > 0:
-                viz.save_plot(viz_dir, epoch + 1)
-
+                viz.save_plot(viz_dir, epoch + 1, use_expert_path=use_expert)
         # PDMS epoch 报告（仅 surviving worlds）
         pdms_scores = [scorers[w].compute()
                        for w in range(config.num_worlds)
@@ -256,7 +258,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(
         description='IDC-Bridge 评估脚本。所有默认值从 YAML 配置文件读取，CLI 参数可覆盖。')
-    parser.add_argument('--config', type=str, default='configs/eval.yaml',
+    _default_cfg = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), '..', '..', 'configs', 'eval.yaml'))
+    parser.add_argument('--config', type=str, default=_default_cfg,
                         help='YAML 配置文件路径')
     parser.add_argument('--data-dir', type=str, required=True,
                         help='Waymo tfrecord 数据目录')

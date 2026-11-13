@@ -13,7 +13,10 @@ training:
   lr_actor_min: 1.0e-6            # CosineAnnealingLR 终止学习率（Actor）
   lr_critic_max: 3.0e-4           # CosineAnnealingLR 起始学习率（Critic）
   lr_critic_min: 1.0e-5           # CosineAnnealingLR 终止学习率（Critic）
-  pim_interval: 30                # 每 N 次 PEV 后执行一次 PIM（Actor 更新频率）
+  pim_interval: 30                # 每 N 个 env step 执行一次 PIM（Actor 更新频率）
+  pev_interval: 5                 # 每 N 个 env step 执行一次 PEV（Critic 更新频率）。
+                                  # 原来每步都算一次 30 步 rollout，而 critic 目前没有任何
+                                  # 消费者，等于白烧 ~97% 的 rollout 算力。做完选路后可调回 1。
   gamma: 0.99                     # 折扣因子，用于 rollout 中未来 utility 的折现
   buffer_capacity: 200000         # PER 缓冲区最大容量（条目数）：~10 epoch 填满
   window_size: 30                 # Transformer Actor 滑窗帧数（30 帧 × 0.1s = 3.0 秒历史）
@@ -24,21 +27,53 @@ training:
 
 # ---- Agent 参数 ----
 agent:
-  pos_err_weight: 0.03            # utility 中位置跟踪误差的权重（|ego - ref|²）
-  speed_err_weight: 0.005         # utility 中速度跟踪误差权重（降 10× 打破龟速最优解）
-  heading_err_weight: 0.3         # utility 中航向误差的权重（delta_phi²）
-  steer_cost_weight: 0.15         # 转向控制代价权重（提高 2.5× 抑制高速抖动）
-  acc_cost_weight: 0.01           # 加速控制代价权重（acc_raw²），正则化加速度剧烈程度
+  pos_err_weight: 0.04            # 位置跟踪误差权重 —— 论文 Q=diag(.04,.04,...)，两个坐标各 .04
+  speed_err_weight: 0.01          # 速度跟踪误差权重 —— 论文 0.01
+                                  # （旧的 0.005 是"龟速最优"时期压下去的，参考点修好后恢复论文值）
+  heading_err_weight: 0.1         # 航向误差权重 —— 论文 0.1
+                                  # （旧的 0.3 是在补偿输入尺度失衡，表示层修好后回退）
+  steer_cost_weight: 0.1          # 转向控制代价权重，作用在 **物理前轮角 δ(rad)** 的平方上 —— 论文 R_δ=0.1
+  acc_cost_weight: 0.005          # 加速控制代价权重，作用在 **物理加速度 a(m/s²)** 的平方上 —— 论文 R_a=0.005
   lookahead_pos_weight: 0.05      # 前瞻点横向误差权重（t+5/10/15 的 lat_err² ×3）
   lookahead_heading_weight: 0.05  # 前瞻点航向误差权重（t+5/10/15 的 dphi² ×3）
-  noise_std: 0.1                  # select_action 探索噪声标准差（高斯加到 raw_output）
+  noise_std: 0.03                 # select_action 探索噪声标准差（高斯加到 raw_output）。
+                                  # 原代码内部还乘了 0.3，实际生效值是 0.03；这里去掉魔法系数直接写真实值
   noise_decay_rate: 0.95          # 每次 PIM 后噪声衰减倍率：σ ← max(σ×0.95, noise_std_min)
   noise_std_min: 0.03             # 噪声下限——保证后期仍有少量探索
   bc_weight: 0.1                  # 转向 BC loss 在 actor loss 中的权重
   progress_weight: 0.05           # 沿路径前进奖励（utility 负项：前进越多 cost 越低）
+  ttc_weight: 0.2                 # TTC 连续惩罚权重（碰撞前逼近梯度）
+  jerk_weight: 0.01               # Jerk 舒适性惩罚权重
+  jerk_max: 120.0                 # 最大允许 jerk (m/s³)，归一化用
+  road_weight: 1.0                # 道路约束权重。road_in_penalty=true 时它乘在 φ 的路沿项上，
+                                  # 量级与"每辆车 1 m 侵入 ≈ 1.0"对齐；road_in_penalty=false 时
+                                  # 退回 J_actor 里的软代价（旧行为，建议用 0.05）。
   init_penalty: 0.01              # ρ 初始值 + 无违规时的 EMA 锚点
   max_penalty: 3.0                # ρ 上限，防止 penalty 完全淹没 utility
-  amplifier_c: 0.002              # 已弃用（EMA 方案不再依赖此参数），保留兼容
+  amplifier_c: 0.002              # EMA 方案下已弃用，保留兼容
+  # ---- 罚因子调度 ----
+  penalty_schedule: ema           # ema（现状）| gep（论文 Algorithm 1：每 m 次 PIM 无条件 ρ←c·ρ）
+  gep_amplifier: 1.1              # 仅 penalty_schedule=gep 时生效，论文的 c（>1）
+  # ---- 目标函数一致性 ----
+  # 截断作用在**物理偏差**上（而非总代价），阈值有物理含义：
+  #   3 s 预测时域内本来就不可能弥补的偏差，惩罚它只会污染梯度。
+  pos_err_clamp: 50.0             # |位置偏差| 上限 (m)
+  lat_err_clamp: 20.0             # |前瞻横向偏差| 上限 (m)
+  utility_clamp: 10000.0          # 总 utility 的截断，仅作发散保护（原来 500 会形成 129 m 的死梯度区）
+  penalty_clamp: 100.0            # 单步 penalty 截断
+  # ---- 采样 / 约束归属 / 安全域 ----
+  use_is_weights: true            # PER 自归一化重要性权重（偏差校正）；false=纯优先采样(有偏)
+  road_in_penalty: true           # true: 路沿进 φ（论文做法，被 ρ 放大）；false: 进 J_actor 软代价
+  veh_safe_ellipse: false         # false: 双圆中心距标量阈值（现状）；true: 论文 Mahalanobis 椭圆
+  veh_safe_long: 5.0              # 椭圆纵向半轴 (m)，仅 veh_safe_ellipse=true 生效
+  veh_safe_lat: 2.2               # 椭圆横向半轴 (m)，约 1.2× 车道线间距的一半
+  # ---- 状态表示 / 参考点 / 归一化 ----
+  state_mode: ego                 # ego = 自车系表达（逐帧把自车放原点、航向 0，默认）
+                                  # abs = 旧行为（直接喂绝对坐标，仅用于消融）
+  ref_mode: nearest               # nearest = 窗口内最近点投影，参考点随位置推进（默认）
+                                  # index   = 逐帧 +1，参考点随时钟推进（旧行为，仅用于消融）
+  ref_window: 25                  # 最近点投影搜索半窗（索引步数，25×0.1s=2.5s）
+  obs_norm: true                  # 输入在线归一化（带先验收缩，冷启动≈恒等映射）
   D_veh_safe: 3.5                 # 车辆碰撞安全距离（m）：自车-周车圆心距 < 此值时产生 penalty
   D_road_safe: 1.5                # 道路安全距离（m）：自车到路边距离 < 此值时产生 penalty
   half_length: 2.25               # 半车长（m），用于双圆模型的圆心偏移
@@ -57,6 +92,7 @@ world:
   dense_sample_size: 10000        # 稠密场景候选池大小（优先从密度区间采样）
   max_bad_worlds: 60              # 坏 world 数超过此值触发 resample（保留 ≥ num_worlds-max 个 good）
   resample_interval: 10           # 每 N 个 epoch 检查一次是否需 resample
+  use_expert_path: true           # true: 使用 expert 轨迹生成参考路径; false: 从道路图生成
   filter_threshold: 200           # ego 坐标超过 ±200m 视为坏 world
   dataset_size: 0                 # 数据池大小，0=自动检测 data_dir 下 tfrecord 文件数
   density_cache_file: "/workspace/data/logs/density_full.json"  # 离线密度扫描缓存

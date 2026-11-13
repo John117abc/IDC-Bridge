@@ -170,16 +170,38 @@ class WorldManager:
                 )
 
         if step % 5 == 0:
+            dps = []
             max_dp, max_w = 0.0, 0
             for w in range(self.num_worlds):
                 if w in self.bad_worlds or w in self.reached_worlds:
                     continue
                 s = states[w]
                 dp = abs(s[ref_start])
+                dps.append(dp)
                 if dp > max_dp:
                     max_dp, max_w = dp, w
+            # 只报最大值会被"跑飞的那一个 world"完全支配，看不出整体跟踪质量。
+            # 这里同时报中位数 / p90 / 贴合比例，才能判断参考点语义是否合理。
+            # idx_lag = 时钟步数 - 投影索引：>0 说明参考点已被"位置"拽住（S6 修好），
+            #           ≈0 说明参考点仍在随时钟推进（S6 未生效）。
+            try:
+                lags = [self.builder.step_counter[w] - self.builder._ref_idx.get(w, 0)
+                        for w in range(self.num_worlds)
+                        if w not in self.bad_worlds and w not in self.reached_worlds]
+                lag_note = f' idx_lag_med={np.median(lags):.1f}' if lags else ''
+            except Exception:
+                lag_note = ''
+            if dps:
+                arr = np.asarray(dps, dtype=np.float64)
+                med = float(np.median(arr))
+                p90 = float(np.percentile(arr, 90))
+                close = float((arr < 5.0).mean())
+                note = f'median={med:.2f} p90={p90:.2f} max={max_dp:.1f}@{max_w} ' \
+                       f'frac<5m={close:.0%}'
+            else:
+                note = 'no good worlds'
             self.logger.info(
-                f'[DIAG-ref] max pos_err={max_dp:.2f}m @world_{max_w} '
+                f'[DIAG-ref] {note}{lag_note} '
                 f'good={self.good_count} reached={len(self.reached_worlds)} '
                 f'bad={len(self.bad_worlds)}/{self.num_worlds}'
             )
@@ -211,7 +233,16 @@ class WorldManager:
             if self.agent.rho > 0 and len(self.dense_files) >= self.num_worlds * 2
             else self.all_files
         )
-        batch_files = random.sample(candidate_pool, self.num_worlds)
+        # 只替换"坏掉/已到终点"的 world，其余 world 的场景文件保持不变 ——
+        # 这样它们的缓冲区经验依然有效（配合 agent.world_gen 的代际拒采）。
+        replace_w = sorted(self.bad_worlds | self.reached_worlds)
+        if not replace_w:
+            replace_w = list(range(self.num_worlds))
+        cur_files = list(self.env.data_batch)
+        picked = random.sample(candidate_pool, min(len(replace_w), len(candidate_pool)))
+        batch_files = list(cur_files)
+        for w, f in zip(replace_w, picked):
+            batch_files[w] = f
         self.env.swap_data_batch(data_batch=batch_files)
 
         new_ego = []
@@ -221,7 +252,8 @@ class WorldManager:
 
         self.builder._setup_expert_data()
         self.builder.clear_cache()
-        self.builder.generate_candidate_paths(new_ego, num_paths=1)
+        self.builder.generate_candidate_paths(new_ego, num_paths=1,
+                                                use_expert_path=getattr(self.args, 'use_expert_path', True))
 
         self.bad_worlds.clear()
         self.reached_worlds.clear()
@@ -253,7 +285,8 @@ class WorldManager:
         self.builder.clear_cache()
 
         self.agent.update_ego_indices(new_ego)
-        self.agent.clear_buffer()
+        # 不再整体清空缓冲区：只提升被替换 world 的代际，采样时拒掉它们的旧样本
+        self.agent.bump_world_gen(replace_w)
 
         self.logger.info(
             f'[RESAMPLE] complete: {len(self.bad_worlds)} bad, '
