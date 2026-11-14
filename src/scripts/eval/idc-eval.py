@@ -41,7 +41,10 @@ def _record_gif_frame(env, recorder, config, epoch, step, ego_indices, wm, selec
             env.vis.render_3d = True
         imgs = env.vis.plot_simulator_state(
             env_indices=selected_worlds,
-            time_steps=[epoch] * len(selected_worlds),
+            # 这里必须用"当前仿真步数"，不能用回合号 epoch：
+            # plot_simulator_state 是按 time_steps 去取已记录轨迹的某一帧，
+            # 传 epoch（eval 恒为 0）会导致每一帧都渲染第 0 帧，GIF 成了静止图。
+            time_steps=[step] * len(selected_worlds),
             zoom_radius=zoom,
         )
         if view_mode == "bird_3d":
