@@ -1978,3 +1978,104 @@ road_ahead[t]  = Σ w_i × road_dist_at[t+i]  (未来道路宽度预期)
 每次 eval 自动用随机种子，GIF 展示不同世界。
 
 **涉及文件**：`eval.yaml`、`idc-eval.py`
+
+
+---
+
+## 83. 换场景时容器 Exited 134（无 traceback）
+
+**记录**：2026-11-13
+
+**症状**：训练跑到 resample 时进程直接 abort（`Exited 134`），日志最后一行是 `[RESAMPLE] Triggered`，
+没有任何 Python traceback。分步打点后确认崩在 `swap_data_batch` → `sim.set_maps`。
+
+**排查**：逐一排除了"批内有重复文件""部分替换的混合批""取样方式被改坏"三个假设，
+最后用最小复现拿到真实报错：
+
+```
+Error at madrona/src/mw/cuda_exec.cpp:1301 in madrona::initEngineAndUserState(...)
+CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES: too many resources requested for launch
+```
+
+同时验证：换到**同一批**或**重复批**都正常 → `set_maps` 本身可用，问题在"换到了特定规模的场景批"。
+
+**根本原因**：`resample` 的候选池在 `rho>0` 时取的是 `dense_files`（按周车密度降序的前 1 万个最稠密场景），
+而初始批是从全量 7 万均匀抽的。换批等于**系统性地切到最拥挤的场景**，超出引擎编译期固定规模
+（`consts::kMaxAgentCount` 等），kernel 启动资源不足。
+
+**修复**：候选池改回全量 `all_files` 均匀抽样，与初始批口径一致。
+
+**涉及文件**：`src/env/world_manager.py`
+
+---
+
+## 84. 同一进程内创建第二个 env 会 abort
+
+**记录**：2026-11-13
+
+**症状**：想用"重建 env 对象"代替 `set_maps` 来换场景，第二个 `GPUDriveTorchEnv` 构造时 abort。
+
+**报错**：
+
+```
+Error at madrona/src/mw/cuda_exec.cpp:260 in void madrona::setCudaHeapSize()
+```
+
+**结论**：madrona 引擎是**进程级单例**，一个进程只能初始化一次。
+所以换场景只能走 `set_maps`（同进程）或多进程（每进程一个 env）。
+
+**涉及文件**：仅记录，无代码改动。复现脚本见 `tools/test_second_env.py`。
+
+---
+
+## 85. good_worlds 缓存跨 epoch 不失效
+
+**记录**：2026-11-13
+
+**症状**：诊断行出现自相矛盾的数字：`good=60`，但同时 `bad=0/75`、`reached=0`
+（三者相加应等于 `num_worlds`）。等于有 15 个 world 整轮不参与训练。
+
+**根本原因**：每个 epoch 开始时只做 `wm.reached_worlds.clear()`，
+而 `good_worlds` 是带 `_good_cache` 的 property，`clear()` 没有把缓存置空。
+
+**修复**：新增 `WorldManager.begin_epoch()`，同时清 `reached` 并置 `_good_cache = None`；
+train/eval 改为调用它。
+
+**涉及文件**：`src/env/world_manager.py`、`src/scripts/train/idc-train.py`、`src/scripts/eval/idc-eval.py`
+
+---
+
+## 86. Eval 导出的 GIF 是静止图
+
+**记录**：2026-11-14
+
+**症状**：同一 world 的 90 帧图像完全相同。
+
+**根本原因**：`_record_gif_frame` 把 `time_steps` 传成了回合号 `epoch`，
+而 `plot_simulator_state` 的 `time_steps` 指的是"已记录轨迹里的第几步"。
+eval 只有 1 个回合，`epoch` 恒为 0 → 每帧都在渲染 t=0。
+
+**修复（两阶段）**：
+1. 先改为传当前仿真步 `step`（`d893b6d`）
+2. 进一步改成**离线渲染**：rollout 只收数据，结束后用 `src/utils/storyboard.py` 统一出图。
+   顺带解决另外两个问题——原渲染看不出车头朝向/尾迹，且每 world 要 4 分钟以上；
+   现在单 world 约 8 秒，且画面可读（车道边界、品红参考虚线、ego/周车尾迹、图例）。
+
+**涉及文件**：`src/scripts/eval/idc-eval.py`、`src/utils/storyboard.py`
+
+---
+
+## 87. PDMS 的路线完成度用错时间源
+
+**记录**：2026-11-14
+
+**症状**：`completion` 长期稳定在 98~99%，与实际情况（ego 只走了路径的一部分）明显不符。
+
+**根本原因**：`PDMSScorer.update_step(temporal_idx=t)` 的 `t` 取自 `builder.step_counter[w]`
+（仿真步数时钟），而不是参考点的**投影进度索引**。只要 episode 跑满 91 步，
+完成度就必然是 100%。
+
+**修复**：改为从 state 里取投影进度索引（`temp_idx_pos = DIM_EGO+DIM_OTHERS+DIM_VALIDITY+DIM_REF_ERROR`），
+train 与 eval 两处都改。修好后完成度从 98.9% 降到 83.7%，与 `travelled` 里程一致。
+
+**涉及文件**：`src/scripts/train/idc-train.py`、`src/scripts/eval/idc-eval.py`
