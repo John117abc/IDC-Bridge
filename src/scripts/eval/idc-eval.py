@@ -22,6 +22,61 @@ from metrics.plotter import print_pdms_table, plot_pdms_radar, plot_pdms_bar
 logger = get_logger('idc-eval')
 
 
+def _render_storyboards(trace, env, builder, config, ego_indices):
+    """用 storyboard 风格离线渲染 GIF + 关键时刻拼图。
+
+    取代 gpudrive 自带的 plot_simulator_state：那个只画道路细线和车辆圆点，
+    既无车头朝向也无尾迹，而且按 time_steps 取帧容易取错导致静止图。
+    """
+    import time
+
+    import numpy as np
+
+    from utils.storyboard import render_world
+
+    out_dir = os.path.join(config.gif_save_dir, time.strftime('%Y%m%d'))
+    maps = env.sim.map_observation_tensor().to_torch().cpu().numpy()
+    margin = float(getattr(config, 'gif_zoom_radius', 70)) * 0.5
+    for w, tw in trace.items():
+        a = ego_indices[w]
+        ep = builder.expert_pos[w, a]
+        ep = ep.detach().cpu().numpy() if hasattr(ep, 'detach') else np.asarray(ep)
+        png, gif = render_world(tw, maps[w], ep, out_dir, w,
+                                fps=int(getattr(config, 'gif_fps', 12)),
+                                margin=margin)
+        if gif:
+            logger.info(f'[storyboard] world_{w} -> {os.path.basename(gif)}'
+                        + (f' + {os.path.basename(png)}' if png else ''))
+
+
+def _dump_trace(trace, env, builder, config, ego_indices):
+    """把选中的 world 的逐帧位姿 + 地图 + 专家路径落成 npz，供离线画图。"""
+    import time
+
+    import numpy as np
+
+    date_dir = os.path.join(config.file_dir, 'traces', time.strftime('%Y%m%d'))
+    os.makedirs(date_dir, exist_ok=True)
+
+    out = {}
+    for w, t in trace.items():
+        out[f'ego_{w}'] = np.asarray(t['ego'], dtype=np.float32)
+        out[f'info_{w}'] = np.asarray(t['info'], dtype=np.float32)
+        out[f'partners_{w}'] = np.array(t['partners'], dtype=object)
+
+    maps = env.sim.map_observation_tensor().to_torch().cpu().numpy()
+    for w in trace:
+        out[f'map_{w}'] = maps[w].astype(np.float32)
+        a = ego_indices[w]
+        ep = builder.expert_pos[w, a]
+        ep = ep.detach().cpu().numpy() if hasattr(ep, 'detach') else np.asarray(ep)
+        out[f'expert_{w}'] = ep.astype(np.float32)
+
+    path = os.path.join(date_dir, f'trace_{time.strftime("%H%M%S")}.npz')
+    np.savez_compressed(path, **out)
+    print(f'[TRACE] saved {path}  worlds={list(trace.keys())}')
+
+
 def _record_gif_frame(env, recorder, config, epoch, step, ego_indices, wm, selected_worlds):
     """根据 gif_view_mode 录制一帧到 recorder"""
     view_mode = config.gif_view_mode
@@ -149,6 +204,9 @@ def evaluate(config):
 
         gif_worlds = _select_gif_worlds(config, VIZ_WORLDS)
 
+        # 逐帧落盘，供离线画 storyboard（ego/伙伴位姿 + 事件）
+        trace = {w: {'ego': [], 'partners': [], 'info': []} for w in (gif_worlds or [])}
+
         scorers = [PDMSScorer(config) for _ in range(config.num_worlds)]
         ref_start_agent = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
         temp_idx_pos = ref_start_agent + agent.DIM_REF_ERROR
@@ -196,6 +254,33 @@ def evaluate(config):
             abs_for_pdms = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
             partner_for_pdms = env.sim.partner_observations_tensor().to_torch().cpu().numpy()
             rel_np = env.sim.self_observation_tensor().to_torch().cpu().numpy()
+
+            # ---- storyboard trace：记录 ego 与伙伴的世界坐标位姿 ----
+            for w in (gif_worlds or []):
+                a = ego_indices[w]
+                ex = float(abs_for_pdms[w, a, 0])
+                ey = float(abs_for_pdms[w, a, 1])
+                eh = float(abs_for_pdms[w, a, 7])
+                trace[w]['ego'].append((ex, ey, eh))
+                trace[w]['info'].append((float(info_np[w, a, 0]),
+                                         float(info_np[w, a, 1]) + float(info_np[w, a, 2])))
+                pn = partner_for_pdms[w, a]
+                cos_h, sin_h = np.cos(eh), np.sin(eh)
+                ps = []
+                for i in range(pn.shape[0]):
+                    sp, rx, ry, rh = (float(pn[i, 0]), float(pn[i, 1]),
+                                      float(pn[i, 2]), float(pn[i, 3]))
+                    if sp == 0.0 and rx == 0.0 and ry == 0.0:
+                        continue
+                    if not (np.isfinite(sp) and np.isfinite(rx)
+                            and np.isfinite(ry) and np.isfinite(rh)):
+                        continue
+                    if abs(rx) > 1e3 or abs(ry) > 1e3 or abs(sp) > 1e2:
+                        continue
+                    ps.append((ex + rx * cos_h - ry * sin_h,
+                               ey + rx * sin_h + ry * cos_h,
+                               eh + rh, sp))
+                trace[w]['partners'].append(ps)
             for w in wm.good_worlds:
                 a = ego_indices[w]
                 ego_x, ego_y = float(abs_for_pdms[w, a, 0]), float(abs_for_pdms[w, a, 1])
@@ -224,7 +309,10 @@ def evaluate(config):
                     dt=config.dt,
                 )
 
-            if gif_enabled and step % recorder.fps == 0 and gif_worlds:
+            # 老的点线渲染只保留给 agent_pov；bird 视角改为 rollout 结束后
+            # 用 storyboard 离线渲染（更快，也能看出车头朝向与尾迹）
+            if (gif_enabled and config.gif_view_mode == 'agent_pov'
+                    and step % recorder.fps == 0 and gif_worlds):
                 _record_gif_frame(env, recorder, config, epoch, step,
                                   ego_indices, wm, gif_worlds)
 
@@ -254,7 +342,11 @@ def evaluate(config):
                          os.path.join(pdms_plot_dir, f'pdms_bar_epoch{epoch+1}.png'),
                          title=f'Per-World Driving Score Epoch {epoch+1}')
 
-    if gif_enabled:
+    if trace:
+        _dump_trace(trace, env, builder, config, ego_indices)
+        if gif_enabled and config.gif_view_mode != 'agent_pov':
+            _render_storyboards(trace, env, builder, config, ego_indices)
+    if gif_enabled and config.gif_view_mode == 'agent_pov':
         recorder.save_all_gifs(custom_fps=config.gif_fps)
     logger.debug('评估完成')
 
