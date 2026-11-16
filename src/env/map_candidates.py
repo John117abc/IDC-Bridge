@@ -67,9 +67,38 @@ class LaneField:
         return float(d[j]), float(self.h[j])
 
 
+def route_ambiguity(pose, map_rows, radius=10.0):
+    """起步处是否存在"横向岔路"（多分支歧义）的**地图侧**指标。
+
+    只看地图、不看专家：统计 ego 起点附近、与当前朝向夹角在 40°~140° 之间的
+    车道段数量。数量多说明这里是一个路口/多分支点，单靠朝向无法确定该走哪条。
+
+    返回 (n_cross, min_angle_deg)。
+    """
+    field = LaneField(map_rows)
+    if not len(field.h):
+        return 0, 90.0
+    q = np.array([float(pose[0]), float(pose[1])])
+    th = float(pose[2])
+    t = np.clip(((q - field.a) * field.ab).sum(1) / field.den, 0.0, 1.0)
+    proj = field.a + t[:, None] * field.ab
+    d = np.linalg.norm(q - proj, axis=1)
+    dth = np.abs(np.arctan2(np.sin(field.h - th), np.cos(field.h - th)))
+    near = d < radius
+    if not near.any():
+        return 0, 90.0
+    deg = np.degrees(dth[near])
+    cross = (deg > 40.0) & (deg < 140.0)
+    n = int(cross.sum())
+    return n, float(deg.min())
+
+
 def integrate_path(pose, field: LaneField, n=91, ds=1.0,
                    max_turn=np.deg2rad(4.0), lookahead=3.0):
-    """从 pose=(x,y,theta) 出发，沿车道切向场前进 n 步，每步 ds 米。"""
+    """从 pose=(x,y,theta) 出发，沿车道切向场前进 n 步，每步 ds 米。
+
+    ds 由调用方按当前车速给（让参考覆盖同样的 9.1 秒），默认 1.0 m ≈ 10 m/s。
+    """
     x, y, th = float(pose[0]), float(pose[1]), float(pose[2])
     pts = np.empty((n, 2))
     ths = np.empty(n)
@@ -109,7 +138,10 @@ def generate_map_candidates(pose, map_rows, offsets, cfg: SamplerConfig,
     """
     from .candidate_sampler import Candidate
     field = LaneField(map_rows)
-    base, _ = integrate_path(pose, field, n=n, ds=ds)
+    # ds 按当前车速缩放：让参考恰好覆盖 9.1 s（否则快场景会跑出参考尽头，
+    # 慢场景又要求加速）。clamp 到 4~20 m/s 避免极端值。
+    v_plan = float(np.clip(speed0, 4.0, 20.0))
+    base, _ = integrate_path(pose, field, n=n, ds=v_plan * cfg.dt)
     a_seg, b_seg = boundary_segments(map_rows)
     out = []
     for o in offsets:

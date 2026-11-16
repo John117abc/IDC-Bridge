@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 import glob
 import random
@@ -76,10 +76,31 @@ def _maybe_install_candidates(builder, ego_indices, env, config, logger, n=None)
             K, per_world = install_map_candidates(
                 builder, ego_indices, maps, poses, speeds, sc,
                 k_select=max(1, num))
+            # ---- 场景筛选：起步就急转（专家净位移方向与 ego 初始朝向差 >60°）
+            # 的场景，地图参考无法确定该走哪条分支（占 ~10%）。
+            # 只用于"选场景"，不作为模型输入；这些 world 标记为坏，
+            # 让世界管理器在下次 resample 时替换掉。
+            amb = []
+            ex_all = builder.expert_pos.detach().cpu().numpy()
+            for w in range(builder.num_worlds):
+                a = int(ego_indices[w])
+                ex = ex_all[w, a]
+                ex = ex[np.all(np.abs(ex) < 1e4, axis=1)]
+                if len(ex) < 5:
+                    continue
+                d = ex[-1] - ex[0]
+                if np.linalg.norm(d) < 3.0:
+                    continue
+                net = float(np.degrees(np.arctan2(d[1], d[0])))
+                turn = abs((net - np.degrees(poses[w][2]) + 180) % 360 - 180)
+                if turn > 60.0:
+                    amb.append(w)
+            builder._ambiguous_worlds = amb
             ks = [len(v) for v in per_world.values()]
             logger.info(f'[CANDS] 地图候选注入: K={K} '
                         f'每world中位={np.median(ks):.0f} '
-                        f'车速中位={np.median(speeds):.1f} m/s')
+                        f'车速中位={np.median(speeds):.1f} m/s '
+                        f'起步歧义world={len(amb)}')
             return K
         if num <= 1:
             return 1
@@ -188,6 +209,8 @@ def train(config):
     agent = DiscreteIDCAgent(env, config, config.device, builder, ego_indices)
 
     wm = WorldManager(env, builder, agent, all_files, config, logger)
+    for _w in getattr(builder, '_ambiguous_worlds', []):
+        wm.bad_worlds.add(_w)          # 起步歧义场景：交给世界管理器替换
     wm.filter_initial(ego_indices)
 
     epochs = config.epochs
@@ -417,6 +440,8 @@ def train(config):
             if K_PATHS > 1:
                 K_PATHS = _maybe_install_candidates(builder, ego_indices, env,
                                                     config, logger)
+            for _w in getattr(builder, '_ambiguous_worlds', []):
+                wm.bad_worlds.add(_w)
             for w in range(config.num_worlds):
                 agent.reset_world_state(w)
 

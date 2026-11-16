@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # 从头训 + 课程（无任何专家未来参考）：
 #   阶段1 0~599    : K=1（中心地图候选）
 #   阶段2 600~1199 : K=5 + ε 探索（eps 从 600 起算）
@@ -7,11 +7,11 @@ export MADRONA_MWGPU_KERNEL_CACHE=/gpudrive/gpudrive_cache
 PY=/gpudrive/.venv/bin/python
 TRAIN=/gpudrive/baselines/IDC-Bridge/src/scripts/train/idc-train.py
 OUT=/workspace/data
-LOG=$OUT/logs/curr_train.log
+LOG=$OUT/logs/curr_train2.log
 
 TOTAL=1200
 TODAY=$(date +%Y%m%d)
-CKPT_DIR=$OUT/checkpoints/${TODAY}_curr
+CKPT_DIR=$OUT/checkpoints/${TODAY}_curr2
 mkdir -p "$CKPT_DIR"
 
 for attempt in $(seq 1 20); do
