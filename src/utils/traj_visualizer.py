@@ -1,4 +1,4 @@
-import matplotlib
+﻿import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
@@ -101,24 +101,26 @@ class TrajectoryVisualizer:
             ref_label = PATH_LABELS[i] if i < len(PATH_LABELS) else f'Path {i}'
             if not use_expert_path:
                 ref_label = f'Road Graph {ref_label}'
+            # 参考轨迹是我们要观察的主体：实线 + 更粗 + 高 zorder
             ax.plot(bp[:, 0], bp[:, 1],
                     color=COLORS['candidate'][i % len(COLORS['candidate'])],
-                    linewidth=1.2, linestyle='--', alpha=0.8,
-                    label=ref_label, zorder=2)
+                    linewidth=2.6, linestyle='-', alpha=0.95,
+                    label=ref_label, zorder=4)
 
         # --- expert trajectory (only when relevant) ---
         if use_expert_path:
             expert_pos = self.builder.expert_pos[self.world_idx, self.agent_idx].cpu().numpy()
+            # 专家轨迹只作背景参照：浅灰细点线，别抢主体
             ax.plot(expert_pos[:, 0], expert_pos[:, 1],
-                    color=COLORS['expert'], linewidth=2.0, linestyle='-',
-                    label='Expert trajectory', zorder=3)
+                    color='#9e9e9e', linewidth=1.3, linestyle=':', alpha=0.75,
+                    label='Expert trajectory (ref only)', zorder=1)
 
         # --- actual trajectory ---
         if len(self.actual_x) > 0:
             ax.plot(self.actual_x, self.actual_y,
-                    color=COLORS['actual'], linewidth=2.0, linestyle='-',
-                    marker='.', markersize=2, alpha=0.9,
-                    label='Actual trajectory', zorder=5)
+                    color=COLORS['actual'], linewidth=1.8, linestyle='-',
+                    marker='.', markersize=2.5, alpha=0.95,
+                    label='Actual trajectory', zorder=6)
 
         # --- start / end markers ---
         if use_expert_path:
