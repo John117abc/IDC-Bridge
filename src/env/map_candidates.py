@@ -1,4 +1,4 @@
-"""B+ 方案：用地图局部切向场积分出前向路径，再叠横向偏移生成候选。
+﻿"""B+ 方案：用地图局部切向场积分出前向路径，再叠横向偏移生成候选。
 
 核心思想（为了彻底去掉"专家未来"这一特权信息）：
   候选 = 从**当前位姿**出发，沿**地图车道切向场**向前推演 9 秒的一族轨迹
@@ -45,6 +45,20 @@ class LaneField:
 
     def __len__(self):
         return len(self.h)
+
+    def nearest(self, q, radius=6.0):
+        """纯最近的车道段（不看航向），用于第一步锁定"我在哪条车道"。"""
+        if not len(self.h):
+            return np.inf, None
+        t = np.clip(((q - self.a) * self.ab).sum(1) / self.den, 0.0, 1.0)
+        proj = self.a + t[:, None] * self.ab
+        d = np.linalg.norm(q - proj, axis=1)
+        ok = d < radius
+        if not ok.any():
+            return np.inf, None
+        idx = np.where(ok)[0]
+        j = idx[int(np.argmin(d[idx]))]
+        return float(d[j]), float(self.h[j])
 
     def nearest_aligned(self, q, th, radius=6.0, cos_min=np.cos(np.deg2rad(60))):
         """在半径内挑**最顺着当前航向**的车道段（距离只是次要因素）。
@@ -94,7 +108,8 @@ def route_ambiguity(pose, map_rows, radius=10.0):
 
 
 def integrate_path(pose, field: LaneField, n=91, ds=1.0,
-                   max_turn=np.deg2rad(4.0), lookahead=3.0):
+                   max_turn=np.deg2rad(4.0), lookahead=3.0,
+                   lock_radius=2.5):
     """从 pose=(x,y,theta) 出发，沿车道切向场前进 n 步，每步 ds 米。
 
     ds 由调用方按当前车速给（让参考覆盖同样的 9.1 秒），默认 1.0 m ≈ 10 m/s。
@@ -106,7 +121,15 @@ def integrate_path(pose, field: LaneField, n=91, ds=1.0,
     ths[0] = th
     for i in range(1, n):
         q = np.array([x + lookahead * np.cos(th), y + lookahead * np.sin(th)])
-        _d, head = field.nearest_aligned(q, th)
+        if i == 1:
+            # 第一步：用"最近"锁定所在车道（相邻车道通常差 3.5 m）
+            _d0, head = field.nearest(q, radius=6.0)
+            if head is not None:
+                th = float(np.arctan2(np.sin(head), np.cos(head)))
+                lock_head = th
+        else:
+            # 之后收紧到 2.5 m：一旦锁定就禁止跳到相邻车道（3.5 m）
+            _d, head = field.nearest_aligned(q, th, radius=lock_radius)
         if head is not None:
             dth = np.arctan2(np.sin(head - th), np.cos(head - th))
             th = th + float(np.clip(dth, -max_turn, max_turn))
@@ -129,46 +152,68 @@ def offset_along_normals(pts, o):
     return P + (o * smoothstep5(u))[:, None] * nvec
 
 
+def _nominal_speed(pose, field, cfg, n=91):
+    """由**地图曲率**估一个名义目标速度（不看自车瞬时速度）。
+
+    自车在 episode 起点常常接近静止（实测 37% 的轨迹 9.1 s 内走不到 30 m），
+    用它定参考长度会把参考压到 ~36 m，而人类中位要走 47 m、p90 走 171 m。
+    """
+    base, _ = integrate_path(pose, field, n=n, ds=1.0)
+    kap = curvature(base, cfg.dt)
+    v = np.sqrt(cfg.a_lat_max / np.maximum(kap, 1e-6))
+    return float(np.clip(float(np.mean(v)), cfg.v_nominal_min,
+                         cfg.v_nominal_cap))
+
+
 def generate_map_candidates(pose, map_rows, offsets, cfg: SamplerConfig,
-                            speed0=8.0, n=91, ds=1.0):
+                            speed0=8.0, n=91, length_scales=None):
     """返回 list[Candidate]，每条带 corridor 可行性。
 
     pose: (x, y, theta) 当前位姿（世界系）
-    speed0: 当前车速（来自仿真观测，因果）
+    speed0: 当前车速（来自仿真观测，因果；只用于速度剖面起点）
+    length_scales: 纵向尺度集合，参考长度 = v_nominal * s * 9.1 s
     """
     from .candidate_sampler import Candidate
     field = LaneField(map_rows)
-    # ds 按当前车速缩放：让参考恰好覆盖 9.1 s（否则快场景会跑出参考尽头，
-    # 慢场景又要求加速）。clamp 到 4~20 m/s 避免极端值。
-    v_plan = float(np.clip(speed0, 4.0, 20.0))
-    base, _ = integrate_path(pose, field, n=n, ds=v_plan * cfg.dt)
+    lengths = getattr(cfg, 'anchor_lengths', None)
+    if not lengths:
+        # 回退：按 v_nominal × scale 推长度
+        if length_scales is None:
+            length_scales = getattr(cfg, 'length_scales', (1.0,)) or (1.0,)
+        v = _nominal_speed(pose, field, cfg, n)
+        lengths = tuple(v * float(s) * (n - 1) * cfg.dt for s in length_scales)
     a_seg, b_seg = boundary_segments(map_rows)
     out = []
-    for o in offsets:
-        p = offset_along_normals(base, o) if abs(o) > 1e-9 else base.copy()
-        kap = curvature(p, cfg.dt)
-        # 速度剖面：曲率限速 + 加减速约束，**起点用当前车速**，
-        # 之后允许按 a_long_max 加速（不能把上限钉在当前车速上，
-        # 否则从静止起步的场景参考速度永远是 0，车会一直爬）。
-        spd = speed_profile(p, kap, cfg, scale=1.0)
-        spd[0] = min(spd[0], float(np.clip(speed0, 0.5, cfg.v_cap)))
-        ds = np.linalg.norm(np.diff(p, axis=0), axis=1)
-        for i in range(1, len(spd)):
-            spd[i] = min(spd[i],
-                         np.sqrt(spd[i - 1] ** 2 + 2 * cfg.a_long_max * ds[i - 1]))
-        d = np.diff(p, axis=0)
-        hd = np.r_[np.unwrap(np.arctan2(d[:, 1], d[:, 0])), 0.0]
-        hd[-1] = hd[-2]
-        clear = dist_to_segments(p, a_seg, b_seg)
-        c = Candidate(param={"lat_offset": float(o), "dt_shift": 0.0,
-                             "speed_scale": 1.0},
-                      pos=p, heading=hd, speed=spd, clearance=clear,
-                      status="", cert={})
-        c.cert = {"cor_ok": corridor_ok(clear, cfg),
-                  "clear_min": float(clear.min())}
-        c.status = "CERTIFIED_FEASIBLE" if c.cert["cor_ok"] else "INFEASIBLE"
-        out.append(c)
-    return out, base
+    base_path = None
+    for L in lengths:
+        ds = max(0.3, float(L) / max(n - 1, 1))
+        base, _ = integrate_path(pose, field, n=n, ds=ds)
+        if base_path is None and abs(float(L) - 90.0) < 20.0:
+            base_path = base
+        for o in offsets:
+            p = offset_along_normals(base, o) if abs(o) > 1e-9 else base.copy()
+            kap = curvature(p, cfg.dt)
+            spd = speed_profile(p, kap, cfg, scale=1.0)
+            spd[0] = min(spd[0], float(np.clip(speed0, 0.5, cfg.v_cap)))
+            dsd = np.linalg.norm(np.diff(p, axis=0), axis=1)
+            for i in range(1, len(spd)):
+                spd[i] = min(spd[i],
+                             np.sqrt(spd[i - 1] ** 2 + 2 * cfg.a_long_max * dsd[i - 1]))
+            d = np.diff(p, axis=0)
+            hd = np.r_[np.unwrap(np.arctan2(d[:, 1], d[:, 0])), 0.0]
+            hd[-1] = hd[-2]
+            clear = dist_to_segments(p, a_seg, b_seg)
+            c = Candidate(param={"lat_offset": float(o), "dt_shift": 0.0,
+                                 "len_target": float(L), "speed_scale": 1.0},
+                          pos=p, heading=hd, speed=spd, clearance=clear,
+                          status="", cert={})
+            c.cert = {"cor_ok": corridor_ok(clear, cfg),
+                      "clear_min": float(clear.min())}
+            c.status = "CERTIFIED_FEASIBLE" if c.cert["cor_ok"] else "INFEASIBLE"
+            out.append(c)
+    if base_path is None:
+        base_path, _ = integrate_path(pose, field, n=n, ds=1.0)
+    return out, base_path
 
 
 def install_map_candidates(builder, ego_indices, maps, poses, speeds,
