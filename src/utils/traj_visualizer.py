@@ -185,3 +185,27 @@ class TrajectoryVisualizer:
         ax.annotate('', xy=(x + dx, y + dy), xytext=(x, y),
                     arrowprops=dict(arrowstyle='->', color=color,
                                     lw=2.0, alpha=0.7))
+
+
+def make_montage(dir_path: str, epoch: int, cols: int = 4, max_imgs: int = 12,
+                 scale: float = 0.5):
+    """把同一回合各 world 的图拼成一张蒙太奇，方便一眼扫完。"""
+    import glob
+    files = sorted(glob.glob(os.path.join(
+        dir_path, f'epoch_{epoch:03d}_world_*.png')))[:max_imgs]
+    if len(files) < 2:
+        return None
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    imgs = [Image.open(f).convert('RGB') for f in files]
+    w0, h0 = imgs[0].size
+    w, h = max(1, int(w0 * scale)), max(1, int(h0 * scale))
+    rows = (len(imgs) + cols - 1) // cols
+    canvas = Image.new('RGB', (cols * w, rows * h), 'white')
+    for i, im in enumerate(imgs):
+        canvas.paste(im.resize((w, h)), ((i % cols) * w, (i // cols) * h))
+    out = os.path.join(dir_path, f'epoch_{epoch:03d}_montage.png')
+    canvas.save(out)
+    return out

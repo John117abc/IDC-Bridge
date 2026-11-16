@@ -427,6 +427,13 @@ def train(config):
             for viz in viz_list:
                 if len(viz.actual_x) > 0:
                     viz.save_plot(viz_dir, epoch + 1, use_expert_path=use_expert)
+            try:
+                from utils.traj_visualizer import make_montage
+                _m = make_montage(viz_dir, epoch + 1)
+                if _m:
+                    logger.info(f'[VIZ] 蒙太奇 {_m}')
+            except Exception as _e:            # noqa: BLE001
+                logger.debug(f'[VIZ] montage failed: {_e}')
 
         save_info = {'env_name': 'examples'}
         agent.save(save_info=save_info)

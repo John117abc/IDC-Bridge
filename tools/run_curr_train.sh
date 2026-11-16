@@ -1,7 +1,8 @@
-﻿#!/usr/bin/env bash
-# 从头训 + 课程（无任何专家未来参考）：
+#!/usr/bin/env bash
+# 从头训 + 课程（无专家未来参考）
 #   阶段1 0~599    : K=1（中心地图候选）
-#   阶段2 600~1199 : K=5 + ε 探索（eps 从 600 起算）
+#   阶段2 600~1199 : K=5 + ε 探索
+# 断点续训：只从"今天目录"里找 episode < TOTAL 的最新权重（避免误加载历史实验）
 set -u
 export MADRONA_MWGPU_KERNEL_CACHE=/gpudrive/gpudrive_cache
 PY=/gpudrive/.venv/bin/python
@@ -11,12 +12,13 @@ LOG=$OUT/logs/curr_train2.log
 
 TOTAL=1200
 TODAY=$(date +%Y%m%d)
-CKPT_DIR=$OUT/checkpoints/${TODAY}_curr2
-mkdir -p "$CKPT_DIR"
+SAVE_DIR=$OUT/checkpoints/$TODAY
+mkdir -p "$SAVE_DIR"
 
-for attempt in $(seq 1 20); do
-    CKPT=$(ls -1 "$CKPT_DIR"/*.pth 2>/dev/null \
-        | sed -E 's/.*episode=([0-9]+)\.pth/\1\t&/' | sort -n | tail -1 | cut -f2-)
+for attempt in $(seq 1 30); do
+    CKPT=$(ls -1 "$SAVE_DIR"/*.pth 2>/dev/null \
+        | sed -E 's/.*episode=([0-9]+)\.pth/\1\t&/' | sort -n \
+        | awk -F'\t' -v t="$TOTAL" '$1 < t' | tail -1 | cut -f2-)
     if [ -n "${CKPT:-}" ]; then
         RESUME="--load-model --model-path $CKPT"
     else
@@ -30,5 +32,5 @@ for attempt in $(seq 1 20); do
     rc=$?
     echo "===== [SUP] attempt=$attempt exit=$rc $(date '+%F %T') =====" >> "$LOG"
     if [ "$rc" -eq 0 ]; then break; fi
-    sleep 15
+    sleep 20
 done
