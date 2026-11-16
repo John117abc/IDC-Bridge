@@ -156,6 +156,18 @@ def evaluate(config):
     builder.generate_candidate_paths(ego_indices, num_paths=1,
                                        use_expert_path=getattr(config, 'use_expert_path', True))
 
+    # A/B 对照：固定安装候选集，索引语义确定（CenterIndex = K//2）
+    _cand_fixed = int(getattr(config, 'cand_fixed', 0) or 0)
+    if _cand_fixed > 0:
+        from env.candidate_sampler import install_fixed
+        _offs = {3: (-0.8, 0.0, 0.8),
+                 5: (-1.6, -0.8, 0.0, 0.8, 1.6)}.get(
+                     _cand_fixed, (-0.8, 0.0, 0.8))
+        _maps = env.sim.map_observation_tensor().to_torch().cpu().numpy()
+        _K = install_fixed(builder, ego_indices, _maps, _offs)
+        logger.info(f'[AB] 固定候选安装完成: K={_K} offsets={_offs} '
+                    f'center_idx={_K // 2}')
+
     agent = DiscreteIDCAgent(env, config, config.device, builder, ego_indices)
 
     all_files = []
@@ -214,7 +226,11 @@ def evaluate(config):
         for step in range(max_step):
             logger.info(f'回合 {epoch+1}/{config.epochs}, 步数 {step+1}/{max_step}')
 
-            path_indices = [0 for _ in range(config.num_worlds)]
+            _fi = int(getattr(config, 'force_path_index', -1))
+            if _fi >= 0:
+                path_indices = [_fi for _ in range(config.num_worlds)]
+            else:
+                path_indices = [0 for _ in range(config.num_worlds)]
             states = builder.get_idc_observations_batch(ego_indices, path_indices=path_indices)
 
             # Rollout PDMS — 仅在 step 0 对所有 good world 做一次前向推演
@@ -381,6 +397,10 @@ if __name__ == "__main__":
                         help='GIF 播放速度（帧/秒）')
     parser.add_argument('--gif-record-interval', type=int, default=None,
                         help='每隔 N 个 env step 录一帧')
+    parser.add_argument('--cand-fixed', type=int, default=0,
+                        help='>0 时安装固定候选集（3=±0.8/中心，5=±1.6/±0.8/中心）')
+    parser.add_argument('--force-path-index', type=int, default=-1,
+                        help='>=0 时所有世界强制走第 i 条候选（A/B 对照用）')
     parser.add_argument('--gif-world-selection', type=str, default=None,
                         help='first / random')
     parser.add_argument('--min-partner-density', type=float, default=None)
@@ -403,6 +423,8 @@ if __name__ == "__main__":
         'max_penalty': args.max_penalty,
         'file_dir': args.file_dir,
         'gif_enabled': args.gif_enabled,
+        'cand_fixed': args.cand_fixed,
+        'force_path_index': args.force_path_index,
         'gif_view_mode': args.gif_view_mode,
         'gif_max_worlds': args.gif_max_worlds,
         'gif_zoom_radius': args.gif_zoom_radius,

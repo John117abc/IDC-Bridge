@@ -704,6 +704,71 @@ class GPUDriveObservationBuilder:
         speeds[-1] = speeds[-2]
         return speeds
 
+    def rebuild_paths_tensor(self):
+        """由 self.candidate_paths 重算"前视聚合"与 ref_tensor。
+
+        为什么不改 generate_candidate_paths：
+        它内部把这两步写死在世界循环里，直接改会动到基线路径。这里复制一份
+        独立方法，只给"外部注入候选"（candidate_sampler.install_candidates）
+        和以后的多候选训练用，基线行为完全不受影响。
+        """
+        decay_lam = 20
+        for w in range(self.num_worlds):
+            for a, paths in self.candidate_paths.get(w, {}).items():
+                for path in paths:
+                    pos_arr = path['pos']
+                    head_arr = path['heading']
+                    spd_arr = path['speed']
+                    rd_arr = path['road_dist']
+                    n = len(pos_arr)
+                    cp = np.zeros(91, dtype=np.float32)
+                    sp = np.zeros(91, dtype=np.float32)
+                    rp = np.zeros(91, dtype=np.float32)
+                    for i in range(91):
+                        rem = min(91, n) - i
+                        if rem <= 0:
+                            cp[i] = cp[i - 1]
+                            sp[i] = sp[i - 1]
+                            rp[i] = rp[i - 1]
+                            continue
+                        weights = np.exp(-np.arange(rem) / decay_lam)
+                        weights /= (weights.sum() + 1e-8)
+                        if i < n - 1:
+                            dh = head_arr[i + 1:min(n, 91)] - head_arr[i:min(n, 91) - 1]
+                            steps = np.hypot(np.diff(pos_arr[i:min(n, 91), 0]),
+                                             np.diff(pos_arr[i:min(n, 91), 1])) + 1e-6
+                            steer_i = np.zeros(len(dh), dtype=np.float32)
+                            for k in range(min(len(dh), len(weights))):
+                                steer_i[k] = float(np.arctan(5.0 * dh[k]
+                                                             / max(steps[k], 1e-6)))
+                            cp[i] = float(np.sum(weights[:len(steer_i)] * steer_i))
+                        sp[i] = float(np.sum(weights * spd_arr[i:i + rem]))
+                        rp[i] = float(np.sum(weights * rd_arr[i:i + rem]))
+                    path['curv_ahead'] = cp
+                    path['spd_ahead'] = sp
+                    path['road_ahead'] = rp
+
+        num_paths = self.num_candidate_paths
+        num_points = 91
+        ref_data = np.zeros((self.num_worlds, 1, num_paths, num_points, 8),
+                            dtype=np.float32)
+        for w in range(self.num_worlds):
+            for a, paths in self.candidate_paths.get(w, {}).items():
+                for p in range(min(num_paths, len(paths))):
+                    path = paths[p]
+                    n = min(len(path['pos']), num_points)
+                    ref_data[w, 0, p, :n, 0] = path['pos'][:n, 0]
+                    ref_data[w, 0, p, :n, 1] = path['pos'][:n, 1]
+                    ref_data[w, 0, p, :n, 2] = path['speed'][:n]
+                    ref_data[w, 0, p, :n, 3] = path['heading'][:n]
+                    ref_data[w, 0, p, :n, 4] = path['road_dist'][:n]
+                    ref_data[w, 0, p, :n, 5] = path['curv_ahead'][:n]
+                    ref_data[w, 0, p, :n, 6] = path['spd_ahead'][:n]
+                    ref_data[w, 0, p, :n, 7] = path['road_ahead'][:n]
+        self.ref_tensor = torch.from_numpy(ref_data).to(self.expert_pos.device)
+        logger.debug(f'[REBUILD] ref_tensor 重建: worlds={self.num_worlds} '
+                     f'paths={num_paths}')
+
     def _setup_expert_data(self):
         # 假设 sim.expert_trajectory_tensor() 返回形状为 [num_worlds, num_agents, 16*91]
         raw_traj = self.sim.expert_trajectory_tensor().to_torch()

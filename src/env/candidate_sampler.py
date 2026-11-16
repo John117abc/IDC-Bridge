@@ -1,29 +1,34 @@
-"""横向多模态候选的采样 + 走廊裁剪 + 四判据证书（M0-b）。
+"""横向多模态候选的采样 + 走廊裁剪 + 四判据证书（M0-b，v2）。
 
-设计约束（来自实测，不是拍脑袋）
---------------------------------
-* 横向范围 ±1.2 m：实测 ±1.2 m 时 68% 场景整条完全可行、逐点越界仅 4.9%；
-  ±1.5 m 掉到 62%，裁剪负担明显变大。
-* 横向步长 0.4 m：必须大于跟踪误差（实测 median pos_err 0.3~0.5 m），
-  否则 critic/代价分不出候选差异。
-* 走廊几何：`MapObservation` 是线段（position + length + heading），
-  边界是 type 1（road_edge）；type 0 的 length 恒为 0（是点，不是线段）。
-  距离必须用**点到线段**。
-* 运动学：曲率上限 0.246 1/m，且逐点 κ(s) ≤ a_lat_max / v(s)²，
-  a_lat_max = 3.0 m/s²（专家单条最大值 p95）。
+v2 修订（2026-11-16）
+--------------------
+v1 用"专家路径整体法向平移"（平行偏移曲线），起点与 ego 就差 o 米，
+相当于给跟踪器一个阶跃指令 —— 这不是"多模态轨迹"的正确语义。
 
-四态证书
+v2 改成**同起点、不同终点**：
+    y_cand(t) = y_expert(t) + o · S(u(t))
+    S(u) = 6u^5 - 15u^4 + 10u^3      （smoothstep5）
+    u    = 沿路径的弧长进度 0→1
+于是  S(0)=S'(0)=S''(0)=0, S(1)=1, S'(1)=S''(1)=0
+  • 起点 = ego 当前位置（初始跟踪误差 0）
+  • 终点横向偏 o，且终点处与专家路径平行（不走成斜的）
+
+纵向模态按 2026-11-16 的结论：**最近点投影下 pos_err 与时间无关**，
+所以"让行"不需要新路径，只改速度剖面：
+    speed_cand = speed_expert × T/(T+Δt)        Δt ∈ {0, 0.5, 1.0, 1.5} s
+
+参数依据
 --------
-INFEASIBLE           运动学或走廊判据不过（裁剪也救不回来）
-CERTIFIED_DIFFERENT  可行，且与已选候选的 Hausdorff ≥ delta
-CERTIFIED_FEASIBLE   可行，但与某个已选候选太像
-（碰撞判据离线不可评：单帧只拿到周车当前位置，没有未来轨迹 —— 记为 UNKNOWN）
+横向 o：0 / ±0.8 / ±1.6（±3.0 可选，默认关）
+  • 0.8 ≈ 数据净横移 p90 (0.92 m)
+  • 1.6 ≈ p95 (1.73) ≈ 走廊可行上限 p50 (1.50 m)
+  • 间距 0.8 m > 跟踪噪声底 (median pos_err 0.3~0.5 m)
+  • ±3.0 ≈ p99 (2.99)，但只有 1.2% 数据、48% 场景可行 → 默认关
 """
 from dataclasses import dataclass, field
 
 import numpy as np
 
-# ---- map_observation_tensor 列含义（实测）----
 IX_X, IX_Y, IX_LEN, IX_HEAD, IX_TYPE = 0, 1, 2, 5, 6
 ROAD_EDGE = 1
 
@@ -31,25 +36,52 @@ ROAD_EDGE = 1
 @dataclass
 class Candidate:
     param: dict
-    pos: np.ndarray            # [T,2] 世界坐标
-    heading: np.ndarray        # [T]
-    speed: np.ndarray          # [T]
-    clearance: np.ndarray      # [T] 到边界线段的距离
+    pos: np.ndarray
+    heading: np.ndarray
+    speed: np.ndarray
+    clearance: np.ndarray
     status: str
     cert: dict = field(default_factory=dict)
 
 
 @dataclass
 class SamplerConfig:
-    lat_offsets: tuple = (-1.2, -0.8, -0.4, 0.0, 0.4, 0.8, 1.2)
+    # 一条参数轴，多档幅度：
+    #   0      = 中心
+    #   ±0.8   = 数据净横移 p90 (0.92 m) —— 车道内常见避让
+    #   ±1.6   = p95 (1.73) ≈ 走廊可行上限 p50 (1.50 m) —— 大幅避让
+    #   ±3.5   = 一个车道宽（Waymo 车道约 3.5 m）—— **换道**
+    # 车道中心线本身就是"偏移曲线"，所以 o=3.5 的曲线几何上就是相邻车道中心线。
+    # 能不能用交给走廊证书按场景判断（窄路/单车道会自动只剩小幅度）。
+    lat_offsets: tuple = (-3.5, -1.6, -0.8, 0.0, 0.8, 1.6, 3.5)
+    lat_offsets_wide: tuple = ()               # 已并入 lat_offsets，保留字段兼容
+    allow_wide: bool = False
+    dt_shifts: tuple = (0.0, 0.5, 1.0, 1.5)    # 纵向：晚到时长的目标
     d_safe: float = 0.8
     kappa_max: float = 0.246
     a_lat_max: float = 3.0
     a_long_max: float = 3.0
     v_cap: float = 20.0
-    delta: float = 0.8          # 候选间 Hausdorff 下界（m）
-    k_select: int = 4           # 证书后保留几条
+    delta: float = 0.8
+    k_select: int = 4
     dt: float = 0.1
+    # 走廊判据的鲁棒化（2026-11-16）：
+    # 原来要求"整条路径每一点都 >= d_safe"，tensor 里的边界是稀疏线段云，
+    # 一个点擦到就整条废掉 —— 实测 3/16 场景连中心候选都被判 INFEASIBLE。
+    # 改为：允许不超过 corridor_bad_frac 比例的点低于 d_safe，
+    #      但绝对下限 clear_abs_min 必须满足。
+    corridor_bad_frac: float = 0.05
+    clear_abs_min: float = 0.15
+
+
+def corridor_ok(clear, cfg):
+    """鲁棒的走廊判据。"""
+    clear = np.asarray(clear, dtype=np.float64)
+    if not len(clear):
+        return False
+    bad = float(np.mean(clear < cfg.d_safe))
+    return bool(bad <= cfg.corridor_bad_frac
+                and float(clear.min()) >= cfg.clear_abs_min)
 
 
 # ---------------------------------------------------------------- 几何工具
@@ -62,7 +94,6 @@ def dedup_map(rows):
 
 
 def boundary_segments(map_rows, types=(ROAD_EDGE,)):
-    """返回边界线段的两端点 a,b [M,2]（若某行 length<=0 则视为点，做成极短段）。"""
     m = dedup_map(map_rows)
     if not len(m):
         return np.zeros((0, 2)), np.zeros((0, 2))
@@ -72,37 +103,33 @@ def boundary_segments(map_rows, types=(ROAD_EDGE,)):
     x, y, L, h = m[:, IX_X], m[:, IX_Y], m[:, IX_LEN], m[:, IX_HEAD]
     L = np.maximum(L, 1e-3)
     c, s = np.cos(h), np.sin(h)
-    a = np.stack([x - 0.5 * L * c, y - 0.5 * L * s], 1)
-    b = np.stack([x + 0.5 * L * c, y + 0.5 * L * s], 1)
-    return a, b
+    return (np.stack([x - 0.5 * L * c, y - 0.5 * L * s], 1),
+            np.stack([x + 0.5 * L * c, y + 0.5 * L * s], 1))
 
 
 def dist_to_segments(q, a, b):
-    """q [N,2] -> [N]，点到线段集最近距离。"""
     q = np.asarray(q, dtype=np.float64)
     if len(a) == 0:
         return np.full(len(q), np.inf)
     ab = b - a
-    denom = np.maximum((ab ** 2).sum(1), 1e-12)
+    den = np.maximum((ab ** 2).sum(1), 1e-12)
     step = max(1, int(4e6 // max(1, len(a))))
     out = np.empty(len(q))
     for i in range(0, len(q), step):
         qq = q[i:i + step]
         ap = qq[:, None, :] - a[None]
-        t = np.clip((ap * ab[None]).sum(-1) / denom[None], 0.0, 1.0)
+        t = np.clip((ap * ab[None]).sum(-1) / den[None], 0.0, 1.0)
         proj = a[None] + t[..., None] * ab[None]
         out[i:i + step] = np.linalg.norm(qq[:, None, :] - proj, axis=-1).min(1)
     return out
 
 
-def path_normals(p):
-    d = np.gradient(p, axis=0)
-    t = d / np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
-    return np.stack([-t[:, 1], t[:, 0]], axis=1)     # 左法向
+def smoothstep5(u):
+    u = np.clip(np.asarray(u, dtype=np.float64), 0.0, 1.0)
+    return u ** 3 * (10.0 - 15.0 * u + 6.0 * u * u)
 
 
 def curvature(p, dt):
-    """航向差分法。先对位置做 5 点平滑，再对曲率做 3 点平滑，抑制噪声尖峰。"""
     ps = p.copy()
     if len(ps) >= 5:
         k = np.ones(5) / 5.0
@@ -122,13 +149,7 @@ def curvature(p, dt):
     return np.abs(kap)
 
 
-def speed_profile(pos, kap, cfg):
-    """前向-后向速度剖面：同时满足侧向加速度与纵向加加速度约束。
-
-    逐点取 min(v_raw, sqrt(a_lat/kappa)) 会让曲率尖峰处速度骤降，
-    导致 |Δv|/dt 超出纵向加速度上限（实测会让几乎所有候选被判 INFEASIBLE）。
-    这里用标准的 forward-backward pass 把速度剖面压成可执行曲线。
-    """
+def speed_profile(pos, kap, cfg, scale=1.0):
     d = np.diff(pos, axis=0)
     ds = np.maximum(np.linalg.norm(d, axis=1), 1e-6)
     v_raw = np.r_[ds / cfg.dt, ds[-1] / cfg.dt]
@@ -136,91 +157,61 @@ def speed_profile(pos, kap, cfg):
         k = np.ones(3) / 3.0
         v_raw = np.convolve(np.pad(v_raw, (1, 1), mode="edge"), k, mode="valid")
     v_lim = np.sqrt(cfg.a_lat_max / np.maximum(kap, 1e-6))
-    v = np.minimum(np.minimum(v_raw, v_lim), cfg.v_cap)
-    # 后向：保证减速度不超过 a_long（v[i]^2 <= v[i+1]^2 + 2 a ds）
+    v = np.minimum(np.minimum(v_raw, v_lim), cfg.v_cap) * scale
     for i in range(len(v) - 2, -1, -1):
         v[i] = min(v[i], np.sqrt(v[i + 1] ** 2 + 2 * cfg.a_long_max * ds[i]))
-    # 前向：保证加速度不超过 a_long
     for i in range(1, len(v)):
         v[i] = min(v[i], np.sqrt(v[i - 1] ** 2 + 2 * cfg.a_long_max * ds[i - 1]))
     return np.clip(v, 0.0, cfg.v_cap)
 
 
-# ---------------------------------------------------------------- 采样与裁剪
-def clip_point_to_corridor(base_pt, normal, a, b, d_safe, o_max, steps=12):
-    """把 base_pt + o*normal 沿法向收回到满足 clearance>=d_safe 的最近可行 o。
-
-    返回 (实际使用的 o, 该点 clearance, 是否被裁剪)。
-    """
-    def clear(o):
-        q = (base_pt + o * normal)[None, :]
-        return float(dist_to_segments(q, a, b)[0])
-
-    if clear(o_max) >= d_safe:
-        return o_max, clear(o_max), False
-    lo, hi = 0.0, o_max          # 假设 o=0（专家路径）一定可行
-    if clear(lo) < d_safe:
-        return 0.0, clear(lo), True
-    for _ in range(steps):
-        mid = 0.5 * (lo + hi)
-        if clear(mid) >= d_safe:
-            lo = mid
-        else:
-            hi = mid
-    return lo, clear(lo), True
-
-
-def make_candidate(expert, offset, a, b, cfg, long_shift=0.0):
-    """按固定横向偏移生成候选（逐点走廊裁剪 + 曲率限速重采样）。"""
+# ---------------------------------------------------------------- 采样
+def make_candidate(expert, o, dt_shift, a_seg, b_seg, cfg):
+    """同起点、不同终点：在自车系里给路径叠加一条 smoothstep 横向剖面。"""
     T = len(expert)
-    n = path_normals(expert)
-    pos = np.empty_like(expert)
-    clipped = 0
-    o_used = np.empty(T)
-    for i in range(T):
-        o, _c, was = clip_point_to_corridor(expert[i], n[i], a, b,
-                                           cfg.d_safe, abs(offset))
-        o = o if offset >= 0 else -o
-        o_used[i] = o
-        pos[i] = expert[i] + o * n[i]
-        clipped += int(was)
-    # 纵向时间偏移（简化：整条轨迹按 long_shift 平移，仅用于打散速度模态）
-    if abs(long_shift) > 1e-6:
-        k = int(round(long_shift / cfg.dt))
-        if k > 0:
-            pos = np.vstack([pos[:1].repeat(k, 0), pos[:-k]])[:T]
-        elif k < 0:
-            pos = np.vstack([pos[-k:], pos[-1:].repeat(-k, 0)])[:T]
+    p0 = expert[0]
+    d0 = expert[1] - expert[0]
+    h0 = float(np.arctan2(d0[1], d0[0]))
+    c, s = np.cos(-h0), np.sin(-h0)
+    R = np.array([[c, -s], [s, c]])                  # 世界 -> 自车系
+    pe = (expert - p0) @ R.T                          # [T,2]，起点在原点
 
-    d = np.diff(pos, axis=0)
+    arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(pe, axis=0), axis=1))]
+    u = arc / max(arc[-1], 1e-6)
+    pe2 = pe.copy()
+    pe2[:, 1] = pe[:, 1] + o * smoothstep5(u)          # 起点不动、终点偏 o
+
+    # pe = (p - p0) @ R.T  ->  逆变换 pe2 @ R + p0
+    pos = pe2 @ R + p0
+
+    scale = T * cfg.dt / (T * cfg.dt + max(dt_shift, 0.0))
     kap = curvature(pos, cfg.dt)
-    speed = speed_profile(pos, kap, cfg)
-    heading = np.unwrap(np.arctan2(d[:, 1], d[:, 0]))
-    heading = np.r_[heading, heading[-1]]
-    clear = dist_to_segments(pos, a, b)
+    speed = speed_profile(pos, kap, cfg, scale=scale)
+    d = np.diff(pos, axis=0)
+    heading = np.r_[np.unwrap(np.arctan2(d[:, 1], d[:, 0])), 0.0]
+    heading[-1] = heading[-2] if len(heading) > 1 else heading[-1]
+    clear = dist_to_segments(pos, a_seg, b_seg)
     return Candidate(
-        param={"lat_offset": float(offset), "long_shift": float(long_shift),
-               "clipped_points": int(clipped)},
+        param={"lat_offset": float(o), "dt_shift": float(dt_shift),
+               "speed_scale": float(scale)},
         pos=pos, heading=heading, speed=speed, clearance=clear,
         status="", cert={},
     )
 
 
-# ---------------------------------------------------------------- 证书
-def hausdorff(p, q):
-    d1 = np.max([dist_to_segments(np.array([x]), q, q)[0] for x in p[::3]]) \
-        if len(q) else np.inf
-    d2 = np.max([dist_to_segments(np.array([x]), p, p)[0] for x in q[::3]]) \
-        if len(p) else np.inf
-    return float(max(d1, d2))
+def hausdorff(p, q, stride=3):
+    if not len(p) or not len(q):
+        return np.inf
+    d1 = max(float(dist_to_segments(np.array([x]), q, q)[0]) for x in p[::stride])
+    d2 = max(float(dist_to_segments(np.array([x]), p, p)[0]) for x in q[::stride])
+    return max(d1, d2)
 
 
-def certify(cand: Candidate, selected, cfg) -> Candidate:
+def certify(cand, selected, cfg):
     pos, spd, clr = cand.pos, cand.speed, cand.clearance
     kap = curvature(pos, cfg.dt)
     a_lat = spd ** 2 * kap
     acc = np.abs(np.diff(spd)) / cfg.dt
-
     kin_fail = []
     if np.any(kap > cfg.kappa_max * 1.05):
         kin_fail.append("kappa")
@@ -228,48 +219,106 @@ def certify(cand: Candidate, selected, cfg) -> Candidate:
         kin_fail.append("a_lat")
     if len(acc) and np.any(acc > cfg.a_long_max * 1.5):
         kin_fail.append("a_long")
-    cor_ok = bool(np.all(clr >= cfg.d_safe * 0.98))
-    # 判据语义（2026-11-15 修订）：
-    #   走廊 = 硬判据（物理空间能不能待）
-    #   运动学 = 软约束（只记 TRACTION_RISK，不拒候选）；理由：
-    #     1) 跟踪器自身有 clamp，不可跟踪的候选会由代价 J/V 自然排后
-    #     2) 曲率/加速度是 10 Hz 有限差分估出来的，有噪声，硬阈值会制造假阴性
-    #        （实测把 29% 的候选误杀，K' 被压到 2.62）
+    cor_ok = corridor_ok(clr, cfg)
     cand.cert = {
-        "cor_ok": cor_ok,
-        "traction_risk": bool(kin_fail),
-        "kin_fail": kin_fail,
+        "cor_ok": cor_ok, "traction_risk": bool(kin_fail), "kin_fail": kin_fail,
         "kappa_max": float(kap.max()), "a_lat_max": float(a_lat.max()),
         "a_long_max": float(acc.max() if len(acc) else 0.0),
         "clear_min": float(clr.min()),
-        "clipped_points": cand.param["clipped_points"],
-        "collision": "UNKNOWN",     # 离线只有周车当前位置，无未来轨迹
+        "collision": "UNKNOWN",
     }
     if not cor_ok:
         cand.status = "INFEASIBLE"
         return cand
     same = [d for d in (hausdorff(pos, s.pos) for s in selected) if d < cfg.delta]
-    cand.status = "CERTIFIED_DIFFERENT" if not same else "CERTIFIED_FEASIBLE"
-    cand.cert["min_diff_to_selected"] = (
-        min((hausdorff(pos, s.pos) for s in selected), default=float("inf")))
+    cand.status = "CERTIFIED_FEASIBLE" if same else "CERTIFIED_DIFFERENT"
+    cand.cert["min_diff"] = min((hausdorff(pos, s.pos) for s in selected),
+                                default=float("inf"))
     return cand
 
 
-def build_candidates(expert, map_rows, cfg: SamplerConfig, long_shifts=(0.0,)):
-    """采样 -> 裁剪 -> 证书 -> 按 |offset| 从小到大挑出 k_select 条。"""
+def install_candidates(builder, ego_indices, maps, cfg: SamplerConfig):
+    """把采样出的候选注入 builder.candidate_paths，并重建 ref_tensor。
+
+    返回实际生效的候选数 K。K 在不同 world 可能不同（走廊太窄的会被判
+    INFEASIBLE），这里取最大值、缺的用该 world 的最后一个候选补齐，
+    保证 ref_tensor 的 path 维是齐的。
+    """
+    for w in range(builder.num_worlds):
+        a = int(ego_indices[w])
+        expert = builder.expert_pos[w, a].detach().cpu().numpy()
+        if not np.all(np.abs(expert[:, :2]) < 1e3):
+            continue                      # 无效轨迹，交给原来的单路径逻辑
+        a_seg, b_seg = boundary_segments(maps[w])
+        selected, _raw, _inf = build_candidates(expert, maps[w], cfg)
+        if not selected:                  # 兜底：至少给一条中心候选
+            selected = [make_candidate(expert, 0.0, 0.0, a_seg, b_seg, cfg)]
+        paths = []
+        for c in selected:
+            paths.append({
+                'pos': c.pos.astype(np.float32),
+                'heading': c.heading.astype(np.float32),
+                'speed': c.speed.astype(np.float32),
+                'road_dist': np.maximum(c.clearance, 0.0).astype(np.float32),
+            })
+        builder.candidate_paths[w] = {a: paths}
+
+    # 补齐到统一的 K
+    K = 1
+    for d in builder.candidate_paths.values():
+        for paths in d.values():
+            K = max(K, len(paths))
+    for w, d in builder.candidate_paths.items():
+        for a, paths in d.items():
+            while len(paths) < K:
+                paths.append(dict(paths[-1]))     # 浅拷贝即可（只读）
+    builder.num_candidate_paths = K
+    if hasattr(builder, 'rebuild_paths_tensor'):
+        builder.rebuild_paths_tensor()
+    return K
+
+
+def install_fixed(builder, ego_indices, maps, offsets=(-0.8, 0.0, 0.8),
+                  cfg: SamplerConfig = None):
+    """A/B 对照用：给每个 world 固定安装 len(offsets) 条候选（不做证书筛选）。
+
+    索引语义因此是确定的：第 i 条对应 offsets[i]（CenterIndex = len//2）。
+    这让 eval 可以用 --force-path-index 精确指定"全部世界走哪条"。
+    """
+    cfg = cfg or SamplerConfig()
+    for w in range(builder.num_worlds):
+        a = int(ego_indices[w])
+        expert = builder.expert_pos[w, a].detach().cpu().numpy()
+        a_seg, b_seg = boundary_segments(maps[w])
+        paths = []
+        for o in offsets:
+            c = make_candidate(expert, o, 0.0, a_seg, b_seg, cfg)
+            paths.append({
+                'pos': c.pos.astype(np.float32),
+                'heading': c.heading.astype(np.float32),
+                'speed': c.speed.astype(np.float32),
+                'road_dist': np.maximum(c.clearance, 0.0).astype(np.float32),
+            })
+        builder.candidate_paths[w] = {a: paths}
+    builder.num_candidate_paths = len(offsets)
+    builder.rebuild_paths_tensor()
+    return len(offsets)
+
+
+def build_candidates(expert, map_rows, cfg: SamplerConfig):
+    """采样 -> 证书 -> 贪心挑 k_select 条（优先 |o| 小、Δt 小）。"""
     a, b = boundary_segments(map_rows)
-    raw = [make_candidate(expert, o, a, b, cfg, ls)
-           for ls in long_shifts for o in cfg.lat_offsets]
-    selected = []
-    # 只有走廊是硬判据；运动学不合格的候选保留但打 TRACTION_RISK
+    offs = list(cfg.lat_offsets)
+    if cfg.allow_wide:
+        offs += list(cfg.lat_offsets_wide)
+    raw = [make_candidate(expert, o, dt, a, b, cfg)
+           for dt in cfg.dt_shifts for o in offs]
     ok = [c for c in raw if certify(c, [], cfg).cert["cor_ok"]]
-    # 先按 |offset| 升序（保守优先），再按差异性贪心
-    ok.sort(key=lambda c: (abs(c.param["lat_offset"]),
-                           abs(c.param["long_shift"])))
+    ok.sort(key=lambda c: (abs(c.param["lat_offset"]), c.param["dt_shift"]))
+    selected = []
     for c in ok:
         certify(c, selected, cfg)
-        if c.status == "CERTIFIED_DIFFERENT" or not selected:
-            c.status = "CERTIFIED_DIFFERENT" if not selected else c.status
+        if c.status == "CERTIFIED_DIFFERENT":
             selected.append(c)
         if len(selected) >= cfg.k_select:
             break

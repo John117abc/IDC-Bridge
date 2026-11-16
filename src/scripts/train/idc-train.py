@@ -21,6 +21,77 @@ from metrics import PDMSScorer
 logger = get_logger('idc-train')
 
 
+def _eps_at(epoch, config):
+    """ε 调度：warmup 期纯随机（让 actor 学会跟踪所有候选），之后线性降到 eps_end。"""
+    e0 = float(getattr(config, 'eps_start', 1.0))
+    e1 = float(getattr(config, 'eps_end', 0.5))
+    warm = int(getattr(config, 'warmup_epochs', 100))
+    decay = max(int(getattr(config, 'eps_decay_epochs', 200)), 1)
+    if epoch < warm:
+        return e0
+    if epoch < warm + decay:
+        t = (epoch - warm) / decay
+        return e0 + t * (e1 - e0)
+    return e1
+
+
+def _maybe_install_candidates(builder, ego_indices, env, config, logger):
+    """若启用多候选：用 candidate_sampler 生成 K 条并注入 builder；返回 K。
+
+    注入失败时退回原来的单路径逻辑，保证训练不会因为候选模块出问题而中断。
+    """
+    num = int(getattr(config, 'num_candidates', 1) or 1)
+    if num <= 1:
+        return 1
+    try:
+        from env.candidate_sampler import SamplerConfig, install_candidates
+        sc = SamplerConfig(
+            lat_offsets=tuple(getattr(config, 'cand_lat_offsets',
+                                      (-3.5, -1.6, -0.8, 0.0, 0.8, 1.6, 3.5))),
+            allow_wide=bool(getattr(config, 'cand_allow_wide', False)),
+            dt_shifts=tuple(getattr(config, 'cand_dt_shifts', (0.0,))),
+            k_select=int(getattr(config, 'cand_k_select', 4)),
+            delta=float(getattr(config, 'cand_delta', 0.8)),
+            d_safe=float(getattr(config, 'cand_d_safe', 0.8)),
+            corridor_bad_frac=float(getattr(config, 'cand_bad_frac', 0.05)),
+            clear_abs_min=float(getattr(config, 'cand_clear_min', 0.15)),
+        )
+        maps = env.sim.map_observation_tensor().to_torch().cpu().numpy()
+        source = str(getattr(config, 'cand_source', 'map')).lower()
+        if source == 'map':
+            # 无特权信息：候选只由 当前位姿 + 地图 生成
+            from env.map_candidates import install_map_candidates
+            abs_np = env.sim.absolute_self_observation_tensor(
+            ).to_torch().cpu().numpy()
+            rel_np = env.sim.self_observation_tensor(
+            ).to_torch().cpu().numpy()
+            W = builder.num_worlds
+            poses = [(float(abs_np[w, ego_indices[w], 0]),
+                      float(abs_np[w, ego_indices[w], 1]),
+                      float(abs_np[w, ego_indices[w], 7])) for w in range(W)]
+            speeds = [float(np.clip(rel_np[w, ego_indices[w], 2], 1.0, 20.0))
+                      for w in range(W)]
+            K, per_world = install_map_candidates(
+                builder, ego_indices, maps, poses, speeds, sc, k_select=num)
+            ks = [len(v) for v in per_world.values()]
+            logger.info(f'[CANDS] 地图候选注入: K={K} '
+                        f'每world中位={np.median(ks):.0f} '
+                        f'车速中位={np.median(speeds):.1f} m/s')
+            return K
+        K = install_candidates(builder, ego_indices, maps, sc)
+        logger.info(f'[CANDS] 专家候选注入: K={K} '
+                    f'(offsets={sc.lat_offsets}, k_select={sc.k_select})')
+        return K
+    except Exception as e:                      # noqa: BLE001
+        logger.warning(f'[CANDS] 注入失败，退回单路径: {e}')
+        try:
+            builder.generate_candidate_paths(ego_indices, num_paths=1,
+                                             use_expert_path=True)
+        except Exception:
+            pass
+        return 1
+
+
 def _diag_init_step(config, agent, builder, ego_indices, episode_path_indices,
                     states, actions, step):
     if step != 0:
@@ -107,6 +178,7 @@ def train(config):
     ego_indices = get_ego_indices(env, config.num_worlds)
     builder.generate_candidate_paths(ego_indices, num_paths=1,
                                        use_expert_path=getattr(config, 'use_expert_path', True))
+    K_PATHS = _maybe_install_candidates(builder, ego_indices, env, config, logger)
 
     agent = DiscreteIDCAgent(env, config, config.device, builder, ego_indices)
 
@@ -125,6 +197,12 @@ def train(config):
 
     viz_dir = os.path.join(config.file_dir, 'traj_plots')
     os.makedirs(viz_dir, exist_ok=True)
+
+    # ε 调度锚点：从"本次训练的起点"算起，而不是绝对 epoch。
+    # 否则续训（如从 epoch=2400 的基线热启动）会直接落在衰减后的阶段，
+    # 跳过 ε=1.0 的 warmup —— 而那正是"让 actor 学会跟踪所有候选"的关键。
+    EPS_ANCHOR = int(getattr(agent, 'globe_eps', 0) or 0)
+    logger.info(f'[CANDS] eps 调度锚点 = epoch {EPS_ANCHOR}')
 
     for epoch in range(epochs):
         epoch += current_epoch
@@ -153,7 +231,22 @@ def train(config):
         viz_list = [TrajectoryVisualizer(builder, w, ego_indices[w])
                     for w in VIZ_WORLDS]
 
-        episode_path_indices = [0 for _ in range(config.num_worlds)]
+        # ε-greedy 选候选（整条 episode 固定一条）：
+        #   warmup 期 ε=1 纯随机 → 逼 actor 学会跟踪所有横向候选；
+        #   之后 ε 线性下降，非探索分支暂时固定为中心候选（等 M1 的 J/V 选路）。
+        eps = _eps_at(epoch - EPS_ANCHOR, config)
+        if K_PATHS > 1:
+            if np.random.rand() < eps:
+                episode_path_indices = [int(np.random.randint(0, K_PATHS))
+                                        for _ in range(config.num_worlds)]
+            else:
+                episode_path_indices = [0 for _ in range(config.num_worlds)]
+        else:
+            episode_path_indices = [0 for _ in range(config.num_worlds)]
+        if K_PATHS > 1 and (epoch % 20 == 0):
+            hist = np.bincount(episode_path_indices, minlength=K_PATHS)
+            logger.info(f'[CANDS] epoch={epoch+1} eps={eps:.2f} '
+                        f'选择分布={hist.tolist()} K={K_PATHS}')
 
         scorers = [PDMSScorer(config) for _ in range(config.num_worlds)]
         ref_start_agent = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
@@ -304,6 +397,9 @@ def train(config):
                 f'good<{config.num_worlds - config.max_bad_worlds}, triggering resample...'
             )
             ego_indices = wm.resample()
+            if K_PATHS > 1:
+                K_PATHS = _maybe_install_candidates(builder, ego_indices, env,
+                                                    config, logger)
             for w in range(config.num_worlds):
                 agent.reset_world_state(w)
 

@@ -91,14 +91,32 @@ world:
   max_partner_density: 99         # 周车密度上限
   dense_sample_size: 10000        # 稠密场景候选池大小（优先从密度区间采样）
   max_bad_worlds: 60              # 坏 world 数超过此值触发 resample（保留 ≥ num_worlds-max 个 good）
-  resample_interval: 10           # 每 N 个 epoch 做一次"滚动替换"（0 = 关闭）
-  resample_ratio: 0.4             # 每次替换的 world 比例。滚动替换而非全换：
+  resample_interval: 10           # 每 N 个 epoch 做一次"滚动替换"（0 = 关闭）  resample_ratio: 0.4             # 每次替换的 world 比例。滚动替换而非全换：
                                   # 全换会让整个 buffer 作废，且换一次要 30~40 秒，
                                   # 而一个 epoch 只有 19 秒。
   use_expert_path: true           # true: 使用 expert 轨迹生成参考路径; false: 从道路图生成
   filter_threshold: 200           # ego 坐标超过 ±200m 视为坏 world
   dataset_size: 0                 # 数据池大小，0=自动检测 data_dir 下 tfrecord 文件数
   density_cache_file: "/workspace/data/logs/density_full.json"  # 离线密度扫描缓存
+
+  # ---- 横向多模态候选（research/lateral-modes 分支）----
+  # 依据：横向偏移档位来自实测（净横移 p90=0.92 / p95=1.73 / 走廊可行上限 p50=1.50），
+  #      间距 0.8 m > 跟踪噪声底（median pos_err 0.3~0.5 m）。
+  num_candidates: 5                 # >1 时启用多候选；=1 完全退回单路径基线
+  cand_source: map                  # map = 位姿+地图生成（无特权信息，论文用）; expert = 旧做法
+  cand_d_safe: 0.8                  # 走廊阈值
+  cand_bad_frac: 0.05               # 允许低于阈值的点数比例（鲁棒化）
+  cand_clear_min: 0.15              # 绝对下限
+  cand_lat_offsets: [-3.5, -1.6, -0.8, 0.0, 0.8, 1.6, 3.5]   # 终点横向偏移（m）；±3.5 = 换道档
+  cand_allow_wide: false            # 是否加入 ±3.0（换道档；只有 1.2% 数据、48% 场景可行）
+  cand_dt_shifts: [0.0]             # 纵向时间偏移（s）；只改速度剖面，不改几何
+  cand_k_select: 4                  # 证书+差异性过滤后保留几条
+  cand_delta: 0.8                   # 候选间 Hausdorff 下界（m）
+  # ε-greedy 选候选：warmup 期纯随机（逼 actor 学会跟踪所有候选），之后线性下降
+  eps_start: 1.0
+  eps_end: 0.5
+  warmup_epochs: 100
+  eps_decay_epochs: 200
 
 # ---- 诊断开关 ----
 diag:
