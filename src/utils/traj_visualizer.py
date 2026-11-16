@@ -100,7 +100,7 @@ class TrajectoryVisualizer:
             bp = path['pos']
             ref_label = PATH_LABELS[i] if i < len(PATH_LABELS) else f'Path {i}'
             if not use_expert_path:
-                ref_label = f'Road Graph {ref_label}'
+                ref_label = ref_label
             # 参考轨迹是我们要观察的主体：实线 + 更粗 + 高 zorder
             ax.plot(bp[:, 0], bp[:, 1],
                     color=COLORS['candidate'][i % len(COLORS['candidate'])],

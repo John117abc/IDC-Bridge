@@ -423,7 +423,9 @@ def train(config):
         plot_interval = max(int(getattr(config, 'traj_plot_interval', 20)), 1)
         if viz_list and ((epoch + 1) % plot_interval == 0 or (epoch + 1) == 1):
             logger.info(f'保存轨迹图像 (epoch={epoch + 1}, 每 {plot_interval} 轮)')
-            use_expert = getattr(config, 'use_expert_path', True)
+            # 绘图是否画专家轨迹：与 use_expert_path（路径生成方式）解耦，
+            # 现在参考是地图生成的，图里画专家只会造成混淆
+            use_expert = bool(getattr(config, 'plot_show_expert', False))
             for viz in viz_list:
                 if len(viz.actual_x) > 0:
                     viz.save_plot(viz_dir, epoch + 1, use_expert_path=use_expert)

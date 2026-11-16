@@ -26,5 +26,6 @@ viz:
   gif_view_mode: "agent_pov"     # "bird_2d" | "bird_3d" | "agent_pov"
   gif_zoom_radius: 70
   # 轨迹图落盘频率：原实现每个 epoch × 10 个 world，2400 轮会产 2.4 万张图
-  traj_plot_interval: 50          # 每 N 个 epoch 存一次（第 1 轮总会存）
+  traj_plot_interval: 20          # 每 N 个 epoch 存一次（第 1 轮总会存）
   traj_plot_max_worlds: 12        # 每次最多画几个 world（0 = 不画）；会额外拼一张蒙太奇
+  plot_show_expert: false         # 图里是否画专家轨迹（false = 只看参考与自车，避免混淆）
