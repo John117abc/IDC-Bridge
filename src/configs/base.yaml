@@ -117,6 +117,11 @@ world:
   eps_end: 0.5
   warmup_epochs: 100
   eps_decay_epochs: 200
+  # ---- 课程训练（从头训用）----
+  # 阶段1（epoch < curriculum_epochs）：K=1，只装中心候选 → 从零学会跟地图路径
+  # 阶段2（之后）：K=num_candidates + ε 探索   → 学会跟横向偏移
+  curriculum_epochs: 600
+  eps_anchor_epoch: 600             # ε 从该 epoch 起算（阶段2的起点）
 
 # ---- 诊断开关 ----
 diag:

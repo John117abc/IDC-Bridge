@@ -35,13 +35,15 @@ def _eps_at(epoch, config):
     return e1
 
 
-def _maybe_install_candidates(builder, ego_indices, env, config, logger):
-    """若启用多候选：用 candidate_sampler 生成 K 条并注入 builder；返回 K。
+def _maybe_install_candidates(builder, ego_indices, env, config, logger, n=None):
+    """若启用多候选：生成并注入 builder；返回实际生效的 K。
 
-    注入失败时退回原来的单路径逻辑，保证训练不会因为候选模块出问题而中断。
+    n=None 时取 config.num_candidates。地图来源即使 n=1 也要安装
+    （阶段 1 的"单条地图参考"就是这么来的，不能用专家路径代替）。
     """
-    num = int(getattr(config, 'num_candidates', 1) or 1)
-    if num <= 1:
+    num = int(n if n is not None else (getattr(config, 'num_candidates', 1) or 1))
+    source = str(getattr(config, 'cand_source', 'map')).lower()
+    if source != 'map' and num <= 1:
         return 1
     try:
         from env.candidate_sampler import SamplerConfig, install_candidates
@@ -72,12 +74,15 @@ def _maybe_install_candidates(builder, ego_indices, env, config, logger):
             speeds = [float(np.clip(rel_np[w, ego_indices[w], 2], 1.0, 20.0))
                       for w in range(W)]
             K, per_world = install_map_candidates(
-                builder, ego_indices, maps, poses, speeds, sc, k_select=num)
+                builder, ego_indices, maps, poses, speeds, sc,
+                k_select=max(1, num))
             ks = [len(v) for v in per_world.values()]
             logger.info(f'[CANDS] 地图候选注入: K={K} '
                         f'每world中位={np.median(ks):.0f} '
                         f'车速中位={np.median(speeds):.1f} m/s')
             return K
+        if num <= 1:
+            return 1
         K = install_candidates(builder, ego_indices, maps, sc)
         logger.info(f'[CANDS] 专家候选注入: K={K} '
                     f'(offsets={sc.lat_offsets}, k_select={sc.k_select})')
@@ -201,7 +206,9 @@ def train(config):
     # ε 调度锚点：从"本次训练的起点"算起，而不是绝对 epoch。
     # 否则续训（如从 epoch=2400 的基线热启动）会直接落在衰减后的阶段，
     # 跳过 ε=1.0 的 warmup —— 而那正是"让 actor 学会跟踪所有候选"的关键。
-    EPS_ANCHOR = int(getattr(agent, 'globe_eps', 0) or 0)
+    _cfg_anchor = int(getattr(config, 'eps_anchor_epoch', -1))
+    EPS_ANCHOR = (_cfg_anchor if _cfg_anchor >= 0
+                  else int(getattr(agent, 'globe_eps', 0) or 0))
     logger.info(f'[CANDS] eps 调度锚点 = epoch {EPS_ANCHOR}')
 
     for epoch in range(epochs):
@@ -234,6 +241,16 @@ def train(config):
         # ε-greedy 选候选（整条 episode 固定一条）：
         #   warmup 期 ε=1 纯随机 → 逼 actor 学会跟踪所有横向候选；
         #   之后 ε 线性下降，非探索分支暂时固定为中心候选（等 M1 的 J/V 选路）。
+        # ---- 课程：前 curriculum_epochs 轮只装中心候选（先学会跟一条地图路径），
+        #      之后换成多候选 + ε 探索（学会跟横向偏移）。全程只用位姿+地图。
+        _curr = int(getattr(config, 'curriculum_epochs', 0) or 0)
+        _n_target = 1 if (_curr > 0 and epoch < _curr) else int(
+            getattr(config, 'num_candidates', 5))
+        if _n_target != K_PATHS:
+            K_PATHS = _maybe_install_candidates(builder, ego_indices, env,
+                                                config, logger, n=_n_target)
+            logger.info(f'[CANDS] 课程切换 epoch={epoch} → K={K_PATHS}')
+
         eps = _eps_at(epoch - EPS_ANCHOR, config)
         if K_PATHS > 1:
             if np.random.rand() < eps:
