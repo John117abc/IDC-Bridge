@@ -209,3 +209,34 @@ def make_montage(dir_path: str, epoch: int, cols: int = 4, max_imgs: int = 12,
     out = os.path.join(dir_path, f'epoch_{epoch:03d}_montage.png')
     canvas.save(out)
     return out
+def make_montage(dir_path: str, epoch: int, cols: int = 4, max_imgs: int = 12,
+                 scale: float = 0.5):
+    """把同一回合各 world 的图拼成一张蒙太奇（只用 matplotlib，不依赖 PIL）。"""
+    import glob
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    files = sorted(glob.glob(os.path.join(
+        dir_path, f'epoch_{epoch:03d}_world_*.png')))[:max_imgs]
+    if len(files) < 2:
+        return None
+    try:
+        imgs = [plt.imread(f) for f in files]
+        rows = (len(imgs) + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols,
+                                 figsize=(cols * 4.2 * scale * 2,
+                                          rows * 3.6 * scale * 2))
+        for ax in axes.flat:
+            ax.axis('off')
+        for ax, f, im in zip(axes.flat, files, imgs):
+            ax.imshow(im)
+            name = os.path.basename(f).replace('.png', '')
+            ax.set_title(name, fontsize=7)
+            ax.axis('off')
+        fig.tight_layout()
+        out = os.path.join(dir_path, f'epoch_{epoch:03d}_montage.png')
+        fig.savefig(out, dpi=90, bbox_inches='tight')
+        plt.close(fig)
+        return out
+    except Exception:
+        return None
