@@ -222,9 +222,13 @@ def score_trajectory(scene: Scene, traj, dt=0.1):
     """相对 log 的 PDMS。轨迹长度应覆盖未来窗口（约 80 帧）。"""
     m = step_metrics(scene, traj)
     hm = scene.human
-    T = len(m['coll'])
+    T = min(len(m['coll']), len(hm['coll']))
     if T < 3:
         return {'driving_score': 0.0, 'valid': False}
+    m = {k: (v[:T] if isinstance(v, np.ndarray) and v.ndim >= 1
+             and len(v) != T else v) for k, v in m.items()}
+    hm = {k: (v[:T] if isinstance(v, np.ndarray) and v.ndim >= 1
+              and len(v) != T else v) for k, v in hm.items()}
 
     nc = 0.0 if np.any(m['coll'] & ~hm['coll']) else 1.0
     dac = 0.0 if np.any(m['off'] & ~hm['off']) else 1.0
