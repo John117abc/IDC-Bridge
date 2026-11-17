@@ -65,6 +65,7 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--patience", type=int, default=8, help="早停耐心（每隔 5 轮评估一次）")
     args = ap.parse_args()
 
     z = np.load(os.path.join(args.data, 'train.npz'))
@@ -140,7 +141,8 @@ def main():
         return (torch.cat(L).numpy(), torch.cat(R).numpy(),
                 float(torch.stack(ACC).mean()))
 
-    # 去掉重复的 dev 定义（上面已经定义过）
+    best_fde, best_ep, patience = 1e9, 0, 0
+    best_state = None
     t0 = time.time()
     for ep in range(1, args.epochs + 1):
         perm = rng.permutation(tr)
@@ -163,15 +165,30 @@ def main():
             tt_bwd += time.time() - tt
             tot += float(loss) * len(ix)
         sched.step()
-        if ep % 10 == 0 or ep == 1:
+        if ep % 5 == 0 or ep == 1:
             mse, fde, acc = evaluate(va)
             ade = np.sqrt(mse)
+            cur = float(np.median(fde))
+            tag = ''
+            if cur < best_fde - 1e-4:
+                best_fde, best_ep = cur, ep
+                best_state = {k: v.detach().clone()
+                              for k, v in model.state_dict().items()}
+                patience = 0
+                tag = '  *best*'
+            else:
+                patience += 1
             print(f"ep {ep:4d} loss {tot/len(tr):.3f} | val ADE {ade.mean():.2f} "
-                  f"FDE {fde.mean():.2f} p50 {np.median(fde):.2f} "
-                  f"({time.time()-t0:.0f}s) acc {acc*100:.1f}%", flush=True)
+                  f"FDE {fde.mean():.2f} p50 {cur:.2f} "
+                  f"({time.time()-t0:.0f}s) acc {acc*100:.1f}%{tag}", flush=True)
+            if patience >= args.patience:
+                print(f'early stop at ep {ep} (best ep {best_ep})', flush=True)
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
     mse, fde, acc = evaluate(va)
     ade = np.sqrt(mse)
-    print(f"FINAL ADE {ade.mean():.3f}  FDE {fde.mean():.3f}  "
+    print(f"BEST(ep {best_ep}) ADE {ade.mean():.3f}  FDE {fde.mean():.3f}  "
           f"p50 {np.median(fde):.3f}  <1m {100*np.mean(fde<1):.0f}%  "
           f"cls_acc {acc*100:.1f}%")
     if args.out:

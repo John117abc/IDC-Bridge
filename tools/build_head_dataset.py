@@ -26,7 +26,8 @@ sys.path.insert(0, os.path.join(_ROOT, "src"))
 
 N_MAX = 32
 M_MAX = 128
-T_FUT = 80
+T_FUT = 8          # 8 个 waypoint（对齐 DiffusionDrive）
+WP_STEP = 5        # 每 0.5 s 一个（10 Hz × 5）
 HIST = 10
 
 
@@ -75,7 +76,10 @@ def _gt_only(fp):
     P = np.asarray([[q['x'], q['y']] for q in pos], np.float64)
     H = np.asarray(objs[int(idx)].get('heading') or [0.0] * len(pos), np.float64)
     t = HIST
-    gt = to_ego(P[t + 1:t + 1 + T_FUT], P[t], float(H[t]))
+    widx = [t + WP_STEP * (i + 1) for i in range(T_FUT)]
+    if widx[-1] >= len(P):
+        return None
+    gt = to_ego(P[widx], P[t], float(H[t]))
     if len(gt) < T_FUT or np.abs(gt).max() > 500:
         return None
     return gt.astype(np.float32)
@@ -123,7 +127,10 @@ def build_one(d, anchors):
     ego = np.concatenate([[v_now, v_prev, yaw], ego_hist.reshape(-1)]).astype(np.float32)
 
     # --- GT 未来（自车系）---
-    fut = P[t + 1:t + 1 + T_FUT]
+    widx = [t + WP_STEP * (i + 1) for i in range(T_FUT)]
+    if widx[-1] >= len(P):
+        return None
+    fut = P[widx]
     if len(fut) < T_FUT:
         return None
     gt = to_ego(fut, p0, h0).astype(np.float32)

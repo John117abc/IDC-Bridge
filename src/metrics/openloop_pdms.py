@@ -70,7 +70,8 @@ def _obb_overlap(pa, ha, da, pb, hb, db):
 
 
 class Scene:
-    def __init__(self, d):
+    def __init__(self, d, horizon=None):
+        self.horizon = horizon
         objs = d.get('objects') or []
         idx = (d.get('metadata') or {}).get('sdc_track_index')
         if idx is None:
@@ -80,7 +81,7 @@ class Scene:
         self.T = len(sdc.get('position') or [])
         self.t_now = min(T_NOW, max(self.T - 2, 0))
         self.f0 = self.t_now + 1                  # 未来起点
-        self.f1 = self.T
+        self.f1 = (self.f0 + int(self.horizon)) if self.horizon else self.T
         self.n_future = max(self.f1 - self.f0, 0)
 
         self.ego_dim = (float(sdc.get('length') or EGO_DIM[0]),
