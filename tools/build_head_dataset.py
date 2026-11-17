@@ -75,7 +75,7 @@ def _gt_only(fp):
         return None
     P = np.asarray([[q['x'], q['y']] for q in pos], np.float64)
     H = np.asarray(objs[int(idx)].get('heading') or [0.0] * len(pos), np.float64)
-    t = HIST
+    t = int(t_now) if t_now is not None else HIST
     widx = [t + WP_STEP * (i + 1) for i in range(T_FUT)]
     if widx[-1] >= len(P):
         return None
@@ -97,7 +97,7 @@ def _one(fp):
     return build_one(d, _G['a'])
 
 
-def build_one(d, anchors):
+def build_one(d, anchors, t_now=None):
     """返回一个样本的 numpy 特征与标签；不可用返回 None。"""
     objs = d.get('objects') or []
     meta = d.get('metadata') or {}
@@ -110,7 +110,7 @@ def build_one(d, anchors):
         return None
     P = np.asarray([[q['x'], q['y']] for q in pos], np.float64)
     H = np.asarray(sdc.get('heading') or [0.0] * len(pos), np.float64)
-    t = HIST
+    t = int(t_now) if t_now is not None else HIST
     p0, h0 = P[t], float(H[t])
     if not np.all(np.isfinite(p0)):
         return None

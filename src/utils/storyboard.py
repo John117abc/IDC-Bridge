@@ -34,7 +34,7 @@ ROAD_STYLE = {
 }
 ROAD_OTHER = ("#d0d0d0", 1.6, 0.60, "other road points")
 
-C_EXPERT = "#d01c8b"      # 参考轨迹：品红，最醒目
+C_EXPERT = "#212121"      # 参考轨迹：品红，最醒目
 C_EGO = "#08519c"
 C_EGO_FILL = "#2b8cbe"
 C_NB = "#fdae6b"
@@ -72,9 +72,13 @@ class StoryboardPainter:
     """把 trace 的某一帧画到给定 Axes 上。"""
 
     def __init__(self, map_pts, expert, ego_len=4.8, ego_wid=2.0,
-                 margin=35.0, trail=40):
+                 margin=35.0, trail=40, candidates=None):
         self.map_pts = np.asarray(map_pts) if map_pts is not None else np.zeros((0, 7))
         self.expert = np.asarray(expert) if expert is not None else np.zeros((0, 2))
+        self.candidates = ([np.asarray(c) for c in candidates]
+                           if candidates else [])
+        self.candidates = ([np.asarray(c) for c in candidates]
+                           if candidates else [])
         self.ego_len = float(ego_len)
         self.ego_wid = float(ego_wid)
         self.margin = float(margin)
@@ -113,9 +117,43 @@ class StoryboardPainter:
         # 专家参考轨迹：加粗品红虚线。zorder 放在 ego 尾迹之上，
         # 否则两者重合时参考线会被蓝色尾迹完全盖住，看不出跟踪贴合程度。
         if len(self.expert):
-            ax.plot(self.expert[:, 0], self.expert[:, 1], ls="--", lw=3.0,
-                    c=C_EXPERT, alpha=0.95, zorder=6,
-                    marker="o", ms=2.2, markevery=8)
+            ax.plot(self.expert[:, 0], self.expert[:, 1], ls="--", lw=1.6,
+                    c=C_EXPERT, alpha=0.9, zorder=4,
+                    marker="o", ms=1.8, markevery=10)
+
+        # 候选轨迹：高对比色 + 每条单独图例；第 0 条（概率最高）最粗
+        _cols = ["#d50000", "#2962ff", "#00c853", "#ff6d00", "#aa00ff"]
+        self._cand_handles = []
+        _pre = 11                          # 日志前缀（自车已走过的 1.1 s）
+        for _i, _c in enumerate(self.candidates):
+            if len(_c) < 2:
+                continue
+            _col = _cols[_i % len(_cols)]
+            _lw = 3.0 if _i == 0 else 1.4
+            _a = 0.90 if _i == 0 else 0.75
+            _p0 = min(_pre, len(_c))
+            if _p0 > 1:                    # 过去：浅灰细线
+                ax.plot(_c[:_p0, 0], _c[:_p0, 1], ls="-", lw=1.0,
+                        c="#bdbdbd", alpha=0.45, zorder=3)
+            _p1 = min(_pre + 40, len(_c))  # 计划：4 秒实线
+            ax.plot(_c[_p0:_p1, 0], _c[_p0:_p1, 1], ls="-", lw=_lw,
+                    c=_col, alpha=_a, zorder=7)
+            if len(_c) > _p1:              # 外推：点线
+                ax.plot(_c[_p1 - 1:, 0], _c[_p1 - 1:, 1], ls=":", lw=_lw * 0.7,
+                        c=_col, alpha=0.45, zorder=6)
+            self._cand_handles.append(
+                Line2D([], [], color=_col, lw=_lw,
+                       label=f'cand{_i}' + (' (top-1)' if _i == 0 else '')))
+
+        # 候选轨迹：细线不同颜色；第 0 条（概率最高）加粗
+        _cols = ["#8e24aa", "#00897b", "#f9a825", "#6d4c41", "#546e7a"]
+        for _i, _c in enumerate(self.candidates):
+            if len(_c) < 2:
+                continue
+            ax.plot(_c[:, 0], _c[:, 1], ls="-",
+                    lw=2.8 if _i == 0 else 1.2,
+                    c=_cols[_i % len(_cols)],
+                    alpha=0.95 if _i == 0 else 0.55, zorder=5)
 
         # 周车尾迹 + 当前车体
         lo = max(0, t - self.trail)
@@ -160,7 +198,8 @@ class StoryboardPainter:
         ax.set_ylabel("y (m)", fontsize=8)
 
         if legend:
-            ax.legend(handles=legend_handles(), loc="upper right",
+            ax.legend(handles=legend_handles()
+                      + getattr(self, '_cand_handles', []), loc="upper right",
                       fontsize=6.8, framealpha=0.92, borderpad=0.5,
                       labelspacing=0.35, ncol=1)
 
@@ -173,6 +212,7 @@ def _truncate(ego):
 
 
 def render_world(trace_w, map_pts, expert, out_dir, world, fps=12,
+                 candidates=None,
                  ego_len=4.8, ego_wid=2.0, margin=35.0,
                  storyboard=True, gif=True, dpi=120):
     """为一个 world 输出 storyboard PNG + GIF。返回 (png_path, gif_path)。"""
@@ -188,7 +228,8 @@ def render_world(trace_w, map_pts, expert, out_dir, world, fps=12,
     ego, info, partners = ego[:T], info[:T], partners[:T]
 
     painter = StoryboardPainter(map_pts, expert, ego_len=ego_len,
-                                ego_wid=ego_wid, margin=margin)
+                                ego_wid=ego_wid, margin=margin,
+                                candidates=candidates)
     os.makedirs(out_dir, exist_ok=True)
     png_path = gif_path = None
 
@@ -205,7 +246,8 @@ def render_world(trace_w, map_pts, expert, out_dir, world, fps=12,
         fig, axes = plt.subplots(2, 3, figsize=(16, 10.5))
         for ax, t in zip(axes.ravel(), picks):
             painter.draw(ax, ego, partners, info, t)
-        fig.legend(handles=legend_handles(), loc="lower center", ncol=4,
+        fig.legend(handles=legend_handles()
+                   + getattr(painter, '_cand_handles', []), loc="lower center", ncol=4,
                    fontsize=9, framealpha=0.95, bbox_to_anchor=(0.5, 0.0))
         fig.suptitle(subtitle, fontsize=12, fontweight="bold")
         fig.tight_layout(rect=(0, 0.045, 1, 1))

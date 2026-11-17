@@ -65,6 +65,7 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--warm", type=int, default=20, help="warmup epochs")
     ap.add_argument("--patience", type=int, default=8, help="早停耐心（每隔 5 轮评估一次）")
     args = ap.parse_args()
 
@@ -154,12 +155,16 @@ def main():
             ego, ag, am, mp, mm, gt, lab, res = batch(ix)
             tt_data += time.time() - tt
             tt = time.time()
-            logits, resid = model(ego, ag, am, mp, mm, anchors, k_hint=lab)
+            if ep <= args.warm:
+                logits, resid = model(ego, ag, am, mp, mm, anchors, k_hint=lab)
+                _k = lab
+            else:
+                logits, resid = model(ego, ag, am, mp, mm, anchors)
+                _k = logits.argmax(-1).detach()
             tt_fwd += time.time() - tt
             tt = time.time()
             loss = F.cross_entropy(logits, lab, weight=cw.to(dev))
-            loss = loss + 5.0 * (resid - res).abs().mean()
-            pred = anchors[lab] + resid
+            pred = anchors[_k] + resid
             loss = loss + 2.0 * (pred - gt).abs().mean()
             loss.backward(); opt.step(); opt.zero_grad()
             tt_bwd += time.time() - tt

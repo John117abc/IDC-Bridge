@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 import random
 
@@ -41,9 +41,19 @@ def _render_storyboards(trace, env, builder, config, ego_indices):
         a = ego_indices[w]
         ep = builder.expert_pos[w, a]
         ep = ep.detach().cpu().numpy() if hasattr(ep, 'detach') else np.asarray(ep)
+        ep = np.asarray(ep)[10:]        # 只画决策点（frame 10）之后的未来
+        _cands = None
+        try:
+            _ai = int(a)
+            if w in builder.candidate_paths and _ai in builder.candidate_paths[w]:
+                _cands = [np.asarray((x['pos'].detach().cpu().numpy()
+                                      if hasattr(x['pos'], 'detach') else x['pos']))
+                          for x in builder.candidate_paths[w][_ai]]
+        except Exception:
+            _cands = None
         png, gif = render_world(tw, maps[w], ep, out_dir, w,
                                 fps=int(getattr(config, 'gif_fps', 12)),
-                                margin=margin)
+                                margin=margin, candidates=_cands)
         if gif:
             logger.info(f'[storyboard] world_{w} -> {os.path.basename(gif)}'
                         + (f' + {os.path.basename(png)}' if png else ''))
@@ -70,6 +80,7 @@ def _dump_trace(trace, env, builder, config, ego_indices):
         a = ego_indices[w]
         ep = builder.expert_pos[w, a]
         ep = ep.detach().cpu().numpy() if hasattr(ep, 'detach') else np.asarray(ep)
+        ep = np.asarray(ep)[10:]        # 只画决策点（frame 10）之后的未来
         out[f'expert_{w}'] = ep.astype(np.float32)
 
     path = os.path.join(date_dir, f'trace_{time.strftime("%H%M%S")}.npz')
@@ -150,6 +161,15 @@ def evaluate(config):
 
     scenes = load_scenes(env)
     builder = GPUDriveObservationBuilder(env, scenes)
+    try:
+        import json as _json
+        _idx0 = list(env.data_loader.indices)[:config.num_worlds]
+        _fs0 = [os.path.basename(str(env.data_loader.dataset[k])) for k in _idx0]
+        with open('/workspace/data/world_files.json', 'w') as _fh:
+            _json.dump(_fs0, _fh)
+        logger.info(f'[EVAL] world files dumped: {len(_fs0)}')
+    except Exception as _e:
+        logger.info(f'[EVAL] world dump failed: {_e}')
     max_step = builder.EXPERT_TRAJ_LEN
 
     ego_indices = get_ego_indices(env, config.num_worlds)
@@ -168,6 +188,27 @@ def evaluate(config):
         logger.info(f'[AB] 固定候选安装完成: K={_K} offsets={_offs} '
                     f'center_idx={_K // 2}')
 
+    _ext_path = getattr(config, 'external_candidates', '') or ''
+    if _ext_path:
+        import numpy as _np
+        from env.candidate_sampler import install_external
+        _data = _np.load(_ext_path, allow_pickle=True)
+        _names = [str(n) for n in _data['names']]
+        _n2i = {n: i for i, n in enumerate(_names)}
+        _idx = list(env.data_loader.indices)[:config.num_worlds]
+        _files = [env.data_loader.dataset[i] for i in _idx]
+        _ext, _exts = {}, {}
+        for _w, _f in enumerate(_files):
+            _b = os.path.basename(str(_f))
+            if _b in _n2i:
+                _j = _n2i[_b]
+                _ext[_w] = _data['paths'][_j]
+                _exts[_w] = _data['speeds'][_j]
+        _K = install_external(builder, ego_indices, _ext, _exts,
+                               origin_pos=_data.get('origin_pos'),
+                               origin_heading=_data.get('origin_heading'))
+        logger.info(f'[EVAL] external candidates: {len(_ext)}/{config.num_worlds} '
+                    f'worlds, K={_K}')
     agent = DiscreteIDCAgent(env, config, config.device, builder, ego_indices)
 
     all_files = []
@@ -192,6 +233,27 @@ def evaluate(config):
 
     viz_dir = os.path.join(config.file_dir, 'eval_plots')
     os.makedirs(viz_dir, exist_ok=True)
+
+    _REPLAN = None
+    if getattr(config, 'replan_candidates', ''):
+        import numpy as _np
+        from env.candidate_sampler import install_external
+        _d = _np.load(config.replan_candidates, allow_pickle=True)
+        _idx = list(env.data_loader.indices)[:config.num_worlds]
+        _fs = [env.data_loader.dataset[i] for i in _idx]
+        _n2i = {str(n): i for i, n in enumerate(_d['names'])}
+        _op = _np.zeros((len(_fs), 2), _np.float32)
+        _oh = _np.zeros(len(_fs), _np.float32)
+        for _w, _f in enumerate(_fs):
+            _k = _n2i.get(os.path.basename(str(_f)))
+            if _k is not None:
+                _op[_w] = _d['origin_pos'][_k]
+                _oh[_w] = _d['origin_heading'][_k]
+        _REPLAN = dict(frames=[int(x) for x in _d['frames']], data=_d,
+                       files=_fs, n2i=_n2i, op=_op, oh=_oh)
+        logger.info(f'[REPLAN] frames={_REPLAN["frames"]} '
+                    f'matched={sum(1 for f in _fs if os.path.basename(str(f)) in _n2i)}'
+                    f'/{len(_fs)}')
 
     for epoch in range(config.epochs):
         obs = env.reset()
@@ -225,6 +287,33 @@ def evaluate(config):
 
         for step in range(max_step):
             logger.info(f'回合 {epoch+1}/{config.epochs}, 步数 {step+1}/{max_step}')
+
+            if _REPLAN is not None and step in _REPLAN['frames']:
+                _ri = _REPLAN['frames'].index(step)
+                _ext, _exts = {}, {}
+                for _w, _f in enumerate(_REPLAN['files']):
+                    _k = _REPLAN['n2i'].get(os.path.basename(str(_f)))
+                    if _k is not None:
+                        _ext[_w] = _REPLAN['data']['paths'][_k][_ri]
+                        _exts[_w] = _REPLAN['data']['speeds'][_k][_ri]
+                _tp = None
+                try:
+                    _abs = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+                    _nw = len(_REPLAN['files'])
+                    _tp = ({_w: _abs[_w, 0, :2] for _w in range(_nw)}
+                           if _abs.ndim == 3
+                           else {_w: _abs[_w, :2] for _w in range(_nw)})
+                    if step == _REPLAN['frames'][0]:
+                        logger.info(f'[REPLAN] ego abs shape={_abs.shape} '
+                                    f'w0={_tp.get(0)}')
+                except Exception as _e:
+                    logger.info(f'[REPLAN] ego pose unavailable: {_e}')
+                install_external(builder, ego_indices, _ext, _exts,
+                                 origin_pos=_REPLAN['op'],
+                                 origin_heading=_REPLAN['oh'],
+                                 target_pos=_tp)
+                logger.info(f'[REPLAN] step {step} -> r{_ri} '
+                            f'({len(_ext)} worlds)')
 
             _fi = int(getattr(config, 'force_path_index', -1))
             if _fi >= 0:
@@ -399,6 +488,10 @@ if __name__ == "__main__":
                         help='每隔 N 个 env step 录一帧')
     parser.add_argument('--cand-fixed', type=int, default=0,
                         help='>0 时安装固定候选集（3=±0.8/中心，5=±1.6/±0.8/中心）')
+    parser.add_argument('--replan-candidates', type=str, default='',
+                        help='滚动重规划 npz（含 frames 维）')
+    parser.add_argument('--external-candidates', type=str, default='',
+                        help='规划头 top-k 轨迹 npz（离线注入）')
     parser.add_argument('--force-path-index', type=int, default=-1,
                         help='>=0 时所有世界强制走第 i 条候选（A/B 对照用）')
     parser.add_argument('--gif-world-selection', type=str, default=None,
@@ -425,6 +518,8 @@ if __name__ == "__main__":
         'gif_enabled': args.gif_enabled,
         'cand_fixed': args.cand_fixed,
         'force_path_index': args.force_path_index,
+        'external_candidates': args.external_candidates,
+        'replan_candidates': args.replan_candidates,
         'gif_view_mode': args.gif_view_mode,
         'gif_max_worlds': args.gif_max_worlds,
         'gif_zoom_radius': args.gif_zoom_radius,

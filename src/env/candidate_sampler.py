@@ -333,3 +333,58 @@ def build_candidates(expert, map_rows, cfg: SamplerConfig):
             break
     infeasible = [c for c in raw if c.status == "INFEASIBLE"]
     return selected, raw, infeasible
+
+
+def install_external(builder, ego_indices, paths_by_world, speeds_by_world=None,
+                    origin_pos=None, origin_heading=None, target_pos=None):
+    """把外部轨迹（如规划头的 top-k）直接注入为候选集。
+
+    paths_by_world : {world: (K, N, 2)}  世界坐标
+    speeds_by_world: {world: (K, N)}     可选，缺省按相邻点位移推
+    返回实际生效的 K。
+    """
+    K = 1
+    for w in range(builder.num_worlds):
+        a = int(ego_indices[w])
+        P = paths_by_world.get(w)
+        if P is None:
+            continue
+        # 外部轨迹是世界坐标，先转到 env 局部坐标（用 expert 首帧做刚体对齐）
+        expert = builder.expert_pos[w, a].detach().cpu().numpy()
+        env_p0 = expert[0, :2]
+        d0 = expert[1, :2] - expert[0, :2]
+        env_h0 = float(np.arctan2(d0[1], d0[0])) if np.linalg.norm(d0) > 1e-6 else 0.0
+        lst = []
+        _P = np.asarray(P, np.float32)
+        if origin_pos is not None:
+            jp0 = np.asarray(origin_pos[w], np.float32)
+            jh0 = float(origin_heading[w])
+            dth = env_h0 - jh0
+            c, sn = np.cos(dth), np.sin(dth)
+            R = np.array([[c, -sn], [sn, c]], np.float32)
+            _P = ((_P.reshape(-1, 2) - jp0[None]) @ R.T + env_p0[None]).reshape(_P.shape)
+        if target_pos is not None and w in target_pos:
+            _tp = np.asarray(target_pos[w], np.float32)
+            _delta = _tp - _P[0, 0]
+            _P = _P + _delta[None, None, :]
+        for i, p in enumerate(_P):
+            d = np.gradient(p, axis=0)
+            hd = np.arctan2(d[:, 1], d[:, 0]).astype(np.float32)
+            if speeds_by_world is not None and w in speeds_by_world:
+                sp = np.asarray(speeds_by_world[w][i], np.float32)
+            else:
+                sp = np.maximum(np.linalg.norm(np.diff(p, axis=0), axis=1) / 0.1,
+                                0.5).astype(np.float32)
+                sp = np.r_[sp, sp[-1]]
+            lst.append(dict(pos=p, heading=hd, speed=sp,
+                            road_dist=np.zeros(len(p), np.float32)))
+        builder.candidate_paths[w] = {a: lst}
+        K = max(K, len(lst))
+    for w, d in builder.candidate_paths.items():
+        for a, paths in d.items():
+            while len(paths) < K:
+                paths.append(dict(paths[-1]))
+    builder.num_candidate_paths = K
+    if hasattr(builder, 'rebuild_paths_tensor'):
+        builder.rebuild_paths_tensor()
+    return K
