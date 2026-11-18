@@ -145,8 +145,11 @@ class Scene:
         return float(p[0]), float(p[1]), h
 
     def speed_now(self, dt=0.1):
-        j = min(self.t_now, self.T - 2)
-        return float(np.linalg.norm(self.expert_pos[j + 1] - self.expert_pos[j]) / dt)
+        """只用历史：[t] 与 [t-k] 的位移（不读 t+1，避免因果泄漏）。"""
+        j = min(self.t_now, self.T - 1)
+        k = 2 if j - 2 >= 0 else 1
+        return float(np.linalg.norm(self.expert_pos[j] - self.expert_pos[j - k])
+                     / (k * dt))
     def progress(self, q):
         """q 投影到**未来专家轨迹**上的进度 0~1。"""
         if len(self.xa) == 0:
@@ -220,6 +223,18 @@ def step_metrics(scene: Scene, traj, dt=0.1):
             'jerk': jerk, 'lat': lat, 'traj': traj}
 
 
+def ttc_score(cand, human):
+    """TTC 是"越大越好"：分数 = clip(候选/人类)，并处理 inf（无威胁）。"""
+    out = np.ones(len(cand))
+    c_fin = np.isfinite(cand)
+    h_fin = np.isfinite(human)
+    both = c_fin & h_fin
+    out[both] = np.clip(cand[both] / np.maximum(human[both], EPS), 0.0, 1.0)
+    out[h_fin & ~c_fin] = 1.0      # 人类有威胁、候选没有 → 候选更安全
+    out[~h_fin & c_fin] = 0.0      # 人类没威胁、候选有 → 候选更危险
+    return out
+
+
 def score_trajectory(scene: Scene, traj, dt=0.1):
     """相对 log 的 PDMS。轨迹长度应覆盖未来窗口（约 80 帧）。"""
     m = step_metrics(scene, traj)
@@ -242,7 +257,7 @@ def score_trajectory(scene: Scene, traj, dt=0.1):
         out[valid] = np.clip(good[valid] / np.maximum(bad[valid], EPS), 0.0, 1.0)
         return out
 
-    ttc_s = ratio(m['ttc'], hm['ttc'])
+    ttc_s = ttc_score(m['ttc'], hm['ttc'])
     comfort_s = ratio(m['jerk'], hm['jerk'])
     lk_s = ratio(m['lat'], hm['lat'])
     comfort_s = np.where((hm['jerk'] <= EPS) & (m['jerk'] <= EPS), 1.0, comfort_s)

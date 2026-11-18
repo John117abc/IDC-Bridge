@@ -75,7 +75,7 @@ def _gt_only(fp):
         return None
     P = np.asarray([[q['x'], q['y']] for q in pos], np.float64)
     H = np.asarray(objs[int(idx)].get('heading') or [0.0] * len(pos), np.float64)
-    t = int(t_now) if t_now is not None else HIST
+    t = HIST
     widx = [t + WP_STEP * (i + 1) for i in range(T_FUT)]
     if widx[-1] >= len(P):
         return None
@@ -116,9 +116,12 @@ def build_one(d, anchors, t_now=None):
         return None
 
     # --- ego 特征 ---
-    v_now = np.linalg.norm(P[t + 1] - P[t]) / 0.1 if t + 1 < len(P) else 0.0
+    # 因果速度：只用 [t] 与 [t-2]（不读 t+1，避免 1 帧泄漏）
+    _k = 2 if t - 2 >= 0 else 1
+    v_now = float(np.linalg.norm(P[t] - P[t - _k]) / (_k * 0.1))
     j = max(t - 5, 0)
-    v_prev = np.linalg.norm(P[j + 1] - P[j]) / 0.1 if j + 1 < len(P) else v_now
+    _k2 = 2 if j - 2 >= 0 else 1
+    v_prev = float(np.linalg.norm(P[j] - P[j - _k2]) / (_k2 * 0.1))
     yaw = float(np.arctan2(np.sin(H[t] - H[j]), np.cos(H[t] - H[j]))) / max(0.1 * (t - j), 1e-3)
     ego_hist = np.zeros((HIST, 2), np.float32)
     j0 = t - (HIST - 1)
@@ -156,9 +159,14 @@ def build_one(d, anchors, t_now=None):
         hh = float((o.get('heading') or [0.0])[t]) if o.get('heading') else 0.0
         dh = hh - h0
         q = o['position']
-        v = 0.0
-        if t + 1 < len(q):
-            v = float(np.linalg.norm(np.array([q[t + 1]['x'], q[t + 1]['y']]) - p) / 0.1)
+        # 因果速度：只用 [t] 与 [t-2]，不读 q[t+1]
+        _ka = 2 if t - 2 >= 0 else 1
+        if t - _ka >= 0:
+            _qk = q[t - _ka]
+            v = float(np.linalg.norm(p - np.array([_qk['x'], _qk['y']]))
+                      / (_ka * 0.1))
+        else:
+            v = 0.0
         rel = to_ego(p[None], p0, h0)[0]
         hist = np.zeros(20, np.float32)
         j0 = t - (HIST - 1)

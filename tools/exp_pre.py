@@ -50,12 +50,18 @@ def resample(path, scale):
                      np.interp(tgt, src, path[:, 1])], 1)
 
 
-def pure_pursuit(ref, v0, lookahead=1.2, max_steer=0.6):
-    """运动学自行车 + 纯追踪。ref: (T,2) 目标路径（含起点）。"""
+def pure_pursuit(ref, v0, lookahead=1.2, max_steer=0.6, p0=None, h0=None):
+    """运动学自行车 + 纯追踪。ref: (T,2) 目标路径。
+
+    p0/h0: 统一的起始位姿（来自决策时刻的观测）。若给出，则所有候选
+    都从同一个观测状态起步，避免"每条候选从自己的 0.1s 点起步"的偏差。
+    """
     seg = np.linalg.norm(np.diff(ref, axis=0), axis=1)
     arc = np.r_[0, np.cumsum(seg)]
-    p = ref[0].copy()
-    h = np.arctan2(ref[1, 1] - ref[0, 1], ref[1, 0] - ref[0, 0])
+    p = (np.asarray(p0, dtype=float).copy() if p0 is not None
+         else ref[0].copy())
+    h = (float(h0) if h0 is not None
+         else float(np.arctan2(ref[1, 1] - ref[0, 1], ref[1, 0] - ref[0, 0])))
     out = [p.copy()]
     v = v0
     for _ in range(len(ref) - 1):
@@ -77,7 +83,7 @@ def pure_pursuit(ref, v0, lookahead=1.2, max_steer=0.6):
     return np.asarray(out)
 
 
-def stanley(ref, v0, k_cross=2.0, max_steer=0.6):
+def stanley(ref, v0, k_cross=2.0, max_steer=0.6, p0=None, h0=None):
     """Stanley 控制器（横向误差 + 航向误差）。"""
     seg = np.linalg.norm(np.diff(ref, axis=0), axis=1)
     arc = np.r_[0, np.cumsum(seg)]
