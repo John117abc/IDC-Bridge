@@ -70,3 +70,25 @@ class ContinuousCritic(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+class PaperMLPActor(nn.Module):
+    """论文原版：两个隐藏层各 256，ELU，无归一化（Guan et al. 2023）。"""
+
+    def __init__(self, state_dim, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, 2),
+        )
+        # 论文未指定初始化；用 Xavier 保证中性
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return self.net(x)

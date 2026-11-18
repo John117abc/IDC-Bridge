@@ -7,7 +7,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from typing import Tuple, List, Dict, Any
 
-from models.continuous_actor_critic import TransformerActor, ContinuousCritic
+from models.continuous_actor_critic import (TransformerActor, ContinuousCritic, PaperMLPActor)
 from models.kinematic_bicycle import KinematicBicycleModel
 from buffer import PERBuffer
 from utils import get_logger
@@ -68,14 +68,22 @@ class DiscreteIDCAgent:
 
         # 网络
         self.window_size = int(getattr(config, 'window_size', 16))
-        self.actor = TransformerActor(
-            state_dim=self.ENCODED_DIM,
-            d_model=int(getattr(config, 'transformer_d_model', 256)),
-            nhead=int(getattr(config, 'transformer_nhead', 4)),
-            num_layers=int(getattr(config, 'transformer_num_layers', 2)),
-            window_size=self.window_size,
-            dropout=float(getattr(config, 'transformer_dropout', 0.1)),
-        ).to(device)
+        self.actor_type = str(getattr(config, 'actor_type', 'transformer'))
+        if self.actor_type == 'mlp':
+            # 论文原版：单帧状态 + 2×256 ELU
+            self.actor = PaperMLPActor(
+                state_dim=self.ENCODED_DIM,
+                hidden_dim=int(getattr(config, 'hidden_dim', 256)),
+            ).to(device)
+        else:
+            self.actor = TransformerActor(
+                state_dim=self.ENCODED_DIM,
+                d_model=int(getattr(config, 'transformer_d_model', 256)),
+                nhead=int(getattr(config, 'transformer_nhead', 4)),
+                num_layers=int(getattr(config, 'transformer_num_layers', 2)),
+                window_size=self.window_size,
+                dropout=float(getattr(config, 'transformer_dropout', 0.1)),
+            ).to(device)
         self.critic = ContinuousCritic(self.ENCODED_DIM, config.hidden_dim).to(device)
         self.dynamics = KinematicBicycleModel(
             dt=self.dt,
@@ -273,7 +281,10 @@ class DiscreteIDCAgent:
 
     def _policy(self, s_window: torch.Tensor) -> torch.Tensor:
         """actor 的唯一入口：编码 -> 归一化 -> 前向。所有调用点都必须走这里。"""
-        return self.actor(self._norm(self._encode(s_window)))
+        x = self._norm(self._encode(s_window))
+        if self.actor_type == 'mlp':
+            x = x[:, -1, :]        # 论文原版：只用当前帧
+        return self.actor(x)
 
     def _value(self, s: torch.Tensor) -> torch.Tensor:
         """critic 的唯一入口。"""

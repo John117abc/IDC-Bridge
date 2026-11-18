@@ -8,6 +8,7 @@ training:
   dt: 0.1                         # 动力学推演步长（秒）：0.1s × horizon 步 = 有效前瞻时间
   horizon: 30                     # PIM/PEV rollout 推演步数（30 步 = 3.0 秒）
   batch_size: 128                 # 每次 PEV/PIM 从 buffer 采样的样本数
+  actor_type: transformer     # transformer(改进) | mlp(论文原版)
   hidden_dim: 512                 # Critic MLP 隐层维度（Actor 为 Transformer，不受此参数影响）
   lr_actor_max: 1.0e-4            # CosineAnnealingLR 起始学习率（Actor）
   lr_actor_min: 1.0e-6            # CosineAnnealingLR 终止学习率（Actor）
