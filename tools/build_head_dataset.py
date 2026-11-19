@@ -26,7 +26,8 @@ sys.path.insert(0, os.path.join(_ROOT, "src"))
 
 N_MAX = 32
 M_MAX = 128
-T_FUT = 8          # 8 个 waypoint（对齐 DiffusionDrive）
+T_FUT = 8
+T_FUT_EXT = 40      # 奖励用的 4 s 逐帧（0.1 s）          # 8 个 waypoint（对齐 DiffusionDrive）
 WP_STEP = 5        # 每 0.5 s 一个（10 Hz × 5）
 HIST = 10
 
@@ -143,6 +144,8 @@ def build_one(d, anchors, t_now=None):
     # --- agents ---
     ag = np.zeros((N_MAX, 28), np.float32)
     amask = np.zeros(N_MAX, np.float32)
+    agent_fut = np.zeros((N_MAX, T_FUT_EXT, 2), np.float32)
+    agent_fut_valid = np.zeros((N_MAX, T_FUT_EXT), np.float32)
     cands = []
     for i, o in enumerate(objs):
         if i == int(idx) or not o.get('position'):
@@ -175,6 +178,14 @@ def build_one(d, anchors, t_now=None):
                              np.float64)
             pe = to_ego(pts, p0, h0) - rel[None]
             hist = pe.reshape(-1).astype(np.float32)
+        # 逐帧未来位置（奖励用；只对回放周车，评测口径）
+        _val = o.get('valid') or [1] * len(q)
+        for _j in range(T_FUT_EXT):
+            _tj = t + 1 + _j
+            if _tj < len(q) and int(_val[_tj]) == 1:
+                _qq = q[_tj]
+                agent_fut[n, _j] = [_qq['x'], _qq['y']]
+                agent_fut_valid[n, _j] = 1.0
         ag[n] = np.r_[[rel[0], rel[1], np.cos(dh), np.sin(dh), v,
                        float(o.get('length') or 4.5),
                        float(o.get('width') or 1.9), 1.0], hist]
@@ -208,7 +219,9 @@ def build_one(d, anchors, t_now=None):
     resid = gt - anchors[k]
     return dict(ego=ego, agent=ag, amask=amask, map=mp, mmask=mmask,
                 gt=gt, label=np.int64(k), resid=resid.astype(np.float32),
-                fde=float(fde[k]))
+                fde=float(fde[k]), agent_fut=agent_fut,
+                agent_fut_valid=agent_fut_valid,
+                ego_world=np.asarray([p0[0], p0[1], h0], np.float32))
 
 
 def main():
@@ -226,15 +239,22 @@ def main():
     if len(files) > args.n_scenes:
         files = [files[i] for i in rng.choice(len(files), args.n_scenes,
                                               replace=False)]
-    print(f"场景 {len(files)}")
+    # split_before_cluster：先划分，锚点只在训练集上聚类
+    rng2 = np.random.default_rng(args.seed + 1)
+    perm = rng2.permutation(len(files))
+    n_val = max(1, int(round(0.1 * len(files))))
+    val_idx = set(perm[:n_val].tolist())
+    is_val = np.array([i in val_idx for i in range(len(files))], bool)
+    train_files = [f for f, v in zip(files, is_val) if not v]
+    print(f"场景 {len(files)}  训练 {len(train_files)}  验证 {int(is_val.sum())}")
 
     # ---- pass 1：收集自车系 GT 未来，聚类出锚点 ----
     from multiprocessing import Pool
     workers = min(8, os.cpu_count() or 4)
     with Pool(workers) as p:
-        res = list(p.imap(_gt_only, files, chunksize=20))
+        res = list(p.imap(_gt_only, train_files, chunksize=20))
     gts = [r for r in res if r is not None]
-    keep = [fp for fp, r in zip(files, res) if r is not None]
+    keep_train = [fp for fp, r in zip(train_files, res) if r is not None]
     print(f"有效 {len(gts)}")
     X = np.asarray(gts, np.float32).reshape(len(gts), -1)
     C, _ = kmeans(X, args.k, seed=args.seed)
@@ -243,18 +263,32 @@ def main():
     print(f"锚点 {anchors.shape}")
 
     # ---- pass 2：特征 + 标签 ----
-    data = {k: [] for k in ('ego', 'agent', 'amask', 'map', 'mmask',
-                            'gt', 'label', 'resid')}
+    keys = ('ego', 'agent', 'amask', 'map', 'mmask', 'gt', 'label', 'resid',
+            'agent_fut', 'agent_fut_valid', 'ego_world')
+    data_tr = {k: [] for k in keys}
+    ids_tr = []
+    data_va = {k: [] for k in keys}
+    ids_va = []
     fdes = []
+    _train_names = set(os.path.basename(x) for x in train_files)
     with Pool(workers, initializer=_init_worker, initargs=(anchors,)) as p:
-        for s in p.imap(_one, keep, chunksize=20):
-            if s is None:
+        for fp, smp in zip(files, p.imap(_one, files, chunksize=20)):
+            if smp is None:
                 continue
-            for k in data:
-                data[k].append(s[k])
-            fdes.append(s['fde'])
-    out = {k: np.asarray(v) for k, v in data.items()}
+            _v = os.path.basename(fp) in _train_names
+            _dst, _ids = (data_tr, ids_tr) if _v else (data_va, ids_va)
+            for k in keys:
+                _dst[k].append(smp[k])
+            _ids.append(os.path.basename(fp))
+            fdes.append(smp['fde'])
+    out = {k: np.asarray(v) for k, v in data_tr.items()}
+    out['scene_id'] = np.asarray(ids_tr)
     np.savez_compressed(os.path.join(args.out, 'train.npz'), **out)
+    if ids_va:
+        outv = {k: np.asarray(v) for k, v in data_va.items()}
+        outv['scene_id'] = np.asarray(ids_va)
+        np.savez_compressed(os.path.join(args.out, 'val.npz'), **outv)
+        print(f"验证集 {len(ids_va)} 条 → val.npz")
     print(f"样本 {len(fdes)}")
     f = np.asarray(fdes)
     print(f"标签 FDE: p50={np.median(f):.2f} p90={np.percentile(f,90):.2f} "
