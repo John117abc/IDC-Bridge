@@ -1,4 +1,4 @@
-import math
+﻿import math
 import sys
 import numpy as np
 import torch
@@ -13,6 +13,26 @@ from buffer import PERBuffer
 from utils import get_logger
 from utils import save_checkpoint, load_checkpoint
 from utils.running_norm import RunningNorm
+
+
+def _cfgget(config, name, default):
+    """先读顶层，再依次从 agent/training/dynamics/world 段里找（兼容嵌套配置）。"""
+    v = getattr(config, name, None)
+    if v is not None:
+        return v
+    for sec in ('agent', 'training', 'dynamics', 'world', 'diag', 'metrics'):
+        obj = getattr(config, sec, None)
+        if obj is None:
+            continue
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    if isinstance(config, dict) and name in config:
+        return config[name]
+    return default
+
+
 
 logger = get_logger('idc-agent')
 
@@ -68,12 +88,12 @@ class DiscreteIDCAgent:
 
         # 网络
         self.window_size = int(getattr(config, 'window_size', 16))
-        self.actor_type = str(getattr(config, 'actor_type', 'transformer'))
+        self.actor_type = str(_cfgget(config, 'actor_type', 'transformer'))
         if self.actor_type == 'mlp':
             # 论文原版：单帧状态 + 2×256 ELU
             self.actor = PaperMLPActor(
                 state_dim=self.ENCODED_DIM,
-                hidden_dim=int(getattr(config, 'hidden_dim', 256)),
+                hidden_dim=int(_cfgget(config, 'actor_hidden', 256)),
             ).to(device)
         else:
             self.actor = TransformerActor(
@@ -84,7 +104,7 @@ class DiscreteIDCAgent:
                 window_size=self.window_size,
                 dropout=float(getattr(config, 'transformer_dropout', 0.1)),
             ).to(device)
-        self.critic = ContinuousCritic(self.ENCODED_DIM, config.hidden_dim).to(device)
+        self.critic = ContinuousCritic(self.ENCODED_DIM, int(_cfgget(config, 'critic_hidden', 512))).to(device)
         self.dynamics = KinematicBicycleModel(
             dt=self.dt,
             L=config.wheelbase,
@@ -311,7 +331,7 @@ class DiscreteIDCAgent:
             enc_window = self._encode(window_tensor)
             # 用"策略实际访问到的状态分布"更新归一化统计（只取当前帧）
             self.input_norm.update(enc_window[:, -1, :])
-            raw_output = self.actor(self._norm(enc_window))
+            raw_output = self._policy(window_tensor)
             batch_size = raw_output.shape[0]
             raw_output = raw_output.view(batch_size, self.max_agents, 2)
 
@@ -598,9 +618,10 @@ class DiscreteIDCAgent:
                 logger.warning(f'[NaN-src] bc_loss 非有限: actor_steer_finite='
                                f'{bool(torch.isfinite(actor_steer).all())} '
                                f'expert_finite={bool(torch.isfinite(expert_steer).all())}')
-            actor_loss = actor_loss + bc_weight * bc_loss
+            _bc_scale = actor_loss.detach().abs() / (bc_loss.detach() + 1e-8)
+            actor_loss = actor_loss + bc_weight * bc_loss * _bc_scale
             if self.global_step % 50 == 0:
-                logger.info(f'[DIAG-bc] bc_loss={bc_loss.item():.4f} weight={bc_weight} '
+                logger.info(f'[DIAG-bc] bc_loss={bc_loss.item():.4f} weight={bc_weight} scaled={float(bc_weight*_bc_scale):.4f} '
                             f'expert_mean={expert_steer.mean().item():.3f}')
         else:
             bc_loss = None

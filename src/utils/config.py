@@ -1,4 +1,4 @@
-import os
+﻿import os
 import copy
 import yaml
 from types import SimpleNamespace
@@ -74,7 +74,13 @@ def build_config(config_path: str, cli_overrides: dict = None) -> SimpleNamespac
     """
     cfg = _load_yaml(config_path)
     cfg = _resolve_include(config_path, cfg)
-    cfg_flat = _flatten_selectively(cfg)
+    cfg_flat = {}
+    for _sec, _val in cfg.items():
+        if isinstance(_val, dict):
+            cfg_flat.update(_val)
+            cfg_flat[_sec] = SimpleNamespace(**_val)
+        else:
+            cfg_flat[_sec] = _val
     if cli_overrides:
         for k, v in cli_overrides.items():
             if v is not None:

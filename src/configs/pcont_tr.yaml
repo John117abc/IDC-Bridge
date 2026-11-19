@@ -1,0 +1,39 @@
+﻿_base: "base.yaml"
+
+# ---- 环境配置 ----
+env:
+  num_worlds: 75
+  max_agents: 1
+  epochs: 1500
+  seed: 5
+  device: "cuda"
+
+# ---- 路径/保存 ----
+paths:
+  file_dir: "/workspace/data"
+  model_path: "/workspace/data/checkpoints/20260709/idc-waymo-v1.0_examples_121610_episode=290.pth"
+  save_freq: 5
+  load_model: false
+
+# ---- 可视化/GIF 配置（训练默认关闭） ----
+viz:
+  gif_enabled: false
+  gif_fps: 15
+  gif_record_interval: 2
+  gif_max_worlds: 10
+  gif_save_dir: "/workspace/data/gifs"
+  gif_world_selection: "first"     # "first" | "random"
+  gif_view_mode: "agent_pov"     # "bird_2d" | "bird_3d" | "agent_pov"
+  gif_zoom_radius: 70
+  # 轨迹图落盘频率：原实现每个 epoch × 10 个 world，2400 轮会产 2.4 万张图
+  traj_plot_interval: 20          # 每 N 个 epoch 存一次（第 1 轮总会存）
+  traj_plot_max_worlds: 12        # 每次最多画几个 world（0 = 不画）；会额外拼一张蒙太奇
+  plot_show_expert: false         # 图里是否画专家轨迹（false = 只看参考与自车，避免混淆）
+
+# ---- resume: 阶段 A(0-500) -> B(500-1000) -> C(1000-1500) ----
+curriculum_epochs: 500
+q_start_epoch: 1000
+eps_anchor_epoch: 500
+traj_plot_interval: 100
+run_tag: g2s_tr
+bc_weight: 0.0

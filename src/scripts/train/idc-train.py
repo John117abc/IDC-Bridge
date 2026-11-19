@@ -223,7 +223,10 @@ def train(config):
 
     logger.info(f'训练开始: epochs={config.epochs}, num_worlds={config.num_worlds}, max_steps={max_step}')
 
-    viz_dir = os.path.join(config.file_dir, 'traj_plots')
+    _tag = str(getattr(config, 'run_tag', 'run'))
+    import datetime as _dtm
+    _date = _dtm.datetime.now().strftime('%Y%m%d')
+    viz_dir = os.path.join(config.file_dir, 'traj_plots', _date, _tag)
     os.makedirs(viz_dir, exist_ok=True)
 
     # ε 调度锚点：从"本次训练的起点"算起，而不是绝对 epoch。
@@ -303,9 +306,46 @@ def train(config):
             abs_np_step = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
             rel_np_step = env.sim.self_observation_tensor().to_torch().cpu().numpy()
             partner_np_step = env.sim.partner_observations_tensor().to_torch().cpu().numpy()
-            states = builder.get_idc_observations_batch(
-                ego_indices, path_indices=episode_path_indices,
-                _abs_np=abs_np_step, _rel_np=rel_np_step, _partner_np=partner_np_step)
+            _q_start = int(getattr(config, 'q_start_epoch', 10 ** 9))
+            _psel_cfg = str(getattr(config, 'path_select', 'q')).lower()
+            _psel = 'q' if (epoch >= _q_start and _psel_cfg == 'q') else 'eps'
+            if epoch % 20 == 0:
+                _ph = 'A(K=1)' if epoch < int(getattr(config, 'curriculum_epochs', 0)) else ('B(K=5,eps)' if _psel == 'eps' else 'C(K=5,Q)')
+                logger.info(f'[PHASE] epoch={epoch} -> {_ph} path_select={_psel}')
+            _pevery = max(int(getattr(config, 'path_select_every', 1)), 1)
+            if K_PATHS > 1 and _psel == 'q' and (step % _pevery == 0):
+                _st_all, _W = [], config.num_worlds
+                for _k in range(K_PATHS):
+                    _st_all.append(builder.get_idc_observations_batch(
+                        ego_indices, path_indices=[_k] * _W,
+                        _abs_np=abs_np_step, _rel_np=rel_np_step,
+                        _partner_np=partner_np_step))
+                with torch.no_grad():
+                    _qs = []
+                    for _k in range(K_PATHS):
+                        _sk = torch.from_numpy(
+                            np.stack([_st_all[_k][w] for w in range(_W)])
+                        ).float().to(agent.device)
+                        _qs.append(agent._value(_sk).squeeze(-1).cpu().numpy())
+                _qs = np.stack(_qs, axis=1)
+                _chosen = np.argmin(_qs, axis=1)
+                episode_path_indices = [int(_chosen[w]) for w in range(_W)]
+                _DIM = int(getattr(agent, 'TOTAL_STATE_DIM',
+                                   len(np.asarray(_st_all[0][0]).reshape(-1))))
+                def _fix_state(_x):
+                    _v = np.asarray(_x, dtype=np.float32).reshape(-1)
+                    if _v.size < _DIM:
+                        _v = np.pad(_v, (0, _DIM - _v.size))
+                    return _v[:_DIM]
+                states = [_fix_state(_st_all[_chosen[w]][w]) for w in range(_W)]
+                if step % 50 == 0:
+                    import collections as _co
+                    _h = _co.Counter(episode_path_indices)
+                    logger.info(f'[PATHSEL] step={step} Q选路分布={dict(_h)} K={K_PATHS}')
+            else:
+                states = builder.get_idc_observations_batch(
+                    ego_indices, path_indices=episode_path_indices,
+                    _abs_np=abs_np_step, _rel_np=rel_np_step, _partner_np=partner_np_step)
 
             wm.filter_per_step(states, step)
 
