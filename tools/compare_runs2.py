@@ -1,4 +1,4 @@
-"""对比 G1(MLP) vs G2(Transformer)：75 worlds, 500 epochs, 三段课程 + 每步Q选路。"""
+﻿"""对比 G1(MLP) vs G2(Transformer)：75 worlds, 500 epochs, 三段课程 + 每步Q选路。"""
 import os
 import re
 
@@ -8,7 +8,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 LOGS = [('MLP (paper baseline)', '/workspace/data/logs/g1_mlp.log', '#1e88e5'),
-        ('Transformer (ours)', '/workspace/data/logs/g2_tr.log', '#e53935')]
+        ('Transformer (ours)', '/workspace/data/logs/g2_tr.log', '#e53935'),
+        ('Transformer + BC', '/workspace/data/logs/g3_bc.log', '#43a047')]
 OUT = '/workspace/data/compare2'
 os.makedirs(OUT, exist_ok=True)
 
@@ -86,7 +87,7 @@ for ax, t in zip(axes.flat, ['Tracking error median (m)',
     ax.set_xlabel('epoch')
 axes[1, 0].set_ylim(0, 100)
 axes[1, 1].set_yscale('log')
-fig.suptitle('IDC controller: MLP vs Transformer (75 worlds, 500 epochs, K=5 + Q selection)')
+fig.suptitle('IDC controller: MLP vs Transformer vs Transformer+BC (75 worlds, 500 epochs, phase A)')
 fig.tight_layout()
 fig.savefig(f'{OUT}/fig_compare_curves.png')
 plt.close(fig)
@@ -95,17 +96,17 @@ plt.close(fig)
 names = list(data)
 keys = [('pdms', 'PDMS'), ('comp', 'completion %'), ('coll', 'collisions'),
         ('off', 'off-road'), ('med', 'median err (m)'), ('frac', 'frac<5m %')]
-fig, axes = plt.subplots(1, 6, figsize=(16, 3.2), dpi=150)
+fig, axes = plt.subplots(1, 6, figsize=(17, 3.2), dpi=150)
 for ax, (k, title) in zip(axes, keys):
     vals = [data[n][k][-1] for n in names]
-    ax.bar([0, 1], vals, color=[data[n]['color'] for n in names])
-    ax.set_xticks([0, 1])
-    ax.set_xticklabels(['MLP', 'Transf.'], fontsize=8)
+    ax.bar(range(len(names)), vals, color=[data[n]['color'] for n in names])
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels(['MLP', 'TF', 'TF+BC'], fontsize=8)
     ax.set_title(title, fontsize=9)
     for i, v in enumerate(vals):
         ax.text(i, v, f'{v:.1f}', ha='center', va='bottom', fontsize=8)
     ax.grid(axis='y', alpha=0.25)
-fig.suptitle('Final metrics at epoch 500 (75 worlds)')
+fig.suptitle('Final metrics at epoch 500 (75 worlds, 3 models)')
 fig.tight_layout()
 fig.savefig(f'{OUT}/fig_compare_final.png')
 plt.close(fig)

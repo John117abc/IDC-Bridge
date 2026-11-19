@@ -121,20 +121,31 @@ class GPUDriveObservationBuilder:
                 pos_arr = path['pos']; head_arr = path['heading']
                 spd_arr = path['speed']; rd_arr = path['road_dist']
                 cp, sp, rp = np.zeros(91, dtype=np.float32), np.zeros(91, dtype=np.float32), np.zeros(91, dtype=np.float32)
+                # 只在有效段内聚合（last_valid_idx 之后是外推段，不参与）
+                nv = int(path.get('last_valid_idx', len(pos_arr) - 1))
+                nv = max(1, min(nv, len(pos_arr) - 1))
                 for i in range(91):
-                    rem = 91 - i
+                    j_end = nv + 1
+                    rem = max(j_end - i, 1)
                     weights = np.exp(-np.arange(rem) / decay_lam)
                     weights /= (weights.sum() + 1e-8)
-                    if i < 90:
-                        dh = head_arr[i+1:] - head_arr[i:-1]
-                        steps = np.hypot(np.diff(pos_arr[i:, 0]), np.diff(pos_arr[i:, 1])) + 1e-6
-                        steer_i = np.zeros(rem, dtype=np.float32)
-                        steer_i[0] = float(np.arctan(5.0 * dh[0] / steps[0])) if rem > 1 else 0.0
-                        for k in range(1, rem):
-                            steer_i[k] = float(np.arctan(5.0 * dh[k-1] / max(steps[k-1], 1e-6)))
-                        cp[i] = float(np.sum(weights * steer_i))
-                    sp[i] = float(np.sum(weights * spd_arr[i:]))
-                    rp[i] = float(np.sum(weights * rd_arr[i:]))
+                    if i < nv:
+                        dh = head_arr[i+1:j_end] - head_arr[i:j_end-1]
+                        steps = np.hypot(np.diff(pos_arr[i:j_end, 0]),
+                                         np.diff(pos_arr[i:j_end, 1])) + 1e-6
+                        steer_i = np.arctan(5.0 * dh / steps)
+                        if len(steer_i):
+                            ww = np.exp(-np.arange(len(steer_i)) / decay_lam)
+                            ww /= (ww.sum() + 1e-8)
+                            cp[i] = float(np.sum(ww * steer_i))
+                    sp[i] = float(np.sum(weights * spd_arr[i:j_end]))
+                    rp[i] = float(np.sum(weights * rd_arr[i:j_end]))
+                # 有效段之后保持末值
+                if nv < 90:
+                    cp[nv] = cp[nv-1] if nv >= 1 else 0.0
+                    cp[nv+1:] = cp[nv]
+                    sp[nv+1:] = sp[nv]
+                    rp[nv+1:] = rp[nv]
                 path['curv_ahead'] = cp
                 path['spd_ahead'] = sp
                 path['road_ahead'] = rp
@@ -162,6 +173,7 @@ class GPUDriveObservationBuilder:
                 ref_data[w, 0, p, :n, 6] = path['spd_ahead'][:]
                 ref_data[w, 0, p, :n, 7] = path['road_ahead'][:]
         self.ref_tensor = torch.from_numpy(ref_data).to(self.expert_pos.device)
+        self._build_last_valid_lut()
 
         # 诊断: 打印候选路径坐标范围，确认与 ego 坐标系对齐
         for w in range(min(self.num_worlds, 3)):
@@ -721,6 +733,8 @@ class GPUDriveObservationBuilder:
                     spd_arr = path['speed']
                     rd_arr = path['road_dist']
                     n = len(pos_arr)
+                    # 有效长度：last_valid_idx 之后是外推段，不参与聚合
+                    n = min(n, int(path.get('last_valid_idx', n - 1)) + 1)
                     cp = np.zeros(91, dtype=np.float32)
                     sp = np.zeros(91, dtype=np.float32)
                     rp = np.zeros(91, dtype=np.float32)
@@ -766,6 +780,7 @@ class GPUDriveObservationBuilder:
                     ref_data[w, 0, p, :n, 6] = path['spd_ahead'][:n]
                     ref_data[w, 0, p, :n, 7] = path['road_ahead'][:n]
         self.ref_tensor = torch.from_numpy(ref_data).to(self.expert_pos.device)
+        self._build_last_valid_lut()
         logger.debug(f'[REBUILD] ref_tensor 重建: worlds={self.num_worlds} '
                      f'paths={num_paths}')
 
@@ -929,9 +944,11 @@ class GPUDriveObservationBuilder:
 
             # 前瞻参考点（t+5, t+10, t+15），给 Actor 前方弯道/道路信息
             num_pts = len(path['pos'])
-            t_l1 = min(t + 5, num_pts - 1)
-            t_l2 = min(t + 10, num_pts - 1)
-            t_l3 = min(t + 15, num_pts - 1)
+            nv_la = int(path.get('last_valid_idx', num_pts - 1))
+            nv_la = max(1, min(nv_la, num_pts - 1))
+            t_l1 = min(t + 5, nv_la)
+            t_l2 = min(t + 10, nv_la)
+            t_l3 = min(t + 15, nv_la)
 
             lx1, ly1 = float(path['pos'][t_l1, 0]), float(path['pos'][t_l1, 1])
             lh1 = float(path['heading'][t_l1])
@@ -1158,6 +1175,9 @@ class GPUDriveObservationBuilder:
             w_tensor = torch.tensor(list(world_indices), device=self.ref_tensor.device, dtype=torch.long)
             p_tensor = torch.tensor(list(path_indices), device=self.ref_tensor.device, dtype=torch.long)
             t_tensor = temporal_indices.long().clamp(0, self.ref_tensor.shape[3] - 1).to(self.ref_tensor.device)
+            if getattr(self, 'last_valid_lut', None) is not None:
+                _lv = self.last_valid_lut[w_tensor, 0, p_tensor].to(t_tensor.device)
+                t_tensor = torch.minimum(t_tensor, _lv)
             return self.ref_tensor[w_tensor, 0, p_tensor, t_tensor, 4].to(device)
         # CPU 回退
         dists = []
@@ -1218,6 +1238,19 @@ class GPUDriveObservationBuilder:
         d2 = d2.masked_fill(~mask, float('inf'))
         best = d2.argmin(dim=1)
         return torch.maximum(best, prev)
+
+
+    def _build_last_valid_lut(self):
+        """构建 (W,1,P) 的有效索引表，供批量读取裁剪使用。"""
+        W = int(self.num_worlds)
+        P = int(getattr(self, 'num_candidate_paths', 1))
+        N = int(getattr(self, 'EXPERT_TRAJ_LEN', 91))
+        lut = np.full((W, 1, P), N - 1, np.int64)
+        for w in range(W):
+            for a, paths in self.candidate_paths.get(w, {}).items():
+                for p in range(min(P, len(paths))):
+                    lut[w, 0, p] = int(paths[p].get('last_valid_idx', N - 1))
+        self.last_valid_lut = torch.from_numpy(lut).to(self.expert_pos.device)
 
     def get_ref_states_batch(self, world_indices, ego_xs, ego_ys,
                                ego_indices_map: list,

@@ -27,9 +27,12 @@ v2 改成**同起点、不同终点**：
 """
 from dataclasses import dataclass, field
 
+import logging
+
 import numpy as np
 
 IX_X, IX_Y, IX_LEN, IX_HEAD, IX_TYPE = 0, 1, 2, 5, 6
+logger = logging.getLogger(__name__)
 ROAD_EDGE = 1
 
 
@@ -335,8 +338,23 @@ def build_candidates(expert, map_rows, cfg: SamplerConfig):
     return selected, raw, infeasible
 
 
+def road_dist_for_path(pos, map_rows, last_valid_idx=None):
+    """逐点到路缘的最近距离；与地图候选使用同一套定义与单位。
+
+    pos: (N,2) env 坐标；last_valid_idx: 有效点个数（含），None=全部有效。
+    返回 (dist (N,), has_edge bool)。无路缘时 dist 全为 inf，由调用方处理。
+    """
+    a_seg, b_seg = boundary_segments(map_rows)
+    has_edge = len(a_seg) > 0
+    if not has_edge:
+        return np.full(len(pos), np.inf, np.float32), False
+    d = dist_to_segments(np.asarray(pos, np.float64), a_seg, b_seg)
+    return d.astype(np.float32), True
+
+
 def install_external(builder, ego_indices, paths_by_world, speeds_by_world=None,
-                    origin_pos=None, origin_heading=None, target_pos=None):
+                    origin_pos=None, origin_heading=None, target_pos=None,
+                    maps=None, last_valid_idx=None):
     """把外部轨迹（如规划头的 top-k）直接注入为候选集。
 
     paths_by_world : {world: (K, N, 2)}  世界坐标
@@ -367,6 +385,12 @@ def install_external(builder, ego_indices, paths_by_world, speeds_by_world=None,
             _tp = np.asarray(target_pos[w], np.float32)
             _delta = _tp - _P[0, 0]
             _P = _P + _delta[None, None, :]
+        # 路缘距离：与地图候选同一套定义（boundary_segments + dist_to_segments）
+        _map_rows = None
+        if maps is not None and w in maps:
+            _map_rows = maps[w]
+        elif getattr(builder, 'map_rows_by_world', None) and w in builder.map_rows_by_world:
+            _map_rows = builder.map_rows_by_world[w]
         for i, p in enumerate(_P):
             d = np.gradient(p, axis=0)
             hd = np.arctan2(d[:, 1], d[:, 0]).astype(np.float32)
@@ -376,8 +400,33 @@ def install_external(builder, ego_indices, paths_by_world, speeds_by_world=None,
                 sp = np.maximum(np.linalg.norm(np.diff(p, axis=0), axis=1) / 0.1,
                                 0.5).astype(np.float32)
                 sp = np.r_[sp, sp[-1]]
-            lst.append(dict(pos=p, heading=hd, speed=sp,
-                            road_dist=np.zeros(len(p), np.float32)))
+            nv = len(p) if last_valid_idx is None else int(last_valid_idx[w])
+            nv = int(np.clip(nv, 1, len(p)))
+            # 末点用向后差分（避免第一个外推点改变第 4 秒的速度/朝向特征）
+            if nv >= 2 and nv < len(sp):
+                sp[nv - 1] = sp[nv - 2]
+                sp[nv:] = sp[nv - 1]
+                hd[nv - 1] = np.float32(np.arctan2(p[nv - 1, 1] - p[nv - 2, 1],
+                                                p[nv - 1, 0] - p[nv - 2, 0]))
+                hd[nv:] = hd[nv - 1]
+            if _map_rows is None:
+                rd = np.zeros(len(p), np.float32)
+            else:
+                _d, _has = road_dist_for_path(p, _map_rows, nv)
+                if not _has:
+                    logger.warning(f'[ROAD_DIST] world={w} 无路缘线段，'
+                                   f'road_dist 置 0（该场景缺路缘信息）')
+                    rd = np.zeros(len(p), np.float32)
+                else:
+                    rd = np.asarray(_d, np.float32).copy()
+                    if not np.isfinite(rd[:nv]).all():
+                        logger.warning(f'[ROAD_DIST] world={w} 有效段含非有限值，已裁剪')
+                        rd[:nv] = np.nan_to_num(rd[:nv], nan=0.0, posinf=50.0)
+                    # 无效尾段：沿用有效末点，避免把外推段距离送进网络
+                    if nv < len(p):
+                        rd[nv:] = rd[nv - 1]
+            lst.append(dict(pos=p, heading=hd, speed=sp, road_dist=rd,
+                            last_valid_idx=int(nv) - 1))
         builder.candidate_paths[w] = {a: lst}
         K = max(K, len(lst))
     for w, d in builder.candidate_paths.items():

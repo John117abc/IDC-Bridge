@@ -218,6 +218,52 @@ def evaluate(config):
 
     logger.info(f'正在加载模型: {config.model_path}')
     agent.load(config.model_path)
+    if getattr(config, 'check_tail', False):
+        import numpy as _np
+        import torch as _th
+        from env.candidate_sampler import install_external
+        _abs = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+        _maps = env.sim.map_observation_tensor().to_torch().cpu().numpy()
+        _W = config.num_worlds
+
+        def _mk(_turn):
+            _P, _S = {}, {}
+            for _w in range(_W):
+                _px = float(_abs[_w, 0, 0])
+                _py = float(_abs[_w, 0, 1])
+                _ph = float(_abs[_w, 0, 7])
+                _pts = []
+                _th_ = _ph
+                _x, _y = _px, _py
+                for _i in range(91):
+                    _pts.append([_x, _y])
+                    if _i >= 40 and _turn:
+                        _th_ += 0.35
+                    _x += 1.0 * _np.cos(_th_)
+                    _y += 1.0 * _np.sin(_th_)
+                _P[_w] = _np.asarray(_pts, _np.float32)[None]
+                _S[_w] = _np.full((1, 91), 10.0, _np.float32)
+            return _P, _S
+
+        def _states(_turn):
+            _P, _S = _mk(_turn)
+            install_external(builder, ego_indices, _P, _S, maps=_maps,
+                             last_valid_idx={_w: 41 for _w in range(_W)})
+            _st = builder.get_idc_observations_batch(
+                ego_indices, path_indices=[0] * _W)
+            return _np.stack([_st[_w] for _w in range(_W)])
+
+        _sa = _states(False)
+        _sb = _states(True)
+        _ds = float(_np.max(_np.abs(_sa - _sb)))
+        with _th.no_grad():
+            _qa = agent._value(_th.from_numpy(_sa).float().to(config.device)).cpu().numpy()
+            _qb = agent._value(_th.from_numpy(_sb).float().to(config.device)).cpu().numpy()
+        _dq = float(_np.max(_np.abs(_qa - _qb)))
+        _ok = (_ds < 1e-5 and _dq < 1e-4)
+        logger.info(f'[0b] state max|diff|={_ds:.3e} critic max|diff|={_dq:.3e} '
+                    f'-> {"PASS" if _ok else "FAIL"}')
+        return
     logger.info(f'评估模式: rho={agent.rho}, max_penalty={agent.max_penalty}')
 
     logger.info('正在生成损失曲线图...')
@@ -468,6 +514,7 @@ if __name__ == "__main__":
                         help='Waymo tfrecord 数据目录')
     parser.add_argument('--model-path', type=str, required=True,
                         help='模型 checkpoint 路径')
+    parser.add_argument('--check-tail', dest='check_tail', action='store_true', default=False)
     parser.add_argument('--num-worlds', type=int, default=None)
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--seed', type=int, default=None)
@@ -508,6 +555,7 @@ if __name__ == "__main__":
     cli_overrides = {
         'data_dir': args.data_dir,
         'model_path': args.model_path,
+        'check_tail': args.check_tail,
         'num_worlds': args.num_worlds,
         'epochs': args.epochs,
         'seed': args.seed,
