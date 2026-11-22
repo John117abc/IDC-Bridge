@@ -1,4 +1,4 @@
-﻿"""横向多模态候选的采样 + 走廊裁剪 + 四判据证书（M0-b，v2）。
+"""横向多模态候选的采样 + 走廊裁剪 + 四判据证书（M0-b，v2）。
 
 v2 修订（2026-11-16）
 --------------------
@@ -354,11 +354,15 @@ def road_dist_for_path(pos, map_rows, last_valid_idx=None):
 
 def install_external(builder, ego_indices, paths_by_world, speeds_by_world=None,
                     origin_pos=None, origin_heading=None, target_pos=None,
-                    maps=None, last_valid_idx=None):
+                    maps=None, last_valid_idx=None, blend_tail=False,
+                    tail_idx=None):
     """把外部轨迹（如规划头的 top-k）直接注入为候选集。
 
     paths_by_world : {world: (K, N, 2)}  世界坐标
     speeds_by_world: {world: (K, N)}     可选，缺省按相邻点位移推
+    blend_tail     : True 时，从 tail_idx 起的尾段沿用**原候选**（沿路线的那条），
+                     避免 4 s 规划之后用直线外推导致脱轨
+    tail_idx       : 从第几个点开始接原候选（默认取 last_valid_idx 对应的 nv）
     返回实际生效的 K。
     """
     K = 1
@@ -385,6 +389,21 @@ def install_external(builder, ego_indices, paths_by_world, speeds_by_world=None,
             _tp = np.asarray(target_pos[w], np.float32)
             _delta = _tp - _P[0, 0]
             _P = _P + _delta[None, None, :]
+        # 尾段接回原候选（沿路线），避免规划窗之后用直线外推脱轨
+        _orig_pos = None
+        if blend_tail:
+            try:
+                _orig = builder.candidate_paths[w][a][0]['pos']
+                _orig_pos = np.asarray(_orig, np.float32)
+                _ti = int(tail_idx) if tail_idx is not None else (
+                    int(last_valid_idx[w]) if last_valid_idx is not None else len(_P[0]))
+                _ti = int(np.clip(_ti, 1, _P.shape[1]))
+                if len(_orig_pos) >= _P.shape[1]:
+                    _delta_t = _P[:, _ti - 1] - _orig_pos[None, _ti - 1]
+                    _tail = _orig_pos[None, _ti:] + _delta_t[:, None, :]
+                    _P = np.concatenate([_P[:, :_ti], _tail], axis=1)
+            except Exception as _e:
+                logger.warning(f'[BLEND] world={w} 尾段接回失败: {_e}')
         # 路缘距离：与地图候选同一套定义（boundary_segments + dist_to_segments）
         _map_rows = None
         if maps is not None and w in maps:

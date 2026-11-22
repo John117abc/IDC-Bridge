@@ -5,3 +5,6 @@
 __pycache__/
 .idea/
 logs/
+
+# 允许提交的权重（规划器产物）
+!assets/*.pt
