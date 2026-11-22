@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import os
 import random
 
@@ -51,9 +51,14 @@ def _render_storyboards(trace, env, builder, config, ego_indices):
                           for x in builder.candidate_paths[w][_ai]]
         except Exception:
             _cands = None
+        _seq = tw.get('cands') if isinstance(tw, dict) else None
+        _sel = tw.get('sel') if isinstance(tw, dict) else None
         png, gif = render_world(tw, maps[w], ep, out_dir, w,
                                 fps=int(getattr(config, 'gif_fps', 12)),
-                                margin=margin, candidates=_cands)
+                                margin=margin, candidates=_cands,
+                                cands_seq=_seq, sel_seq=_sel,
+                                cands_pre=0 if getattr(config, 'planner_runtime', '')
+                                else 11)
         if gif:
             logger.info(f'[storyboard] world_{w} -> {os.path.basename(gif)}'
                         + (f' + {os.path.basename(png)}' if png else ''))
@@ -120,7 +125,13 @@ def _record_gif_frame(env, recorder, config, epoch, step, ego_indices, wm, selec
 
 
 def _select_gif_worlds(config, good_envs):
-    """根据 gif_world_selection + gif_max_worlds 选出要录制的 world 列表"""
+    """根据 gif_worlds / gif_world_selection + gif_max_worlds 选出要录制的 world 列表"""
+    _want = getattr(config, 'gif_worlds', '') or ''
+    if _want:
+        _ids = [int(x) for x in str(_want).split(',') if str(x).strip() != '']
+        _sel = [w for w in _ids if w in good_envs]
+        if _sel:
+            return _sel
     max_n = config.gif_max_worlds
     if max_n == 0 or max_n >= len(good_envs):
         return good_envs
@@ -206,7 +217,12 @@ def evaluate(config):
                 _exts[_w] = _data['speeds'][_j]
         _K = install_external(builder, ego_indices, _ext, _exts,
                                origin_pos=_data.get('origin_pos'),
-                               origin_heading=_data.get('origin_heading'))
+                               origin_heading=_data.get('origin_heading'),
+                               last_valid_idx=(
+                                   {_w: int(config.external_now_idx)
+                                    for _w in _ext}
+                                   if int(getattr(config, 'external_now_idx', 0))
+                                   else None))
         logger.info(f'[EVAL] external candidates: {len(_ext)}/{config.num_worlds} '
                     f'worlds, K={_K}')
     agent = DiscreteIDCAgent(env, config, config.device, builder, ego_indices)
@@ -301,6 +317,56 @@ def evaluate(config):
                     f'matched={sum(1 for f in _fs if os.path.basename(str(f)) in _n2i)}'
                     f'/{len(_fs)}')
 
+    def _dump_ref(tag):
+        """打印 world0 候选的 pos/速度/朝向 + 派生特征，用于排查注入对齐。"""
+        try:
+            _w0, _a0 = 0, ego_indices[0]
+            _cp = builder.candidate_paths[_w0][_a0]
+            _p = _cp[0]
+            logger.info(f'[DUMP-{tag}] 候选数={len(_cp)} '
+                        f'keys={sorted(_p.keys())}')
+            for _k in ('pos', 'speed', 'heading', 'curv_ahead', 'spd_ahead',
+                       'road_ahead', 'road_dist'):
+                if _k not in _p:
+                    continue
+                _v = np.asarray(_p[_k])
+                if _v.ndim == 2:
+                    logger.info(f'[DUMP-{tag}] {_k}: '
+                                f'{np.round(_v[:3].reshape(-1), 2)} ... '
+                                f'p20={np.round(_v[20].reshape(-1), 2)}')
+                else:
+                    logger.info(f'[DUMP-{tag}] {_k}: {np.round(_v[:4], 2)} ... '
+                                f'v20={np.round(float(_v[20]), 2)}')
+            _ep = builder.expert_pos[_w0][_a0].detach().cpu().numpy()
+            logger.info(f'[DUMP-{tag}] expert p10={np.round(_ep[10, :2], 2)} '
+                        f'p20={np.round(_ep[20, :2], 2)}')
+            _abs = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+            logger.info(f'[DUMP-{tag}] ego_abs={np.round(_abs[0, 0, :2], 2)} '
+                        f'yaw={float(_abs[0, 0, 7]):.3f}')
+        except Exception as _e:
+            logger.info(f'[DUMP-{tag}] 失败: {_e}')
+
+    _RT = None
+    if getattr(config, 'planner_runtime', ''):
+        from env.planner_runtime import PlannerRuntime
+        _RT = PlannerRuntime(
+            config.planner_runtime, k=getattr(config, 'planner_k', 1),
+            replan_every=getattr(config, 'planner_replan_every', 5),
+            mode=getattr(config, 'planner_mode', 'planner'),
+            device=getattr(config, 'device', 'cuda'),
+            dump_path=getattr(config, 'planner_dump', ''))
+        _RT.debug = True
+        logger.info(f'[RT] 在线规划器: mode={config.planner_mode} '
+                    f'every={config.planner_replan_every} k={config.planner_k}')
+
+    def _rt_install(builder_, ego_idx, paths_, speeds_, tgt_):
+        from env.candidate_sampler import install_external
+        _maps = env.sim.map_observation_tensor().to_torch().cpu().numpy()
+        install_external(builder_, ego_idx, paths_, speeds_,
+                         target_pos=tgt_,
+                         last_valid_idx={w: 41 for w in paths_},
+                         blend_tail=False, maps=_maps)   # 两种模式同一套参考布局
+
     for epoch in range(config.epochs):
         obs = env.reset()
         for w in range(config.num_worlds):
@@ -308,6 +374,10 @@ def evaluate(config):
             agent.reset_world_state(w)
         builder.clear_cache()
         wm.begin_epoch()
+        if _RT is not None:
+            _RT.reset()
+        if getattr(config, 'dump_ref', False):
+            _dump_ref('internal')
 
         done_np = env.get_dones().cpu().numpy()
         for w in range(config.num_worlds):
@@ -325,9 +395,33 @@ def evaluate(config):
         gif_worlds = _select_gif_worlds(config, VIZ_WORLDS)
 
         # 逐帧落盘，供离线画 storyboard（ego/伙伴位姿 + 事件）
-        trace = {w: {'ego': [], 'partners': [], 'info': []} for w in (gif_worlds or [])}
+        trace = {w: {'ego': [], 'partners': [], 'info': [],
+                     'cands': [], 'sel': []} for w in (gif_worlds or [])}
 
         scorers = [PDMSScorer(config) for _ in range(config.num_worlds)]
+        if getattr(config, 'dump_ref', False):
+            try:
+                _w0, _a0 = 0, ego_indices[0]
+                _cp = builder.candidate_paths[_w0][_a0]
+                logger.info(f'[DUMP] world0 候选数={len(_cp)} '
+                            f'num_candidate_paths={builder.num_candidate_paths}')
+                for _i, _p in enumerate(_cp[:2]):
+                    _ps = _p['pos']
+                    logger.info(f'[DUMP] cand{_i} keys={sorted(_p.keys())} '
+                                f'lv={_p.get("last_valid_idx", "-")} '
+                                f'p0={np.round(_ps[0],2)} p1={np.round(_ps[1],2)} '
+                                f'p10={np.round(_ps[10],2)} p20={np.round(_ps[20],2)} '
+                                f'sp0..3={np.round(_p["speed"][:4],2)} '
+                                f'hd0..3={np.round(_p["heading"][:4],2)}')
+                _ep = builder.expert_pos[_w0][_a0].detach().cpu().numpy()
+                logger.info(f'[DUMP] expert p0={np.round(_ep[0,:2],2)} '
+                            f'p10={np.round(_ep[10,:2],2)} '
+                            f'p20={np.round(_ep[20,:2],2)}')
+                _abs = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
+                logger.info(f'[DUMP] ego_abs now={np.round(_abs[0,0,:2],2)} '
+                            f'yaw={float(_abs[0,0,7]):.3f}')
+            except Exception as _e:
+                logger.info(f'[DUMP] 失败: {_e}')
         ref_start_agent = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
         temp_idx_pos = ref_start_agent + agent.DIM_REF_ERROR
 
@@ -343,6 +437,7 @@ def evaluate(config):
                         _ext[_w] = _REPLAN['data']['paths'][_k][_ri]
                         _exts[_w] = _REPLAN['data']['speeds'][_k][_ri]
                 _tp = None
+                _maps = None
                 try:
                     _abs = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
                     _nw = len(_REPLAN['files'])
@@ -354,18 +449,63 @@ def evaluate(config):
                                     f'w0={_tp.get(0)}')
                 except Exception as _e:
                     logger.info(f'[REPLAN] ego pose unavailable: {_e}')
+                try:
+                    _maps = env.sim.map_observation_tensor().to_torch().cpu().numpy()
+                except Exception as _e:
+                    logger.info(f'[REPLAN] map unavailable: {_e}')
                 install_external(builder, ego_indices, _ext, _exts,
                                  origin_pos=_REPLAN['op'],
                                  origin_heading=_REPLAN['oh'],
-                                 target_pos=_tp)
+                                 target_pos=_tp,
+                                 last_valid_idx=(
+                                     {_w: int(config.external_tail_idx)
+                                      for _w in _ext}
+                                     if int(getattr(config, 'external_tail_idx', 0))
+                                     else None),
+                                 blend_tail=bool(getattr(config, 'external_blend_tail', False)),
+                                 maps=_maps,
+                                 tail_idx=int(getattr(config, 'external_tail_idx', 0)) or None)
                 logger.info(f'[REPLAN] step {step} -> r{_ri} '
                             f'({len(_ext)} worlds)')
+                if step == 0 and getattr(config, 'dump_ref', False):
+                    _dump_ref('injected')
+
+            if _RT is not None:
+                _RT.observe(env, ego_indices)
+                if step % max(_RT.replan_every, 1) == 0:
+                    _RT.maybe_replan(step, env, builder, ego_indices, _rt_install)
+                    if step == 0:
+                        logger.info('[RT] 首次重规划完成')
+                if step == 0 and getattr(config, 'dump_feat', ''):
+                    try:
+                        import numpy as _np2
+                        _out = {}
+                        _idx = list(env.data_loader.indices)[:config.num_worlds]
+                        _files = [env.data_loader.dataset[i] for i in _idx]
+                        for _w in range(config.num_worlds):
+                            _a = int(ego_indices[_w])
+                            _eg, (_x, _y, _h) = _RT._ego_feat(_w)
+                            _ag, _am = _RT._agent_feat(env, _w, _a, _x, _y, _h)
+                            _mp, _mm = _RT._map_feat(env, _w, _x, _y, _h)
+                            _out[f'name{_w}'] = os.path.basename(str(_files[_w]))
+                            _out[f'ego{_w}'] = _np2.asarray(_eg, _np2.float32)
+                            _out[f'ag{_w}'] = _np2.asarray(_ag, _np2.float32)
+                            _out[f'am{_w}'] = _np2.asarray(_am, _np2.float32)
+                            _out[f'mp{_w}'] = _np2.asarray(_mp, _np2.float32)
+                            _out[f'mm{_w}'] = _np2.asarray(_mm, _np2.float32)
+                            _out[f'pose{_w}'] = _np2.asarray([_x, _y, _h], _np2.float32)
+                        _np2.savez_compressed(config.dump_feat, **_out)
+                        logger.info(f'[FEAT] dump {config.num_worlds} worlds -> {config.dump_feat}')
+                    except Exception as _e:
+                        logger.info(f'[FEAT] dump 失败: {_e}')
 
             _fi = int(getattr(config, 'force_path_index', -1))
             if _fi >= 0:
                 path_indices = [_fi for _ in range(config.num_worlds)]
             else:
                 path_indices = [0 for _ in range(config.num_worlds)]
+            if _RT is not None and step % max(_RT.replan_every, 1) == 0:
+                _RT.set_selected(path_indices[0])
             states = builder.get_idc_observations_batch(ego_indices, path_indices=path_indices)
 
             # Rollout PDMS — 仅在 step 0 对所有 good world 做一次前向推演
@@ -413,6 +553,15 @@ def evaluate(config):
                 ey = float(abs_for_pdms[w, a, 1])
                 eh = float(abs_for_pdms[w, a, 7])
                 trace[w]['ego'].append((ex, ey, eh))
+                try:
+                    _cc = [np.asarray((x['pos'].detach().cpu().numpy()
+                                      if hasattr(x['pos'], 'detach') else x['pos']),
+                                     np.float32)
+                           for x in builder.candidate_paths[w][a]]
+                except Exception:
+                    _cc = []
+                trace[w]['cands'].append(_cc)
+                trace[w]['sel'].append(int(path_indices[w]) if 'path_indices' in dir() else 0)
                 trace[w]['info'].append((float(info_np[w, a, 0]),
                                          float(info_np[w, a, 1]) + float(info_np[w, a, 2])))
                 pn = partner_for_pdms[w, a]
@@ -539,10 +688,37 @@ if __name__ == "__main__":
                         help='滚动重规划 npz（含 frames 维）')
     parser.add_argument('--external-candidates', type=str, default='',
                         help='规划头 top-k 轨迹 npz（离线注入）')
+    parser.add_argument('--external-now-idx', type=int, default=0,
+                        help='外部参考里"当前时刻"所在的下标（>0 时通过 '
+                             'last_valid_idx 传给 state builder；'
+                             '前缀 11 点历史 + 规划 → 传 11）')
+    parser.add_argument('--external-blend-tail', action='store_true',
+                        help='规划窗之后接回原候选（沿路线），避免直线外推脱轨')
+    parser.add_argument('--external-tail-idx', type=int, default=41,
+                        help='从第几个点开始接回原候选（40 点规划 → 41）')
+    parser.add_argument('--dump-ref', action='store_true',
+                        help='打印 world0 的候选参考/专家/自车位姿，用于排查注入对齐')
+    parser.add_argument('--planner-runtime', default='',
+                        help='在线规划器 runtime：checkpoint 路径（按频率滚动重规划）')
+    parser.add_argument('--planner-replan-every', type=int, default=5,
+                        help='每多少步重规划一次（5 → 2 Hz）')
+    parser.add_argument('--planner-mode', default='planner',
+                        choices=['planner', 'route'],
+                        help='route=把 env 内部参考原样重装（验收用）')
+    parser.add_argument('--planner-k', type=int, default=1,
+                        help='注入几条模态（IDC 未训过选择时用 1）')
+    parser.add_argument('--planner-dump', default='',
+                        help='把每次重规划的候选项/选中项/自车轨迹存成 npz（可视化用）')
+    parser.add_argument('--dump-feat', default='',
+                        help='在 step 0 把在线特征 dump 成 npz（P0 特征一致性用）')
     parser.add_argument('--force-path-index', type=int, default=-1,
                         help='>=0 时所有世界强制走第 i 条候选（A/B 对照用）')
     parser.add_argument('--gif-world-selection', type=str, default=None,
                         help='first / random')
+    parser.add_argument('--gif-worlds', type=str, default='',
+                        help='指定要录 gif 的 world 下标，逗号分隔，如 3,5')
+    parser.add_argument('--traj-plot-max-worlds', type=int, default=4,
+                        help='最多为多少个 world 录 gif（默认 4）')
     parser.add_argument('--min-partner-density', type=float, default=None)
     parser.add_argument('--max-partner-density', type=int, default=None)
     parser.add_argument('--dense-sample-size', type=int, default=None)
@@ -567,6 +743,16 @@ if __name__ == "__main__":
         'cand_fixed': args.cand_fixed,
         'force_path_index': args.force_path_index,
         'external_candidates': args.external_candidates,
+        'external_now_idx': args.external_now_idx,
+        'external_blend_tail': args.external_blend_tail,
+        'external_tail_idx': args.external_tail_idx,
+        'dump_ref': args.dump_ref,
+        'planner_runtime': args.planner_runtime,
+        'planner_replan_every': args.planner_replan_every,
+        'planner_mode': args.planner_mode,
+        'planner_k': args.planner_k,
+        'planner_dump': args.planner_dump,
+        'dump_feat': args.dump_feat,
         'replan_candidates': args.replan_candidates,
         'gif_view_mode': args.gif_view_mode,
         'gif_max_worlds': args.gif_max_worlds,
@@ -574,6 +760,8 @@ if __name__ == "__main__":
         'gif_fps': args.gif_fps,
         'gif_record_interval': args.gif_record_interval,
         'gif_world_selection': args.gif_world_selection,
+        'gif_worlds': args.gif_worlds,
+        'traj_plot_max_worlds': args.traj_plot_max_worlds,
         'min_partner_density': args.min_partner_density,
         'max_partner_density': args.max_partner_density,
         'dense_sample_size': args.dense_sample_size,
@@ -587,3 +775,12 @@ if __name__ == "__main__":
         config.gif_enabled = config.gif_enabled.lower() == 'true'
 
     evaluate(config)
+
+
+
+
+
+
+
+
+

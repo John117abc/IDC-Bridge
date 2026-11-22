@@ -72,13 +72,15 @@ class StoryboardPainter:
     """把 trace 的某一帧画到给定 Axes 上。"""
 
     def __init__(self, map_pts, expert, ego_len=4.8, ego_wid=2.0,
-                 margin=35.0, trail=40, candidates=None):
+                 margin=35.0, trail=40, candidates=None, pre=11,
+                 cands_seq=None, sel_seq=None):
         self.map_pts = np.asarray(map_pts) if map_pts is not None else np.zeros((0, 7))
         self.expert = np.asarray(expert) if expert is not None else np.zeros((0, 2))
         self.candidates = ([np.asarray(c) for c in candidates]
                            if candidates else [])
-        self.candidates = ([np.asarray(c) for c in candidates]
-                           if candidates else [])
+        self.pre = int(pre)
+        self.cands_seq = cands_seq
+        self.sel_seq = sel_seq
         self.ego_len = float(ego_len)
         self.ego_wid = float(ego_wid)
         self.margin = float(margin)
@@ -124,13 +126,24 @@ class StoryboardPainter:
         # 候选轨迹：高对比色 + 每条单独图例；第 0 条（概率最高）最粗
         _cols = ["#d50000", "#2962ff", "#00c853", "#ff6d00", "#aa00ff"]
         self._cand_handles = []
-        _pre = 11                          # 日志前缀（自车已走过的 1.1 s）
-        for _i, _c in enumerate(self.candidates):
+        _pre = self.pre
+        _cands = self.candidates
+        _sel_now = -1
+        if self.cands_seq is not None:
+            _it = min(t, len(self.cands_seq) - 1)
+            _cc = self.cands_seq[_it]
+            if _cc:
+                _cands = [np.asarray(x) for x in _cc]
+                _pre = 0            # runtime 参考 = 当前点 + 40 点，没有历史前缀
+            if self.sel_seq is not None:
+                _sel_now = int(self.sel_seq[_it])
+        for _i, _c in enumerate(_cands):
             if len(_c) < 2:
                 continue
             _col = _cols[_i % len(_cols)]
-            _lw = 3.0 if _i == 0 else 1.4
-            _a = 0.90 if _i == 0 else 0.75
+            _hi = (_i == _sel_now) if _sel_now >= 0 else (_i == 0)
+            _lw = 3.2 if _hi else 1.3
+            _a = 0.95 if _hi else 0.55
             _p0 = min(_pre, len(_c))
             if _p0 > 1:                    # 过去：浅灰细线
                 ax.plot(_c[:_p0, 0], _c[:_p0, 1], ls="-", lw=1.0,
@@ -138,16 +151,14 @@ class StoryboardPainter:
             _p1 = min(_pre + 40, len(_c))  # 计划：4 秒实线
             ax.plot(_c[_p0:_p1, 0], _c[_p0:_p1, 1], ls="-", lw=_lw,
                     c=_col, alpha=_a, zorder=7)
-            if len(_c) > _p1:              # 外推：点线
-                ax.plot(_c[_p1 - 1:, 0], _c[_p1 - 1:, 1], ls=":", lw=_lw * 0.7,
-                        c=_col, alpha=0.45, zorder=6)
+            # 4 s 之外不再绘制（外推无意义）
             self._cand_handles.append(
                 Line2D([], [], color=_col, lw=_lw,
-                       label=f'cand{_i}' + (' (top-1)' if _i == 0 else '')))
+                       label=f'plan{_i}' + (' (selected)' if _hi else '')))
 
         # 候选轨迹：细线不同颜色；第 0 条（概率最高）加粗
-        _cols = ["#8e24aa", "#00897b", "#f9a825", "#6d4c41", "#546e7a"]
-        for _i, _c in enumerate(self.candidates):
+        _cols = []   # 第二层（整条参考细线）已停用，只保留 4 s 规划层
+        for _i, _c in enumerate(_cands if _cols else []):
             if len(_c) < 2:
                 continue
             ax.plot(_c[:, 0], _c[:, 1], ls="-",
@@ -212,7 +223,7 @@ def _truncate(ego):
 
 
 def render_world(trace_w, map_pts, expert, out_dir, world, fps=12,
-                 candidates=None,
+                 candidates=None, cands_seq=None, sel_seq=None, cands_pre=11,
                  ego_len=4.8, ego_wid=2.0, margin=35.0,
                  storyboard=True, gif=True, dpi=120):
     """为一个 world 输出 storyboard PNG + GIF。返回 (png_path, gif_path)。"""
@@ -229,7 +240,8 @@ def render_world(trace_w, map_pts, expert, out_dir, world, fps=12,
 
     painter = StoryboardPainter(map_pts, expert, ego_len=ego_len,
                                 ego_wid=ego_wid, margin=margin,
-                                candidates=candidates)
+                                candidates=candidates, pre=cands_pre,
+                                cands_seq=cands_seq, sel_seq=sel_seq)
     os.makedirs(out_dir, exist_ok=True)
     png_path = gif_path = None
 
@@ -268,3 +280,7 @@ def render_world(trace_w, map_pts, expert, out_dir, world, fps=12,
         imageio.mimsave(gif_path, frames, fps=fps, loop=0)
 
     return png_path, gif_path
+
+
+
+

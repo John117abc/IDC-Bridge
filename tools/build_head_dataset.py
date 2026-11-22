@@ -1,4 +1,4 @@
-﻿"""构建规划头的训练数据：固定锚点（K-Means）+ 场景特征 + 标签。
+"""构建规划头的训练数据：固定锚点（K-Means）+ 场景特征 + 标签。
 
 锚点：对自车系（frame 10 为原点、朝向 0）的 80 帧 GT 未来做 K-Means → K 条固定锚点
 特征：
@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(_ROOT, "src"))
 
 N_MAX = 32
 M_MAX = 128
+R_MAX = 512         # 奖励几何：沿专家路径走廊的线段上限
 T_FUT = 8
 T_FUT_EXT = 40      # 奖励用的 4 s 逐帧（0.1 s）          # 8 个 waypoint（对齐 DiffusionDrive）
 WP_STEP = 5        # 每 0.5 s 一个（10 Hz × 5）
@@ -146,6 +147,7 @@ def build_one(d, anchors, t_now=None):
     amask = np.zeros(N_MAX, np.float32)
     agent_fut = np.zeros((N_MAX, T_FUT_EXT, 2), np.float32)
     agent_fut_valid = np.zeros((N_MAX, T_FUT_EXT), np.float32)
+    agent_fut_head = np.zeros((N_MAX, T_FUT_EXT), np.float32)
     cands = []
     for i, o in enumerate(objs):
         if i == int(idx) or not o.get('position'):
@@ -180,12 +182,15 @@ def build_one(d, anchors, t_now=None):
             hist = pe.reshape(-1).astype(np.float32)
         # 逐帧未来位置（奖励用；只对回放周车，评测口径）
         _val = o.get('valid') or [1] * len(q)
+        _hd = o.get('heading') or [0.0] * len(q)
         for _j in range(T_FUT_EXT):
             _tj = t + 1 + _j
             if _tj < len(q) and int(_val[_tj]) == 1:
                 _qq = q[_tj]
                 agent_fut[n, _j] = [_qq['x'], _qq['y']]
                 agent_fut_valid[n, _j] = 1.0
+                if _tj < len(_hd):
+                    agent_fut_head[n, _j] = float(_hd[_tj])
         ag[n] = np.r_[[rel[0], rel[1], np.cos(dh), np.sin(dh), v,
                        float(o.get('length') or 4.5),
                        float(o.get('width') or 1.9), 1.0], hist]
@@ -213,14 +218,76 @@ def build_one(d, anchors, t_now=None):
         mp[n] = [mid[0], mid[1], ln, np.cos(hh), np.sin(hh), is_lane, 1.0]
         mmask[n] = 1.0
 
+    # --- 奖励几何：沿专家 8 个 waypoint 走廊的线段（最近的 R_MAX 条，自车系）---
+    _all = []
+    for r in (d.get('roads') or []):
+        _typ = r.get('type')
+        if _typ not in ('lane', 'road_line', 'road_edge') or \
+                len(r.get('geometry') or []) < 2:
+            continue
+        _L = np.asarray([[q['x'], q['y']] for q in r['geometry']], np.float64)
+        _A, _B = _L[:-1], _L[1:]
+        _mid = 0.5 * (_A + _B)
+        _dm = np.min(np.linalg.norm(_mid[:, None, :] - fut[None], axis=2), axis=1)
+        _isl = 1.0 if _typ != 'road_edge' else 0.0
+        for _i in range(len(_A)):
+            _all.append((float(_dm[_i]), _A[_i, 0], _A[_i, 1],
+                         _B[_i, 0], _B[_i, 1], _isl))
+    _all.sort(key=lambda x: x[0])
+    map_r = np.zeros((R_MAX, 5), np.float32)
+    _sel = _all[:R_MAX]
+    for _n, (_dd, _ax, _ay, _bx, _by, _isl) in enumerate(_sel):
+        _pa = to_ego(np.array([[_ax, _ay]]), p0, h0)[0]
+        _pb = to_ego(np.array([[_bx, _by]]), p0, h0)[0]
+        map_r[_n] = [_pa[0], _pa[1], _pb[0], _pb[1], _isl]
+    n_map_r = np.int64(len(_sel))
+    expert_head40 = np.zeros(T_FUT_EXT, np.float32)
+    _h40 = H[t + 1:t + 1 + T_FUT_EXT]
+    expert_head40[:len(_h40)] = _h40
+    ego_dim = np.asarray([float(sdc.get('length') or 4.8),
+                          float(sdc.get('width') or 1.95)], np.float32)
+
     # --- 标签 ---
     fde = np.linalg.norm(anchors[:, -1, :] - gt[-1][None], axis=1)
     k = int(np.argmin(fde))
     resid = gt - anchors[k]
-    return dict(ego=ego, agent=ag, amask=amask, map=mp, mmask=mmask,
+    # --- 人类侧指标（奖励用，预计算；与 score_trajectory 同一套）---
+    try:
+        from metrics.openloop_pdms import Scene, step_metrics
+        _sc = Scene(d, horizon=40)
+        _exp_w = P[t + 1:t + 1 + 40]
+        if len(_exp_w) == 40:
+            _hm = step_metrics(_sc, _exp_w)
+            _h = dict(hm_ttc=_hm['ttc'].astype(np.float32),
+                      hm_jerk=_hm['jerk'].astype(np.float32),
+                      hm_lat=_hm['lat'].astype(np.float32),
+                      hm_coll=_hm['coll'].astype(np.float32),
+                      hm_off=_hm['off'].astype(np.float32),
+                      hm_ddc=_hm['ddc'].astype(np.float32),
+                      expert40=_exp_w.astype(np.float32))
+        else:
+            _h = dict(hm_ttc=np.zeros(40, np.float32),
+                      hm_jerk=np.zeros(40, np.float32),
+                      hm_lat=np.zeros(40, np.float32),
+                      hm_coll=np.zeros(40, np.float32),
+                      hm_off=np.zeros(40, np.float32),
+                      hm_ddc=np.zeros(40, np.float32),
+                      expert40=np.zeros((40, 2), np.float32))
+    except Exception:
+        _h = dict(hm_ttc=np.zeros(40, np.float32),
+                  hm_jerk=np.zeros(40, np.float32),
+                  hm_lat=np.zeros(40, np.float32),
+                  hm_coll=np.zeros(40, np.float32),
+                  hm_off=np.zeros(40, np.float32),
+                  hm_ddc=np.zeros(40, np.float32),
+                  expert40=np.zeros((40, 2), np.float32))
+    return dict(**_h, ego=ego, agent=ag, amask=amask, map=mp, mmask=mmask,
                 gt=gt, label=np.int64(k), resid=resid.astype(np.float32),
                 fde=float(fde[k]), agent_fut=agent_fut,
                 agent_fut_valid=agent_fut_valid,
+                agent_fut_head=agent_fut_head,
+                map_r=map_r, n_map_r=n_map_r,
+                expert_head40=expert_head40, ego_dim=ego_dim,
                 ego_world=np.asarray([p0[0], p0[1], h0], np.float32))
 
 
@@ -264,7 +331,10 @@ def main():
 
     # ---- pass 2：特征 + 标签 ----
     keys = ('ego', 'agent', 'amask', 'map', 'mmask', 'gt', 'label', 'resid',
-            'agent_fut', 'agent_fut_valid', 'ego_world')
+            'agent_fut', 'agent_fut_valid', 'agent_fut_head',
+            'map_r', 'n_map_r', 'expert_head40', 'ego_dim', 'ego_world',
+            'hm_ttc', 'hm_jerk', 'hm_lat', 'hm_coll', 'hm_off', 'hm_ddc',
+            'expert40')
     data_tr = {k: [] for k in keys}
     ids_tr = []
     data_va = {k: [] for k in keys}
