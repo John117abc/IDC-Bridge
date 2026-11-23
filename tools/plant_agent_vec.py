@@ -21,10 +21,14 @@ from train_planner import Planner      # noqa: E402
 MAPS = '/mnt/2T_HDD/plant2_vector/maps'
 CKPT = os.environ.get('VEC_CKPT', '/mnt/2T_HDD/plant2_vector/ckpt_conf/best.pt')
 ROUTE_ONLY = os.environ.get('VEC_ROUTE_ONLY', '0') == '1'
+VEC_CTRL = os.environ.get('VEC_CTRL', 'pp')
+REC_BC = os.environ.get('VEC_RECORD_BC', '0') == '1'
+_BC_ID = [0]  # pp=纯追踪, idc=IDC 控制器
 REPLAN_EVERY = max(1, int(os.environ.get('VEC_REPLAN', '5')))
 REC = os.environ.get('VEC_RECORD', '0') == '1'
 REC_DIR = '/mnt/2T_HDD/plant2_vector/video'
 DEBUG = os.environ.get('VEC_DEBUG', '1') == '1'
+_DUMP_ID = [0]    # 模块级计数（agent 每条 route 会重建实例）
 
 
 def get_entry_point():
@@ -41,17 +45,21 @@ class VecAgent(autonomous_agent.AutonomousAgent):
         self.map_cache = {}
         self.xml_routes = []
         self._rp = None
+        self._dump_i = 0
+        self._atrack = {}
         self._plan_world = None
         self._plan_mode = -1
+        self._atrack = {}
         self._spd_i = 0.0
         self._stuck_t = 0.0
         self._last_thr = 0.0
+        self._idc = None
         try:
             import xml.etree.ElementTree as _ET
-            _fp = os.environ.get(
-                'VEC_ROUTES',
-                '/home/jiangchengxuan/PycharmProjects/research-safe-drive/plant2/'
-                'Bench2Drive/leaderboard/data/two_routes.xml')
+            _fp = (os.environ.get('VEC_ROUTES')
+                   or os.environ.get('ROUTES_FILE')
+                   or '/home/jiangchengxuan/PycharmProjects/research-safe-drive/plant2/'
+                      'Bench2Drive/leaderboard/data/two_routes.xml')
             for _r in _ET.parse(_fp).getroot().findall('route'):
                 _pts = [(float(p.get('x')), float(p.get('y')))
                         for p in _r.find('waypoints').findall('position')]
@@ -320,6 +328,17 @@ class VecAgent(autonomous_agent.AutonomousAgent):
             self._route_logged = True
         return out
 
+    def _hist20(self, a, p0, c, s, rel):
+        q = self._atrack.get(a.id)
+        h = np.zeros((10, 2), np.float32)
+        if q and len(q) == 10:
+            P = np.asarray(q, np.float64)
+            d = P - p0
+            E = np.stack([d[:, 0] * c - d[:, 1] * s,
+                          d[:, 0] * s + d[:, 1] * c], 1)
+            h = (E - rel[None]).astype(np.float32)
+        return h.reshape(-1)
+
     def _feat(self, pose):
         x, y, h, spd = pose
         self.hist.append([x, y, h])
@@ -341,6 +360,10 @@ class VecAgent(autonomous_agent.AutonomousAgent):
             if a.id == self._vehicle.id:
                 continue
             t = a.get_transform()
+            _q = self._atrack.setdefault(a.id, [])
+            _q.append((float(t.location.x), float(t.location.y)))
+            if len(_q) > 10:
+                _q.pop(0)
             p = np.array([t.location.x, t.location.y])
             rows.append((float(np.linalg.norm(p - np.array([x, y]))), p, t, a))
         rows.sort(key=lambda r: r[0])
@@ -352,7 +375,8 @@ class VecAgent(autonomous_agent.AutonomousAgent):
             sp = float(np.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2))
             bb = a.bounding_box.extent
             ag[k] = np.r_[[rel[0], rel[1], np.cos(dh2), np.sin(dh2), sp,
-                           2 * bb.x, 2 * bb.y, 1.0], np.zeros(20, np.float32)]
+                           2 * bb.x, 2 * bb.y, 1.0],
+                          self._hist20(a, np.array([x, y]), c, s, rel)]
             am[k] = 1.0
 
         town = self._vehicle.get_world().get_map().name.split('/')[-1].replace('_Opt', '')
@@ -421,7 +445,8 @@ class VecAgent(autonomous_agent.AutonomousAgent):
     def destroy(self, results=None):
         try:
             if self.dbg:
-                np.savez_compressed('/mnt/2T_HDD/plant2_vector/dbg.npz',
+                _i = _DUMP_ID[0]; _DUMP_ID[0] += 1
+                np.savez_compressed('/mnt/2T_HDD/plant2_vector/dbg_%d.npz' % _i,
                     route=np.stack([d['route'] for d in self.dbg]),
                     pred=np.stack([d['pred'] for d in self.dbg]),
                     pose=np.stack([d['pose'] for d in self.dbg]),
@@ -429,17 +454,105 @@ class VecAgent(autonomous_agent.AutonomousAgent):
                     ctrl=np.array([[d['steer'], d['thr'], d['brk']] for d in self.dbg]),
                     modes=np.stack([d['modes'] if d.get('modes') is not None else np.zeros((6, 8, 2), np.float32) for d in self.dbg]),
                     mp=np.stack([d['mp'] for d in self.dbg]),
+                    ag=np.stack([d['ag'] for d in self.dbg]),
+                    am=np.stack([d['am'] for d in self.dbg]),
                     mm=np.stack([d['mm'] for d in self.dbg]))
-                print('[VecAgent] dbg saved', len(self.dbg), flush=True)
+                print('[VecAgent] dbg saved', len(self.dbg), '-> dbg_%d.npz' % _i, flush=True)
+                self.dbg = []
         except Exception as e:
             print('[VecAgent] dbg save fail', e, flush=True)
+        try:
+            if self._idc is not None:
+                self._idc.flush()
+        except Exception as _e:
+            print('[VecAgent] BC flush fail', _e, flush=True)
         super().destroy()
+
+    def _tm_setup(self):
+        """让 CARLA 交通管理器沿 route 自动驾驶（oracle 执行器）。"""
+        import carla as _carla
+        port = int(os.environ.get('TM_PORT', '8001'))  # 8000 被 leaderboard 占用
+        tm = None
+        try:
+            from srunner.scenariomanager.carla_data_provider import (
+                CarlaDataProvider as _CDP)
+            _client = _CDP.get_client()
+            tm = _client.get_trafficmanager(port)
+        except Exception as e1:                     # noqa: BLE001
+            try:
+                _client = _carla.Client('localhost',
+                                        int(os.environ.get('CARLA_PORT', '2000')))
+                _client.set_timeout(20.0)
+                tm = _client.get_trafficmanager(port)
+            except Exception as e2:                 # noqa: BLE001
+                print(f'[TM] 获取失败: {e1} / {e2}', flush=True)
+                self._tm_ready = True
+                return
+        self._vehicle.set_autopilot(True, port)
+        # 用匹配到的 XML route（世界坐标）作为 TM 的路径
+        pts = None
+        plan = self._plan_pts()
+        pts = self._dense_route(plan)
+        if pts is None:
+            rp = self._rp if self._rp is not None else self._route(self._pose())
+            rv = rp[np.abs(rp[:, 0]) + np.abs(rp[:, 1]) > 0]
+            x, y, h = self._pose()[:3]
+            c, s = np.cos(h), np.sin(h)
+            pts = np.stack([x + rv[:, 0] * c - rv[:, 1] * s,
+                            y + rv[:, 0] * s + rv[:, 1] * c], 1)
+        locs = [_carla.Location(x=float(p[0]), y=float(p[1]), z=1.0) for p in pts]
+        try:
+            tm.set_path(self._vehicle, locs)
+            print(f'[TM] set_path 成功，{len(locs)} 个点', flush=True)
+        except Exception as e:
+            print(f'[TM] set_path 失败: {e}', flush=True)
+        try:
+            tm.set_desired_speed(self._vehicle,
+                                 float(os.environ.get('TM_SPEED', '8.0')))
+        except Exception:
+            pass
+        for fn in ('ignore_lights_percentage', 'ignore_signs_percentage'):
+            try:
+                getattr(tm, fn)(self._vehicle, 100.0 if os.environ.get('TM_IGNORE', '1') == '1' else 0.0)
+            except Exception:
+                pass
+        self._tm = tm
+        self._tm_ready = True
 
     @torch.inference_mode()
     def run_step(self, input_data, timestamp):
         if self._vehicle is None:
             self._vehicle = self._find_hero()
         pose = self._pose()
+        # ---- TM 模式：用 CARLA 交通管理器作为“oracle 执行器”跟踪 route ----
+        if VEC_CTRL == 'tm':
+            if not getattr(self, '_tm_ready', False):
+                self._tm_setup()
+            ctrl = self._vehicle.get_control()      # TM 写入的控制，原样回放
+            self.step += 1
+            if DEBUG and self.step % 20 == 0:
+                print(f'[VecAgent][TM] step {self.step} v={pose[3]:.1f} '
+                      f'thr={ctrl.throttle:.2f} brk={ctrl.brake:.2f} '
+                      f'steer={ctrl.steer:+.2f}', flush=True)
+            return ctrl
+        if (VEC_CTRL == 'idc' or REC_BC) and self._idc is None:
+            from plant_agent_idc import IDCController
+            _town = (self._vehicle.get_world().get_map().name
+                     .split('/')[-1].replace('_Opt', ''))
+            _got = self._map(_town)
+            _rec = ''
+            if REC_BC:
+                _rdir = os.environ.get('VEC_BC_DIR',
+                                       '/mnt/2T_HDD/plant2_vector/bc')
+                _rec = os.path.join(_rdir, f'bc_{_BC_ID[0]}.npz')
+                _BC_ID[0] += 1
+            self._idc = IDCController(
+                os.environ.get('VEC_IDC_CKPT') or CKPT,
+                self._vehicle.get_world(), self._vehicle,
+                os.path.join(MAPS, f'map_{_town}.npz'),
+                tree=(_got[0] if _got is not None else None),
+                infer_every=int(os.environ.get('VEC_IDC_EVERY', '4')),
+                with_policy=(VEC_CTRL == 'idc'), record_path=_rec)
         ego, ag, am, mp, mm = self._feat(pose)
         if self._rp is None or self.step % 5 == 0:
             self._rp = self._route(pose)
@@ -454,6 +567,11 @@ class VecAgent(autonomous_agent.AutonomousAgent):
         if ROUTE_ONLY:
             # 基线：绕开模型，沿 route 中心线以固定速度取 8 点
             rp_v = rp[np.abs(rp[:, 0]) + np.abs(rp[:, 1]) > 0]
+            # 只保留自车前方的 route 点：最近点常在车后方，会让整条参考朝后
+            _ahead = rp_v[rp_v[:, 0] > 0.5]
+            if len(_ahead) >= 3:
+                rp_v = _ahead
+                rp_v[:, 2] -= rp_v[0, 2]
             v_tgt = 6.0
             ss = v_tgt * 0.5 * np.arange(1, 9)
             if len(rp_v) >= 3:
@@ -499,11 +617,60 @@ class VecAgent(autonomous_agent.AutonomousAgent):
         cs = CubicSpline(t2, pe2, axis=0)
         wp41 = cs(np.linspace(0.0, float(t2[-1]), 41))
         steer, thr, brk = self._control(wp41, pose[3])
+        if VEC_CTRL == 'idc' and self._idc is not None:
+            steer, thr, brk = self._idc.control(pose, wp, pose[3], route_ego=rp)
+        elif REC_BC and self._idc is not None:
+            # 录制模式：IDC 只构建状态，动作标签来自纯追踪
+            self._idc.control(pose, wp, pose[3], route_ego=rp)
+            self._idc.record(steer, thr, brk)
+
+        # 卡死提前终止：停太久直接判失败，避免白等 200 s
+        _stuck_lim = float(os.environ.get('VEC_STUCK_SEC', '0'))
+        if _stuck_lim > 0:
+            if pose[3] < 0.2:
+                self._stuck_s = getattr(self, '_stuck_s', 0.0) + 0.05
+            else:
+                self._stuck_s = 0.0
+            if self._stuck_s > _stuck_lim:
+                # 诊断：卡在哪、离车道多远、周围有什么、车高（爬上路缘会升高）
+                try:
+                    t = self._vehicle.get_transform()
+                    _town = (self._vehicle.get_world().get_map().name
+                             .split('/')[-1].replace('_Opt', ''))
+                    _got = self._map(_town)
+                    _dl = -1.0
+                    if _got is not None:
+                        _dd, _ = _got[0].query(
+                            [t.location.x, t.location.y], k=1)
+                        _dl = float(_dd)
+                    _near = []
+                    for _a in self._vehicle.get_world().get_actors().filter('vehicle.*'):
+                        if _a.id == self._vehicle.id:
+                            continue
+                        _at = _a.get_transform()
+                        _d = float(np.hypot(_at.location.x - t.location.x,
+                                            _at.location.y - t.location.y))
+                        if _d < 40.0:
+                            _v = _a.get_velocity()
+                            _sp = float(np.sqrt(_v.x ** 2 + _v.y ** 2 + _v.z ** 2))
+                            _near.append((round(_d, 1), _a.type_id.split('.')[-1],
+                                          round(_sp, 1)))
+                    _near.sort()
+                    print(f'[STUCK-DIAG] 最近车(距/型/速)= {_near[:3]}', flush=True)
+                    print(f'[STUCK-DIAG] pos=({t.location.x:.1f},{t.location.y:.1f},'
+                          f'{t.location.z:.2f}) yaw={t.rotation.yaw:.1f} '
+                          f'v={pose[3]:.2f} steer={steer:+.2f} thr={thr:.2f} brk={brk:.2f} '
+                          f'离最近车道={_dl:.2f}m 附近车={_near[:6]}', flush=True)
+                except Exception as _e:            # noqa: BLE001
+                    print(f'[STUCK-DIAG] 失败: {_e}', flush=True)
+                print(f'[VecAgent] STUCK 车速<0.2m/s 已 {self._stuck_s:.1f}s '
+                      f'→ 提前终止（不空等）', flush=True)
+                raise RuntimeError('STUCK_EARLY_ABORT')
 
         if DEBUG:
             _modes = wp_all if 'wp_all' in dir() else None
             self.dbg.append(dict(route=rp.copy(), pred=wp.copy(), modes=_modes,
-                                pose=np.array(pose, np.float64), mp=mp.copy(), mm=mm.copy(),
+                                pose=np.array(pose, np.float64), mp=mp.copy(), mm=mm.copy(), ag=ag.copy(), am=am.copy(),
                                 steer=steer, thr=thr, brk=brk, k=k))
         self.step += 1
         if DEBUG and self.step % 20 == 0:

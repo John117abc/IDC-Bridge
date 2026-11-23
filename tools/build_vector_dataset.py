@@ -66,12 +66,18 @@ def build(route_dir, map_npz):
     W = np.concatenate(segW)
 
     frames = []
+    id2pos = {}
     for f in range(n):
         boxes = _norm(_load(bf[f]))
         ego = [b for b in boxes if b['class'] == 'ego_car']
         if not ego:
             continue
         frames.append((f, boxes, ego[0]))
+        for _b in boxes:
+            _id = _b.get('id')
+            if _id is None:
+                continue
+            id2pos.setdefault(_id, {})[f] = (_b['wx'], _b['wy'])
     if len(frames) < T_NOW + 50:
         return None
 
@@ -106,9 +112,22 @@ def build(route_dir, map_npz):
             rel = _to_ego(q[None], p0, h0)[0]
             dh = b['wyaw'] - h0
             ex = b['extent']
+            # 10 帧历史：相对该车当前位置、在 ego-now 系下（与 Waymo 口径一致）
+            hist = np.zeros((HIST, 2), np.float32)
+            aid = b.get('id')
+            if aid is not None and aid in id2pos:
+                pts = []
+                for j in range(i - HIST + 1, i + 1):
+                    pj = id2pos[aid].get(j)
+                    pts.append(np.nan if pj is None else pj)
+                if all(p is not np.nan for p in pts) and not any(
+                        isinstance(p, float) for p in pts):
+                    P = np.asarray(pts, np.float64)
+                    pe = _to_ego(P, p0, h0) - rel[None]
+                    hist = pe.astype(np.float32)
             ag[k] = np.r_[[rel[0], rel[1], np.cos(dh), np.sin(dh),
                            float(b.get('speed') or 0.0), 2 * ex[0], 2 * ex[1], 1.0],
-                          np.zeros(20, np.float32)]
+                          hist.reshape(-1)]
             am[k] = 1.0
         # 地图
         mid = 0.5 * (A + B)

@@ -134,13 +134,42 @@ def load_checkpoint(model, filepath, optimizer=None, device=None):
             if name not in saved_model_state:
                 raise KeyError(f"Model '{name}' not found in checkpoint. "
                                f"Available keys: {list(saved_model_state.keys())}")
-            net.load_state_dict(saved_model_state[name])
+            _sd = saved_model_state[name]
+            try:
+                net.load_state_dict(_sd)
+            except RuntimeError as _e:
+                # 维度升级（如 66→84 维）时首层形状不匹配：只跳过这些参数
+                _own = net.state_dict()
+                _ok, _skip, _expand = {}, [], []
+                for _k, _v in _sd.items():
+                    if _k in _own and _own[_k].shape == _v.shape:
+                        _ok[_k] = _v
+                    elif (_k in _own and _v.dim() == 2
+                          and _own[_k].dim() == 2
+                          and _v.shape[0] == _own[_k].shape[0]
+                          and _v.shape[1] < _own[_k].shape[1]):
+                        # 输入维度扩展：旧列拷到前面，新列置零（热启动）
+                        _new = torch.zeros_like(_own[_k])
+                        _new[:, :_v.shape[1]] = _v
+                        _ok[_k] = _new
+                        _expand.append((_k, tuple(_v.shape), tuple(_own[_k].shape)))
+                    else:
+                        _skip.append(_k)
+                net.load_state_dict(_ok, strict=False)
+                if _expand:
+                    print(f'[ckpt] {name}: 维度扩展热启动 {_expand}', flush=True)
+                print(f'[ckpt] {name}: 跳过 {len(_skip)} 个形状不匹配参数 '
+                      f'{_skip[:3]}（其余已加载）', flush=True)
     else:
         # 单模型模式
         model.load_state_dict(saved_model_state)
 
     # 加载优化器
+    import os as _os
     saved_optim_state = checkpoint.get('optimizer_state_dict')
+    if int(_os.environ.get('IDC_STATE_V2', '0')) >= 1:
+        print('[ckpt] IDC_STATE_V2>=1：跳过 optimizer 状态（维度已变）', flush=True)
+        saved_optim_state = None
     if optimizer is not None and saved_optim_state is not None:
         if isinstance(optimizer, dict):
             # 多优化器

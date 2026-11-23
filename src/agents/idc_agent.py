@@ -1,4 +1,4 @@
-﻿import math
+import math
 import sys
 import numpy as np
 import torch
@@ -51,14 +51,31 @@ class DiscreteIDCAgent:
         self.ego_indices = ego_indices
 
         # IDC 维度定义
-        self.DIM_EGO = 6
-        self.DIM_OTHERS = 32
-        self.DIM_VALIDITY = 8
-        self.DIM_REF_ERROR = 18           # [dp, dphi, dv, lat+dphi+road+spd ×3(t+5/10/15) + curvahead+spdahead+rdahead]
-        self.DIM_TEMPORAL = 1
-        self.DIM_VEH = 1                  # 该车的 size.length（GPUDrive 拿它当轴距，逐车不同）
+        import os as _os
+        # 0=旧 66 维；1=v2 84 维（单参考）；2=v2 102 维（含 6 模态）
+        self.state_ver = int(_os.environ.get('IDC_STATE_V2', '0'))
+        if self.state_ver >= 1:
+            # v2：v1 核心（ego6/others32/valid8/ref18/temp1/veh1 = 66）+ 追加 19
+            self.DIM_EGO = 6
+            self.DIM_OTHERS = 32
+            self.DIM_VALIDITY = 8
+            self.DIM_REF_ERROR = 18
+            self.DIM_TEMPORAL = 1
+            self.DIM_VEH = 1
+            self.DIM_EXTRA = 18           # ego2 + others16（插在 veh 之前）
+            self.DIM_MODE = 0
+        else:
+            self.DIM_EGO = 6
+            self.DIM_OTHERS = 32
+            self.DIM_VALIDITY = 8
+            self.DIM_REF_ERROR = 18
+            self.DIM_TEMPORAL = 1
+            self.DIM_VEH = 1
+            self.DIM_MODE = 0
         self.TOTAL_STATE_DIM = (self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
-                                + self.DIM_REF_ERROR + self.DIM_TEMPORAL + self.DIM_VEH)
+                                + self.DIM_REF_ERROR + self.DIM_TEMPORAL + self.DIM_VEH
+                                + getattr(self, 'DIM_EXTRA', 0)
+                                + getattr(self, 'DIM_MODE', 0))
         self.DIM_ROAD = 80
 
         # ---- 状态表示 / 参考点 / 归一化（决策 1 + 2）----
@@ -74,8 +91,11 @@ class DiscreteIDCAgent:
         # （GPUDrive 不提供这两个量，实测恒为 0，占着输入位纯属浪费）
         self.ENCODED_EGO = 4
         self.ENCODED_DIM = (self.ENCODED_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
-                            + self.DIM_REF_ERROR + self.DIM_TEMPORAL + self.DIM_VEH)
-        self.input_norm = RunningNorm(self.ENCODED_DIM)
+                            + self.DIM_REF_ERROR + self.DIM_TEMPORAL + self.DIM_VEH
+                            + getattr(self, 'DIM_EXTRA', 0)
+                            + getattr(self, 'DIM_MODE', 0))
+        self.input_norm = RunningNorm(
+            64 if getattr(self, 'state_ver', 0) >= 1 else self.ENCODED_DIM)
         # 把参考点模式同步给 state builder（obs 构建时也要按同一规则推进索引）
         if hasattr(state_builder, 'ref_mode'):
             state_builder.ref_mode = self.ref_mode
@@ -272,10 +292,36 @@ class DiscreteIDCAgent:
 
         s: [..., TOTAL_STATE_DIM] -> [..., ENCODED_DIM]
         """
+        if getattr(self, 'state_ver', 0) >= 1:
+            lead = s.shape[:-1]
+            x, y, phi = s[..., 0], s[..., 1], s[..., 4]
+            z = torch.zeros_like(x)
+            # --- 前 64 维：与 v1 编码**逐列一致**（保证旧权重可直接热启动）---
+            ego4 = torch.stack([z, z, s[..., 2], z], dim=-1)          # 4
+            o = s[..., 6:38].reshape(*lead, 8, 4)
+            c, sn = torch.cos(phi), torch.sin(phi)
+            dx = o[..., 0] - x.unsqueeze(-1)
+            dy = o[..., 1] - y.unsqueeze(-1)
+            rx = dx * c.unsqueeze(-1) + dy * sn.unsqueeze(-1)
+            ry = -dx * sn.unsqueeze(-1) + dy * c.unsqueeze(-1)
+            dphi = o[..., 2] - phi.unsqueeze(-1)
+            dphi = torch.atan2(torch.sin(dphi), torch.cos(dphi))
+            others = torch.stack([rx, ry, dphi, o[..., 3]], dim=-1).reshape(
+                *lead, self.DIM_OTHERS)                                # 32
+            rest = s[..., 38:65]                                       # 27
+            veil = s[..., 83:84]                                       # 1
+            base64 = torch.cat([ego4, others, rest, veil], dim=-1)      # 64
+            # --- 后 19 维：追加特征（ego2 + others16 + replan1）---
+            ego_ex = s[..., 65:67]
+            oth_ex = s[..., 67:83]
+            return torch.cat([base64, ego_ex, oth_ex], dim=-1)  # 82
+
+        # ---- v1（66 维）编码：与旧权重逐列一致 ----
         lead = s.shape[:-1]
         x, y, phi = s[..., 0], s[..., 1], s[..., 4]
-        o = s[..., self.DIM_EGO:self.DIM_EGO + self.DIM_OTHERS].reshape(*lead, 8, 4)
-        if self.state_mode == 'ego':
+        o = s[..., self.DIM_EGO:self.DIM_EGO + self.DIM_OTHERS].reshape(
+            *lead, 8, 4)
+        if getattr(self, 'state_mode', 'ego') == 'ego':
             c, sn = torch.cos(phi), torch.sin(phi)
             ex = torch.zeros_like(x)
             ey = torch.zeros_like(y)
@@ -289,14 +335,18 @@ class DiscreteIDCAgent:
         else:
             ex, ey, ephi = x, y, phi
             rx, ry, dphi = o[..., 0], o[..., 1], o[..., 2]
-
-        ego_enc = torch.stack([ex, ey, s[..., 2], ephi], dim=-1)      # 4 维
+        ego_enc = torch.stack([ex, ey, s[..., 2], ephi], dim=-1)
         others_enc = torch.stack([rx, ry, dphi, o[..., 3]], dim=-1).reshape(
-            *lead, self.DIM_OTHERS)                                   # 32 维
-        rest = s[..., self.DIM_EGO + self.DIM_OTHERS:]                # 28 维
+            *lead, self.DIM_OTHERS)
+        rest = s[..., self.DIM_EGO + self.DIM_OTHERS:]
         return torch.cat([ego_enc, others_enc, rest], dim=-1)
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        if getattr(self, 'state_ver', 0) >= 1:
+            # 前 64 维 = 旧模型口径（RunningNorm）；后 18 维已在构造时归一化
+            base = x[..., :64]
+            base = self.input_norm(base) if self.obs_norm else base
+            return torch.cat([base, x[..., 64:]], dim=-1)
         return self.input_norm(x) if self.obs_norm else x
 
     def _policy(self, s_window: torch.Tensor) -> torch.Tensor:
@@ -330,7 +380,10 @@ class DiscreteIDCAgent:
                 np.stack(batch_windows)).to(self.device)
             enc_window = self._encode(window_tensor)
             # 用"策略实际访问到的状态分布"更新归一化统计（只取当前帧）
-            self.input_norm.update(enc_window[:, -1, :])
+            if getattr(self, 'state_ver', 0) == 0:
+                self.input_norm.update(enc_window[:, -1, :])
+            else:
+                self.input_norm.update(enc_window[:, -1, :64])
             raw_output = self._policy(window_tensor)
             batch_size = raw_output.shape[0]
             raw_output = raw_output.view(batch_size, self.max_agents, 2)
@@ -516,6 +569,14 @@ class DiscreteIDCAgent:
                                           curv_ahead, spd_ahead, road_ahead], dim=-1)
         
         # 组合并返回最终状态
+        if getattr(self, 'state_ver', 0) >= 1:
+            _base = (self.DIM_EGO + self.DIM_OTHERS + self.DIM_VALIDITY
+                     + self.DIM_REF_ERROR + self.DIM_TEMPORAL)
+            _extra = states[:, _base:_base + self.DIM_EXTRA]   # 单步近似：原样带过去
+            return torch.cat([ego_next_formatted, others_next.view(len(states), -1),
+                              validity_tensors, ref_error_tensors,
+                              temporal_next.unsqueeze(-1).float(),
+                              _extra, veh_len], dim=-1)
         return torch.cat([ego_next_formatted, others_next.view(len(states), -1),
                           validity_tensors, ref_error_tensors,
                           temporal_next.unsqueeze(-1).float(), veh_len], dim=-1)

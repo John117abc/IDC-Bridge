@@ -114,7 +114,7 @@ class PlannerRuntime:
                 _dm['ego'].append((x, y))
                 self._save_dump()
 
-    def _ensure_pack(self, env, w):
+    def _ensure_pack(self, env, w, step=0):
         """惰性加载场景 JSON，用离线同一套特征实现（P0）。"""
         if w in self.packs:
             return self.packs[w]
@@ -123,6 +123,20 @@ class PlannerRuntime:
             from env.planner_features import load_pack
             idx = list(env.data_loader.indices)[w]
             pk = load_pack(str(env.data_loader.dataset[idx]))
+            # 坐标对齐：用自车观测与 pack 自身 ego_pos 之差（与坐标系定义无关）
+            try:
+                _obs = self.buf[w][-1]
+                _t = int(min(10 + int(step), len(pk.ego_pos) - 1))
+                _ref = pk.ego_pos[_t]
+                pk.shift(float(_obs[0]) - float(_ref[0]),
+                         float(_obs[1]) - float(_ref[1]))
+                if getattr(self, 'debug', False):
+                    print('[RT][align] w=%d obs=(%.1f,%.1f) pack_ego=(%.1f,%.1f) '
+                          'seg=%d' % (w, float(_obs[0]), float(_obs[1]),
+                                      float(_ref[0]), float(_ref[1]),
+                                      len(pk.seg_a)), flush=True)
+            except Exception as _me:
+                print(f'[RT] world{w} 对齐失败: {_me}', flush=True)
         except Exception as _e:
             print(f'[RT] world{w} ScenePack 加载失败: {_e}', flush=True)
         self.packs[w] = pk
@@ -243,7 +257,7 @@ class PlannerRuntime:
                     continue
                 full = np.asarray(o, np.float32) - np.asarray(o[lo], np.float32) + np.array([x, y], np.float32)
                 paths[w] = full[None]
-                speeds[w] = np.full((1, N_ENV), self.speed_ref, np.float32)
+                speeds[w] = self._speeds_from_path(paths[w][0], N_ENV)
                 tgt[w] = np.array([x, y], np.float32)
         else:
             for w in range(builder.num_worlds):
@@ -251,8 +265,17 @@ class PlannerRuntime:
                     continue
                 a = int(ego_indices[w])
                 ego, (x, y, h) = self._ego_feat(w)
-                pk = self._ensure_pack(env, w)
+                pk = self._ensure_pack(env, w, step)
                 if pk is not None:
+                    if self.debug and step == 0:
+                        _sa = pk.seg_a
+                        _dd = (float(np.linalg.norm(_sa - np.array([x, y])[None], axis=1).min())
+                               if len(_sa) else -1.0)
+                        print('[RT][pack] w=%d seg=%d agents=%d ego_pos=%d '
+                              'nearest_seg_d=%.1f first_seg=%s'
+                              % (w, len(_sa), len(pk.agents), len(pk.ego_pos),
+                                 _dd, np.round(_sa[0], 1) if len(_sa) else None),
+                              flush=True)
                     _t = min(10 + int(step), 90)
                     h = -h            # env 的 yaw 与日志反向
                     ego = pk.ego_feat(_t)
@@ -337,6 +360,19 @@ class PlannerRuntime:
         self._save_dump()
 
     # ---------------- 工具 ----------------
+    def _speeds_from_path(self, path, n=None):
+        """由轨迹点间距推隐含速度（dt=0.1 时 SPAN=1 点/0.1s）。"""
+        P = np.asarray(path, np.float32)
+        n = n or P.shape[0]
+        if len(P) < 2:
+            return np.full((1, n), 5.0, np.float32)
+        d = np.linalg.norm(np.diff(P, axis=0), axis=1) / 0.1
+        d = np.clip(d, 0.5, 25.0)
+        v = np.r_[d, d[-1]]
+        if len(v) < n:
+            v = np.r_[v, np.full(n - len(v), v[-1])]
+        return v[:n][None].astype(np.float32)
+
     @staticmethod
     def _densify(p8, n=40):
         t_src = np.linspace(0, 4.0, len(p8))

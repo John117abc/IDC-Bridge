@@ -149,7 +149,7 @@ def evaluate(config):
         root=config.data_dir,
         batch_size=config.num_worlds,
         dataset_size=config.num_worlds,
-        sample_with_replacement=True,
+        sample_with_replacement=False,
         shuffle=True,
         seed=config.seed if config.seed is not None else random.randint(0, 999999),
     )
@@ -365,7 +365,7 @@ def evaluate(config):
         install_external(builder_, ego_idx, paths_, speeds_,
                          target_pos=tgt_,
                          last_valid_idx={w: 41 for w in paths_},
-                         blend_tail=False, maps=_maps)   # 两种模式同一套参考布局
+                         blend_tail=True, tail_idx=41, maps=_maps)
 
     for epoch in range(config.epochs):
         obs = env.reset()

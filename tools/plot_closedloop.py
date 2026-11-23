@@ -7,9 +7,14 @@ from matplotlib.patches import Polygon
 from PIL import Image
 import io, os
 
-Z = np.load('/mnt/2T_HDD/plant2_vector/dbg.npz')
+import sys
+SRC = sys.argv[1] if len(sys.argv) > 1 else '/mnt/2T_HDD/plant2_vector/dbg.npz'
+TAG = sys.argv[2] if len(sys.argv) > 2 else 'cl'
+Z = np.load(SRC)
 route, pred, pose, ctrl = Z['route'], Z['pred'], Z['pose'], Z['ctrl']
 modes, mp, mm = Z['modes'], Z['mp'], Z['mm']
+ag = Z['ag'] if 'ag' in Z.files else None
+am = Z['am'] if 'am' in Z.files else None
 N = len(route)
 print('frames', N, 'modes', modes.shape)
 
@@ -29,6 +34,21 @@ def draw(i, ax2):
         dx, dy = np.cos(hh) * ln / 2, np.sin(hh) * ln / 2
         for a, b, u, w in zip(mx - dx, my - dy, mx + dx, my + dy):
             ax2.plot([a, u], [b, w], '-', lw=0.8, c='#b0bec5', zorder=1)
+    # 周车（ego 系框 + 速度箭头）
+    if ag is not None:
+        for k in range(len(am[i])):
+            if am[i][k] < 0.5:
+                continue
+            px, py = float(ag[i][k, 0]), float(ag[i][k, 1])
+            dh = float(np.arctan2(ag[i][k, 3], ag[i][k, 2]))
+            L = max(float(ag[i][k, 5]), 1.0)
+            W = max(float(ag[i][k, 6]), 0.5)
+            cc, ss = np.cos(dh), np.sin(dh)
+            pts = np.array([[-L/2,-W/2],[L/2,-W/2],[L/2,W/2],[-L/2,W/2]])
+            Rm = np.array([[cc,-ss],[ss,cc]])
+            poly = (pts @ Rm.T) + np.array([px, py])
+            ax2.add_patch(Polygon(poly, closed=True, fc='#ffb74d',
+                                  ec='#e65100', lw=0.6, alpha=0.9, zorder=5))
     r = route[i]
     rv = np.abs(r[:, 0]) + np.abs(r[:, 1]) > 0
     if rv.sum() >= 2:
@@ -46,8 +66,8 @@ def draw(i, ax2):
     ax2.set_ylim(-22, 22)
     ax2.set_aspect('equal')
     ax2.grid(alpha=0.3)
-    ax2.set_title('f%03d  v=%.1f  steer=%.2f  thr=%.2f' %
-                  (i, v, ctrl[i, 0], ctrl[i, 1]), fontsize=9)
+    ax2.set_title('f%03d  v=%.1f  steer=%.2f  thr=%.2f  brk=%.2f' %
+                  (i, v, ctrl[i, 0], ctrl[i, 1], ctrl[i, 2]), fontsize=9)
     if i == 0:
         ax2.legend(fontsize=7, loc='upper right')
 
@@ -76,7 +96,7 @@ fig4, ax4 = plt.subplots(2, 2, figsize=(13, 9))
 for _ax, _i in zip(ax4.ravel(), idxs):
     draw(_i, _ax)
 plt.tight_layout()
-plt.savefig('/mnt/2T_HDD/plant2_vector/cl_frames.png', dpi=100)
+plt.savefig('/mnt/2T_HDD/plant2_vector/%s_frames.png' % TAG, dpi=100)
 print('saved frames fig')
 
 fig, axes = plt.subplots(1, 2, figsize=(13, 4.6),
@@ -101,8 +121,8 @@ for i in list(range(0, N, step))[:90]:
     buf.seek(0)
     frames.append(Image.open(buf).convert('RGB').copy())
     if len(frames) == 1:
-        frames[0].save('/mnt/2T_HDD/plant2_vector/cl_sample.png')
+        frames[0].save('/mnt/2T_HDD/plant2_vector/%s_sample.png' % TAG)
 imgs = [im.resize((im.width // 2, im.height // 2)) for im in frames]
-imgs[0].save('/mnt/2T_HDD/plant2_vector/cl_view.gif', save_all=True,
+imgs[0].save('/mnt/2T_HDD/plant2_vector/%s_view.gif' % TAG, save_all=True,
              append_images=imgs[1:], duration=140, loop=0)
 print('saved gif', len(imgs))

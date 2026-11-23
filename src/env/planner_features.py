@@ -43,10 +43,20 @@ class ScenePack:
             q = o['position']
             if len(q) < HIST + T_FUT + 1:
                 continue
+            _pos = np.asarray([[p['x'], p['y']] for p in q], np.float64)
+            _val = np.asarray(o.get('valid') or [1] * len(q), np.float64)
+            # Waymo 用 -10000/无效帧占位：按 valid 掩码把无效帧替换为最近有效位置
+            _bad = (_val <= 0.5) | (np.abs(_pos) > 1e4).any(axis=1)
+            if _bad.any():
+                _ok = np.where(~_bad)[0]
+                if len(_ok):
+                    _pos[_bad] = _pos[_ok[0]]
+                else:
+                    _val[:] = 0.0
             self.agents.append(dict(
-                pos=np.asarray([[p['x'], p['y']] for p in q], np.float64),
+                pos=_pos,
                 head=np.asarray(o.get('heading') or [0.0] * len(q), np.float64),
-                valid=np.asarray(o.get('valid') or [1] * len(q)),
+                valid=_val,
                 length=float(o.get('length') or 4.5),
                 width=float(o.get('width') or 1.9)))
         A, B, lane = [], [], []
@@ -63,6 +73,17 @@ class ScenePack:
         self.seg_a = np.asarray(A, np.float64) if A else np.zeros((0, 2))
         self.seg_b = np.asarray(B, np.float64) if B else np.zeros((0, 2))
         self.seg_lane = np.asarray(lane, np.float64) if lane else np.zeros((0,))
+
+    def shift(self, dx, dy):
+        """整体平移（世界坐标 → GPUDrive sim 坐标，差一个逐场景均值）。"""
+        d = np.array([dx, dy], np.float64)
+        if len(self.seg_a):
+            self.seg_a = self.seg_a + d
+            self.seg_b = self.seg_b + d
+        for a in self.agents:
+            a['pos'] = a['pos'] + d
+        if getattr(self, 'ego_pos', None) is not None and len(self.ego_pos):
+            self.ego_pos = self.ego_pos + d
 
     # ---------- ego ----------
     def ego_pose(self, t):

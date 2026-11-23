@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import os
 import glob
 import random
@@ -19,6 +19,8 @@ from utils.config import build_config
 from metrics import PDMSScorer
 
 logger = get_logger('idc-train')
+_PLANNER_CACHE = {'rt': None, 'install': None, 'worlds': None}
+
 
 
 def _eps_at(epoch, config):
@@ -219,7 +221,15 @@ def train(config):
         logger.info(f'正在加载模型: {config.model_path}')
         agent.load(config.model_path)
         current_epoch = agent.globe_eps
-        epochs -= current_epoch
+        import os as _os
+        if int(_os.environ.get('IDC_RESET_SCHEDULE', '0')) >= 1:
+            # 只加载权重、不从旧 epoch 续训（否则 epochs 可能 <= 0，循环直接为空）
+            print(f'[TRACE] 重置调度：旧 globe_eps={current_epoch} → 0，'
+                  f'epochs={config.epochs}', flush=True)
+            current_epoch = 0
+            epochs = config.epochs
+        else:
+            epochs -= current_epoch
 
     logger.info(f'训练开始: epochs={config.epochs}, num_worlds={config.num_worlds}, max_steps={max_step}')
 
@@ -237,9 +247,12 @@ def train(config):
                   else int(getattr(agent, 'globe_eps', 0) or 0))
     logger.info(f'[CANDS] eps 调度锚点 = epoch {EPS_ANCHOR}')
 
+    print('[TRACE] 进入 epoch 循环', flush=True)
     for epoch in range(epochs):
         epoch += current_epoch
+        print(f'[TRACE] epoch={epoch} 即将 env.reset()', flush=True)
         obs = env.reset()
+        print('[TRACE] env.reset() 完成', flush=True)
         for w in range(config.num_worlds):
             builder.reset_world_step(w, 0)
             agent.reset_world_state(w)
@@ -306,6 +319,45 @@ def train(config):
             abs_np_step = env.sim.absolute_self_observation_tensor().to_torch().cpu().numpy()
             rel_np_step = env.sim.self_observation_tensor().to_torch().cpu().numpy()
             partner_np_step = env.sim.partner_observations_tensor().to_torch().cpu().numpy()
+
+            # ---- 在线规划器：每 N 步把规划轨迹注入为候选参考（重训 IDC 用）----
+            if getattr(config, 'planner_runtime', ''):
+                if step == 0 or _PLANNER_CACHE['rt'] is None:
+                    from env.planner_runtime import PlannerRuntime
+                    from env.candidate_sampler import install_external
+                    _rt = PlannerRuntime(
+                        config.planner_runtime,
+                        k=int(getattr(config, 'planner_k', 1)),
+                        replan_every=int(getattr(config, 'planner_replan_every', 5)),
+                        device=getattr(config, 'device', 'cuda'),
+                        mode='planner')
+                    _rt.debug = True
+                    _rt.reset()
+
+                    def _planner_install(b, ego_idx, paths, speeds, tgt,
+                                         _env=env):
+                        _maps = _env.sim.map_observation_tensor().to_torch().cpu().numpy()
+                        install_external(b, ego_idx, paths, speeds,
+                                         target_pos=tgt,
+                                         last_valid_idx={w: 41 for w in paths},
+                                         blend_tail=True, tail_idx=41, maps=_maps)
+                    _PLANNER_CACHE['rt'] = _rt
+                    _PLANNER_CACHE['install'] = _planner_install
+                # 世界被替换（或本步结束）时重置规划器，避免用旧世界数据出规划
+                _cur_worlds = tuple(sorted(int(i) for i in env.data_loader.indices))
+                if _PLANNER_CACHE['worlds'] != _cur_worlds:
+                    if _PLANNER_CACHE['worlds'] is not None:
+                        _PLANNER_CACHE['rt'].reset()
+                        logger.info('[RT] 世界已替换 → 重置规划器缓存')
+                    _PLANNER_CACHE['worlds'] = _cur_worlds
+                try:
+                    _rt = _PLANNER_CACHE['rt']
+                    _rt.observe(env, ego_indices)
+                    if step % max(int(getattr(config, 'planner_replan_every', 5)), 1) == 0:
+                        _rt.maybe_replan(step, env, builder, ego_indices,
+                                         _PLANNER_CACHE['install'])
+                except Exception as _re:
+                    logger.warning(f'[RT] 重规划失败: {_re}')
             _q_start = int(getattr(config, 'q_start_epoch', 10 ** 9))
             _psel_cfg = str(getattr(config, 'path_select', 'q')).lower()
             _psel = 'q' if (epoch >= _q_start and _psel_cfg == 'q') else 'eps'
@@ -347,6 +399,19 @@ def train(config):
                     ego_indices, path_indices=episode_path_indices,
                     _abs_np=abs_np_step, _rel_np=rel_np_step, _partner_np=partner_np_step)
 
+            # --- 诊断：参考索引推进情况（前 5 步） ---
+            if step < 5 and getattr(config, 'planner_runtime', ''):
+                for _w in range(min(2, config.num_worlds)):
+                    _ri = getattr(builder, '_ref_idx', {}).get(_w, -1)
+                    _sc = builder.step_counter[_w] if hasattr(builder, 'step_counter') else -1
+                    _p0 = None
+                    try:
+                        _p0 = builder.candidate_paths[_w][int(ego_indices[_w])][0]['pos'][:2]
+                    except Exception:
+                        pass
+                    print(f'[DBG-ref] step={step} w={_w} _ref_idx={_ri} '
+                          f'step_counter={_sc} path0={None if _p0 is None else _p0.tolist()}',
+                          flush=True)
             wm.filter_per_step(states, step)
 
             ref_start = agent.DIM_EGO + agent.DIM_OTHERS + agent.DIM_VALIDITY
@@ -542,6 +607,10 @@ if __name__ == "__main__":
     parser.add_argument('--no-road-penalty', action='store_true', default=None)
     parser.add_argument('--no-veh-penalty', action='store_true', default=None)
     # ---- 表示层消融开关 ----
+    parser.add_argument('--planner-runtime', default='',
+                        help='在线规划器 checkpoint（每 N 步注入参考）')
+    parser.add_argument('--planner-replan-every', type=int, default=5)
+    parser.add_argument('--planner-k', type=int, default=1)
     parser.add_argument('--state-mode', type=str, default=None,
                         choices=['ego', 'abs'], help='ego=自车系(默认) / abs=绝对坐标')
     parser.add_argument('--ref-mode', type=str, default=None,
@@ -581,6 +650,9 @@ if __name__ == "__main__":
         'no_road_penalty': args.no_road_penalty,
         'no_veh_penalty': args.no_veh_penalty,
         'state_mode': args.state_mode,
+        'planner_runtime': args.planner_runtime,
+        'planner_replan_every': args.planner_replan_every,
+        'planner_k': args.planner_k,
         'ref_mode': args.ref_mode,
         'obs_norm': (None if args.obs_norm is None
                      else args.obs_norm.lower() == 'true'),
