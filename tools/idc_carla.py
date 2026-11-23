@@ -70,6 +70,10 @@ class IDCCarlaPolicy:
         hidden = int(getattr(cfg, 'actor_hidden', 256) or 256)
 
         win = int(getattr(cfg, 'window_size', WINDOW) or WINDOW)
+        self.action_space = str(ck.get('action_space', 'delta_acc'))
+        self.off_max = float(ck.get('off_max', 3.0))
+        print(f'[idc] action_space={self.action_space} off_max={self.off_max}',
+              flush=True)
         self.actor = TransformerActor(
             state_dim=82, d_model=d_model, nhead=nhead,
             num_layers=layers, window_size=win, dropout=drop).to(self.dev).eval()

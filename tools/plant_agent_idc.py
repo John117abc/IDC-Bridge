@@ -356,7 +356,13 @@ class IDCController:
                 route_w = self._route_world(route_ego, pose_carla) if route_ego is not None else None
                 d_prev = float(os.environ.get('VEC_IDC_PREVIEW', '5.0'))
                 off_gain = float(os.environ.get('VEC_IDC_OFF_GAIN', '0.0'))
-                off = -off_gain * d_prev * math.tan(float(delta))   # CARLA 左正/右负
+                if getattr(self.pol, 'action_space', 'delta_acc') == 'off_acc':
+                    # 动作空间 2D：网络直接输出 (横向偏移 m, 加速度 m/s²)
+                    off = float(np.clip(delta, -self.pol.off_max,
+                                        self.pol.off_max))
+                    acc = float(np.clip(acc, -3.0, 1.5))
+                else:
+                    off = -off_gain * d_prev * math.tan(float(delta))
                 if route_w is not None:
                     steer = self._lat.step(PE.shift_path(route_w, off),
                                            float(speed), wpos, wh)
@@ -367,7 +373,15 @@ class IDCController:
                 # 前方窗口取最小值（为最紧的弯减速）+ 帧间低通，避免 v_tgt 抖动
                 _j1 = int(min(_i5 + 8, len(path['speed']) - 1))
                 _v_raw = float(np.min(path['speed'][_i5:_j1 + 1]))
-                _v_raw = float(np.clip(_v_raw + _vg * float(acc), 2.0, 20.0))
+                if getattr(self.pol, 'action_space', 'delta_acc') == 'off_acc':
+                    # 2D 动作空间：加速度意图积分成速度指令（v_cmd += a·dt）
+                    _dt = 0.05 * self.every
+                    _vc = float(getattr(self, '_v_cmd', None) or 2.0)
+                    _vc = float(np.clip(_vc + acc * _dt, 2.0, 20.0))
+                    self._v_cmd = _vc
+                    _v_raw = _vc
+                else:
+                    _v_raw = float(np.clip(_v_raw + _vg * float(acc), 2.0, 20.0))
                 _prev = getattr(self, '_v_tgt_prev', None)
                 v_tgt = _v_raw if _prev is None else 0.8 * _prev + 0.2 * _v_raw
                 self._v_tgt_prev = v_tgt
