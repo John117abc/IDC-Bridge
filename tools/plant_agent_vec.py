@@ -5,6 +5,7 @@
 输出：8 点轨迹（ego 系，0.5 s）→ 置信度 argmax 选模态 → 三次样条密化 41 点 → 纯追踪 + 速度 P 控制
 """
 import os
+import occ_runtime as OCC
 import sys
 
 import numpy as np
@@ -23,6 +24,7 @@ CKPT = os.environ.get('VEC_CKPT', '/mnt/2T_HDD/plant2_vector/ckpt_conf/best.pt')
 ROUTE_ONLY = os.environ.get('VEC_ROUTE_ONLY', '0') == '1'
 VEC_CTRL = os.environ.get('VEC_CTRL', 'pp')
 REC_BC = os.environ.get('VEC_RECORD_BC', '0') == '1'
+VEC_EXPERT = os.environ.get('VEC_EXPERT', '')
 _BC_ID = [0]  # pp=纯追踪, idc=IDC 控制器
 REPLAN_EVERY = max(1, int(os.environ.get('VEC_REPLAN', '5')))
 REC = os.environ.get('VEC_RECORD', '0') == '1'
@@ -37,7 +39,9 @@ def get_entry_point():
 
 class VecAgent(autonomous_agent.AutonomousAgent):
 
-    def setup(self, path_to_conf_file):
+    def setup(self, path_to_conf_file, route_index=None, traffic_manager=None):
+        self.route_index = route_index
+        self._tm_ref = traffic_manager
         self.track = autonomous_agent.Track.SENSORS
         self.step = 0
         self.hist = []
@@ -71,7 +75,10 @@ class VecAgent(autonomous_agent.AutonomousAgent):
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         ck = torch.load(CKPT, map_location='cpu')
         self.K = int(ck.get('K', 6))
-        self.model = Planner(K=self.K).to(self.device)
+        self.use_occ = bool(ck.get('use_occ', False))
+        self.occ_pos = bool(ck.get('occ_pos', False))
+        self.model = Planner(K=self.K, use_occ=self.use_occ,
+                             occ_pos=self.occ_pos).to(self.device)
         self.model.load_state_dict(ck['model'], strict=False)
         self.model.emit_logits = True
         self.model.eval()
@@ -81,9 +88,58 @@ class VecAgent(autonomous_agent.AutonomousAgent):
         print(f'[VecAgent] ckpt={CKPT} K={self.K} rec={REC} route_only={ROUTE_ONLY}', flush=True)
 
     def sensors(self):
-        return [{'type': 'sensor.camera.rgb', 'x': 1.3, 'y': 0.0, 'z': 2.3,
-                 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-                 'width': 640, 'height': 360, 'fov': 90, 'id': 'rgb'}]
+        specs = [{'type': 'sensor.camera.rgb', 'x': 1.3, 'y': 0.0, 'z': 2.3,
+                  'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+                  'width': 640, 'height': 360, 'fov': 90, 'id': 'rgb'}]
+        if VEC_EXPERT == 'autopilot':
+            # 官方 AutoPilot 专家只需要 IMU
+            specs.append({'type': 'sensor.other.imu', 'x': 0.0, 'y': 0.0, 'z': 0.0,
+                          'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+                          'sensor_tick': 0.05, 'id': 'imu'})
+        if os.environ.get('VEC_TOPCAM', '0') == '1':
+            for _id, _t in (('top_rgb', 'sensor.camera.rgb'),
+                            ('top_sem', 'sensor.camera.semantic_segmentation')):
+                specs.append({'type': _t, 'x': 0.0, 'y': 0.0, 'z': 30.0,
+                              'roll': 0.0, 'pitch': -90.0, 'yaw': 0.0,
+                              'width': 320, 'height': 320, 'fov': 60, 'id': _id})
+        return specs
+
+    def _expert_step(self, input_data, timestamp):
+        """用官方 AutoPilot（PDM-Lite 专家）出控制，只用于数据标注。"""
+        if getattr(self, '_exp', None) is None:
+            import importlib.util as _ilu
+            _tc = os.environ.get(
+                'VEC_EXPERT_DIR',
+                '/home/jiangchengxuan/PycharmProjects/research-safe-drive/plant2/'
+                'Bench2Drive/leaderboard/team_code')
+            if _tc not in sys.path:
+                sys.path.insert(0, _tc)
+            _p = os.path.join(_tc, 'autopilot.py')
+            _spec = _ilu.spec_from_file_location('b2d_autopilot', _p)
+            _mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            _cls = getattr(_mod, _mod.get_entry_point())
+            # 新版 leaderboard 的 AutonomousAgent.__init__(carla_host, carla_port)
+            try:
+                self._exp = _cls('localhost', int(os.environ.get('CARLA_PORT', '2000')))
+            except TypeError:
+                self._exp = _cls('', 'localhost', int(os.environ.get('CARLA_PORT', '2000')))
+            self._exp.setup(_tc, getattr(self, 'route_index', 0),
+                            getattr(self, '_tm_ref', None))
+            # 专家需要全局路线（leaderboard 只把它传给了我们，没有传给专家）
+            _gp = getattr(self, '_global_plan', None)
+            if _gp:
+                try:
+                    self._exp.set_global_plan(
+                        _gp, getattr(self, '_global_plan_world_coord', None))
+                    print(f'[VecAgent] 已把全局路线转给专家 ({len(_gp)} 点)', flush=True)
+                    self._gp_sent = True
+                except Exception as _e:            # noqa: BLE001
+                    print(f'[VecAgent] 转交全局路线失败: {_e}', flush=True)
+            else:
+                print('[VecAgent] 警告：全局路线尚未就绪', flush=True)
+            print('[VecAgent] AutoPilot 专家就绪', flush=True)
+        return self._exp.run_step(input_data, timestamp)
 
     def _find_hero(self):
         try:
@@ -456,7 +512,10 @@ class VecAgent(autonomous_agent.AutonomousAgent):
                     mp=np.stack([d['mp'] for d in self.dbg]),
                     ag=np.stack([d['ag'] for d in self.dbg]),
                     am=np.stack([d['am'] for d in self.dbg]),
-                    mm=np.stack([d['mm'] for d in self.dbg]))
+                    mm=np.stack([d['mm'] for d in self.dbg]),
+                    occ=np.stack([d['occ'] if d.get('occ') is not None
+                                  else np.zeros((3, 64, 64), np.uint8)
+                                  for d in self.dbg]))
                 print('[VecAgent] dbg saved', len(self.dbg), '-> dbg_%d.npz' % _i, flush=True)
                 self.dbg = []
         except Exception as e:
@@ -519,11 +578,86 @@ class VecAgent(autonomous_agent.AutonomousAgent):
         self._tm = tm
         self._tm_ready = True
 
+    def _topview_dump(self, input_data, tag):
+        """保存俯视 RGB/语义图 + 打印 15 m 内 actor 类型"""
+        import numpy as np
+        try:
+            from PIL import Image
+        except Exception:
+            return
+        outdir = '/mnt/2T_HDD/plant2_vector/topview'
+        os.makedirs(outdir, exist_ok=True)
+        for key, name in (('top_rgb', 'rgb'), ('top_sem', 'sem')):
+            d = input_data.get(key)
+            if d is None:
+                continue
+            arr = d[1] if isinstance(d, (tuple, list)) else d
+            arr = np.asarray(arr)
+            if arr.ndim == 3 and arr.shape[2] >= 3:
+                if name == 'sem':
+                    tags = arr[:, :, 2]          # 语义标签在 B 通道
+                    Image.fromarray(tags, mode='L').save(
+                        os.path.join(outdir, f'{tag}_{name}_tag.png'))
+                    uniq, cnt = np.unique(tags, return_counts=True)
+                    top = sorted(zip(cnt, uniq), reverse=True)[:8]
+                    print(f'[TOPVIEW] {tag} 语义标签 top: '
+                          f'{[(int(u), int(c)) for c, u in top]}', flush=True)
+                else:
+                    Image.fromarray(arr[:, :, :3][:, :, ::-1]).save(
+                        os.path.join(outdir, f'{tag}_{name}.png'))
+        t = self._vehicle.get_transform()
+        near = []
+        for a in self._vehicle.get_world().get_actors():
+            at = a.get_transform()
+            d = float(np.hypot(at.location.x - t.location.x,
+                               at.location.y - t.location.y))
+            if d < 15.0:
+                near.append((round(d, 1), a.type_id))
+        near.sort()
+        print(f'[TOPVIEW] {tag} 周围 actor: {near[:10]}', flush=True)
+
+    def _occ_tensor(self):
+        """运行时占据栅格 → (1,3,64,64) float（与训练同口径）"""
+        import numpy as _np
+        import torch as _torch
+        try:
+            if os.environ.get('VEC_OCC_OFF', '0') == '1':
+                o = _np.zeros((3, 64, 64), _np.uint8)
+            else:
+                o = OCC.rasterize(self._vehicle.get_world(), self._vehicle)
+                self._last_occ = OCC.summarize(o)
+                self._last_occ_arr = o
+            if self.step % 100 == 0:
+                print(f'[OCC] step={self.step} '
+                      f'{getattr(self, "_last_occ", {})}', flush=True)
+            return _torch.tensor(o[None]).float().to(self.device)
+        except Exception as _e:      # noqa: BLE001
+            print(f'[OCC] 失败 {_e}', flush=True)
+            return None
+
     @torch.inference_mode()
     def run_step(self, input_data, timestamp):
         if self._vehicle is None:
             self._vehicle = self._find_hero()
         pose = self._pose()
+        if os.environ.get('VEC_TOPVIEW', '0') == '1' and self.step % 100 == 0:
+            try:
+                import numpy as _np
+                t = self._vehicle.get_transform()
+                w = self._vehicle.get_world()
+                props = w.get_actors().filter('static.prop.*')
+                near = []
+                for a in props:
+                    at = a.get_transform()
+                    d = float(_np.hypot(at.location.x - t.location.x,
+                                        at.location.y - t.location.y))
+                    if d < 20.0:
+                        near.append((round(d, 1), a.type_id))
+                near.sort()
+                print(f'[PROPS] step={self.step} 全场 static.prop={len(props)} '
+                      f'20m内={len(near)} 明细={near[:6]}', flush=True)
+            except Exception as _e:      # noqa: BLE001
+                print(f'[PROPS] 失败: {_e}', flush=True)
         # ---- TM 模式：用 CARLA 交通管理器作为“oracle 执行器”跟踪 route ----
         if VEC_CTRL == 'tm':
             if not getattr(self, '_tm_ready', False):
@@ -544,7 +678,8 @@ class VecAgent(autonomous_agent.AutonomousAgent):
             if REC_BC:
                 _rdir = os.environ.get('VEC_BC_DIR',
                                        '/mnt/2T_HDD/plant2_vector/bc')
-                _rec = os.path.join(_rdir, f'bc_{_BC_ID[0]}.npz')
+                # 文件名带 PID：不同采集轮次不会互相覆盖
+                _rec = os.path.join(_rdir, f'bc_{_BC_ID[0]}_{os.getpid()}.npz')
                 _BC_ID[0] += 1
             self._idc = IDCController(
                 os.environ.get('VEC_IDC_CKPT') or CKPT,
@@ -589,7 +724,10 @@ class VecAgent(autonomous_agent.AutonomousAgent):
                 wp = np.stack([v_tgt * 0.5 * np.arange(1, 9), np.zeros(8)], 1)
             k = 0
         else:
-            pred, logits = self.model(*b)
+            if getattr(self, 'use_occ', False):
+                pred, logits = self.model(*b, occ=self._occ_tensor())
+            else:
+                pred, logits = self.model(*b)
             k = int(logits.argmax(1)[0])
             wp_all = pred[0].detach().cpu().numpy()
             wp = wp_all[k]
@@ -617,6 +755,14 @@ class VecAgent(autonomous_agent.AutonomousAgent):
         cs = CubicSpline(t2, pe2, axis=0)
         wp41 = cs(np.linspace(0.0, float(t2[-1]), 41))
         steer, thr, brk = self._control(wp41, pose[3])
+        if VEC_EXPERT == 'autopilot':
+            # 官方 AutoPilot 负责开车；IDC 只构建状态并记录专家动作（DAgger 标注）
+            _ctrl = self._expert_step(input_data, timestamp)
+            if self._idc is not None:
+                self._idc.control(pose, wp, pose[3], route_ego=rp)
+                self._idc.record(_ctrl.steer, _ctrl.throttle, _ctrl.brake)
+            self.step += 1
+            return _ctrl
         if VEC_CTRL == 'idc' and self._idc is not None:
             steer, thr, brk = self._idc.control(pose, wp, pose[3], route_ego=rp)
         elif REC_BC and self._idc is not None:
@@ -657,6 +803,25 @@ class VecAgent(autonomous_agent.AutonomousAgent):
                                           round(_sp, 1)))
                     _near.sort()
                     print(f'[STUCK-DIAG] 最近车(距/型/速)= {_near[:3]}', flush=True)
+                    # 静态设施（锥桶/围挡/标志）——施工场景的关键
+                    _st = []
+                    for _a in self._vehicle.get_world().get_actors().filter('static.prop.*'):
+                        _at = _a.get_transform()
+                        _d = float(np.hypot(_at.location.x - t.location.x,
+                                            _at.location.y - t.location.y))
+                        if _d < 15.0:
+                            _st.append((round(_d, 2), _a.type_id.split('.')[-1]))
+                    _st.sort()
+                    print(f'[STUCK-DIAG] 最近静态物= {_st[:5]}', flush=True)
+                    try:
+                        _dh = math.radians(t.rotation.yaw)
+                        _rx = (rp[:, 0].copy(), rp[:, 1].copy())
+                        _lat = float(np.min(np.abs(rp[np.abs(rp[:, 0]) < 20, 1]))) \
+                            if np.any(np.abs(rp[:, 0]) < 20) else -1.0
+                        print(f'[STUCK-DIAG] 到 route 横向偏移≈ {float(rp[0, 1]):.2f} m',
+                              flush=True)
+                    except Exception:
+                        pass
                     print(f'[STUCK-DIAG] pos=({t.location.x:.1f},{t.location.y:.1f},'
                           f'{t.location.z:.2f}) yaw={t.rotation.yaw:.1f} '
                           f'v={pose[3]:.2f} steer={steer:+.2f} thr={thr:.2f} brk={brk:.2f} '
@@ -669,9 +834,15 @@ class VecAgent(autonomous_agent.AutonomousAgent):
 
         if DEBUG:
             _modes = wp_all if 'wp_all' in dir() else None
+            _occ_r = None
+            try:
+                if getattr(self, '_last_occ_arr', None) is not None:
+                    _occ_r = self._last_occ_arr.copy()
+            except Exception:
+                pass
             self.dbg.append(dict(route=rp.copy(), pred=wp.copy(), modes=_modes,
                                 pose=np.array(pose, np.float64), mp=mp.copy(), mm=mm.copy(), ag=ag.copy(), am=am.copy(),
-                                steer=steer, thr=thr, brk=brk, k=k))
+                                steer=steer, thr=thr, brk=brk, k=k, occ=_occ_r))
         self.step += 1
         if DEBUG and self.step % 20 == 0:
             _lg = 0.0 if ROUTE_ONLY else float(logits.max())
@@ -682,12 +853,29 @@ class VecAgent(autonomous_agent.AutonomousAgent):
             try:
                 import cv2
                 img = input_data['rgb'][1][:, :, :3].copy()
-                txt = 'v=%.1f thr=%.2f brk=%.2f steer=%.2f mode=%d' % (
-                    float(self._pose()[3]), thr, brk, steer, k)
-                cv2.putText(img, txt, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                            (0, 0, 0), 3, cv2.LINE_AA)
-                cv2.putText(img, txt, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                            (255, 255, 255), 1, cv2.LINE_AA)
+                _v = float(self._pose()[3])
+                _lg = 0.0 if ROUTE_ONLY else float(logits.max())
+                _lines = [
+                    'v=%5.2f m/s   mode=%d   logit=%5.2f' % (_v, k, _lg),
+                    'thr=%.2f  brk=%.2f  steer=%+.3f' % (thr, brk, steer),
+                ]
+                try:
+                    if getattr(self, 'use_occ', False) and getattr(self, '_last_occ', None):
+                        o = self._last_occ
+                        _lines.append('occ  veh=%.3f ped=%.3f sta=%.3f blocked=%d'
+                                      % (o['veh'], o['ped'], o['sta'], o['blocked']))
+                except Exception:
+                    pass
+                _h = 30 * len(_lines) + 10
+                _ov = img.copy()
+                cv2.rectangle(_ov, (0, 0), (430, _h), (0, 0, 0), -1)
+                cv2.addWeighted(_ov, 0.55, img, 0.45, 0, img)
+                for _i, _t in enumerate(_lines):
+                    _y = 30 + 30 * _i
+                    cv2.putText(img, _t, (10, _y), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.62, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(img, _t, (10, _y), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.62, (255, 255, 255), 1, cv2.LINE_AA)
                 cv2.imwrite(os.path.join(REC_DIR, 'frame_%05d.png' % self.step),
                             img[:, :, ::-1])
             except Exception as e:

@@ -147,7 +147,8 @@ def build(route_dir, map_npz):
         gt = np.stack([_to_ego(np.array([[frames[i + t * STEP][2]['wx'],
                                           frames[i + t * STEP][2]['wy']]]), p0, h0)[0]
                        for t in range(1, T_FUT + 1)]).astype(np.float32)
-        out.append(dict(ego=ego_feat, agent=ag, amask=am, map=mp, mmask=mm, gt=gt))
+        out.append(dict(ego=ego_feat, agent=ag, amask=am, map=mp, mmask=mm, gt=gt,
+                        fid=int(frames[i][0])))
     return out
 
 

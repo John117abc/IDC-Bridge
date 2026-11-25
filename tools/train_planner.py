@@ -50,13 +50,25 @@ BIAS_LAT = np.array([-2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
 
 # ---------------- 模型 ----------------
 class Planner(nn.Module):
-    def __init__(self, K=K_DEF, d=256, layers=4, heads=8, dropout=0.1):
+    def __init__(self, K=K_DEF, d=256, layers=4, heads=8, dropout=0.1,
+                 use_occ=False, occ_pos=False):
         super().__init__()
         self.K = K
         self.ego_proj = nn.Linear(23, d)
         self.ag_proj = nn.Linear(28, d)
         self.mp_proj = nn.Linear(7, d)
-        self.type_emb = nn.Parameter(torch.zeros(3, d))
+        self.use_occ = bool(use_occ)
+        self.type_emb = nn.Parameter(torch.zeros(4 if use_occ else 3, d))
+        self.occ_pos = bool(occ_pos) and self.use_occ
+        if self.use_occ:
+            # 占据栅格 3×64×64 → 8×8 patch → 64 token
+            self.occ_conv = nn.Conv2d(3, 32, kernel_size=8, stride=8)
+            self.occ_proj = nn.Linear(32, d)
+        if self.occ_pos:
+            # 每个 patch 的中心 (x,y)（自车系、米）→ 傅里叶特征 → d 维
+            self.register_buffer('occ_xy', self._occ_patch_xy())
+            self.occ_pos_mlp = nn.Sequential(
+                nn.Linear(18, d // 2), nn.GELU(), nn.Linear(d // 2, d))
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d, nhead=heads, dim_feedforward=4 * d,
             dropout=dropout, batch_first=True, norm_first=True)
@@ -73,18 +85,47 @@ class Planner(nn.Module):
         self.register_buffer('anchors', torch.zeros(K, 8, 2))
         self.res_scale = 3.0
 
-    def forward(self, ego, ag, amask, mp, mmask):
+    @staticmethod
+    def _occ_patch_xy():
+        """64 个 8×8 patch 的中心坐标（自车系，米）；行=x 前后，列=y 左右"""
+        xs = torch.arange(8).float() * 8 * 0.5 + 3.5 * 0.5 + (-8.0)
+        ys = torch.arange(8).float() * 8 * 0.5 + 3.5 * 0.5 + (-16.0)
+        X, Y = torch.meshgrid(xs, ys)
+        return torch.stack([X.reshape(-1), Y.reshape(-1)], 1)      # (64,2)
+
+    def forward(self, ego, ag, amask, mp, mmask, occ=None):
         B = ego.shape[0]
         tok = torch.cat([self.ego_proj(ego).unsqueeze(1),
                          self.ag_proj(ag), self.mp_proj(mp)], 1)
-        tok = tok + self.type_emb[None, :1, :].expand(
-            -1, 1, -1).repeat(1, 1, 1)
-        types = torch.cat([
-            torch.zeros(1, dtype=torch.long), torch.ones(ag.shape[1], dtype=torch.long),
-            torch.full((mp.shape[1],), 2, dtype=torch.long)]).to(ego.device)
+        occ_tok = None
+        if self.use_occ and occ is not None:
+            o = occ.float()
+            if o.dim() == 3:
+                o = o[None]
+            f = self.occ_conv(o).flatten(2).transpose(1, 2)   # (B,64,32)
+            occ_tok = self.occ_proj(f)                        # (B,64,d)
+            if getattr(self, 'occ_pos', False):
+                xy = self.occ_xy.to(occ_tok.device) / 32.0    # 归一化到 [-1,1]
+                feats = [xy]
+                for k in (1, 2, 4, 8):                        # 傅里叶特征
+                    feats += [torch.sin(k * 3.1416 * xy), torch.cos(k * 3.1416 * xy)]
+                pos = self.occ_pos_mlp(torch.cat(feats, 1))[None]     # (1,64,d)
+                occ_tok = occ_tok + pos
+            tok = torch.cat([tok, occ_tok], 1)
+
+        _tl = [torch.zeros(1, dtype=torch.long),
+               torch.ones(ag.shape[1], dtype=torch.long),
+               torch.full((mp.shape[1],), 2, dtype=torch.long)]
+        if occ_tok is not None:
+            _tl.append(torch.full((occ_tok.shape[1],), 3, dtype=torch.long))
+        types = torch.cat(_tl).to(ego.device)
         tok = tok + self.type_emb[types][None]
         pad = torch.cat([torch.zeros(B, 1, dtype=torch.bool, device=ego.device),
                          amask < 0.5, mmask < 0.5], 1)
+        if occ_tok is not None:
+            pad = torch.cat([pad, torch.zeros(B, occ_tok.shape[1],
+                                              dtype=torch.bool,
+                                              device=ego.device)], 1)
         F = self.encoder(tok, src_key_padding_mask=pad)
         q = self.queries[None].expand(B, -1, -1)
         out, _ = self.cross(q, F, F, key_padding_mask=pad)

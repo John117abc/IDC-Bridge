@@ -59,7 +59,11 @@ def main():
         routes = _r if args.max_routes <= 0 else _r[:args.max_routes]
         if not routes:
             print(f'{sc}: 无 route 目录'); continue
-        agg = {k: [] for k in ('ego', 'agent', 'amask', 'map', 'mmask', 'route', 'gt')}
+        _done = os.path.join(args.out, f'{sc}.npz')
+        if os.environ.get('SKIP_DONE', '1') == '1' and os.path.exists(_done):
+            print(f'{sc}: 已完成，跳过', flush=True); continue
+        agg = {k: [] for k in ('ego', 'agent', 'amask', 'map', 'mmask',
+                              'route', 'gt', 'occ', 'fid')}
         n_ok = n_bad = 0
         for rd in routes:
             town = os.path.basename(rd).split('_')[0]
@@ -74,6 +78,16 @@ def main():
                 print(f'  {os.path.basename(rd)}: 失败 {e}'); n_bad += 1; continue
             if not samp or res is None:
                 n_bad += 1; continue
+            # 占据栅格：occupancy/<scenario>__<route_dir>.npz（frame_ids + occ）
+            _occ = {}
+            _of = os.path.join('/mnt/2T_HDD/plant2_vector/occupancy',
+                               f'{sc}__{os.path.basename(rd)}.npz')
+            if os.path.exists(_of):
+                _z = np.load(_of)
+                for _fid, _o in zip(_z['frame_ids'], _z['occ']):
+                    _occ[int(_fid)] = _o
+            for _d in samp:
+                _d['occ'] = _occ.get(int(_d['fid']), np.zeros((3, 64, 64), np.uint8))
             rw = res[0]
             seg = np.linalg.norm(np.diff(rw, axis=0), axis=1)
             s = np.r_[0.0, np.cumsum(seg)]
