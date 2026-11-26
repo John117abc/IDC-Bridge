@@ -193,3 +193,64 @@ def others_from_world(ego_pose, actors_xyh_speed):
         rows.append((math.hypot(gx - x, gy - y), [gx, gy, gh, sp]))
     rows.sort(key=lambda r: r[0])
     return [r[1] for r in rows[:N_OTHER]]
+
+
+
+def build_path_ext(plan_ego, pose, target_len=28.0, v_floor=3.0, v_max=14.0,
+                   a_lat=2.0):
+    """规划 8 点 → 外推到 target_len 的可执行参考路径（plan2）
+
+    沿**弧长**用 PCHIP 插值（不振荡），解析求航向/曲率；
+    速度 = min(规划速度, 曲率限速)，带下限。
+    """
+    from scipy.interpolate import PchipInterpolator
+    wp = np.asarray(plan_ego, np.float64).reshape(-1, 2)
+    pts = np.vstack([[0.0, 0.0], wp])
+
+    d_end = wp[-1] - wp[-2]
+    sp_end = float(np.linalg.norm(d_end) / 0.5)
+    if sp_end < 1.0:
+        sp_end = 3.0
+    unit = d_end / max(float(np.linalg.norm(d_end)), 1e-6)
+
+    L = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+    while L < target_len:
+        pts = np.vstack([pts, pts[-1] + unit * 1.0])
+        L += 1.0
+
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    s_arc = np.r_[0.0, np.cumsum(seg)]
+    keep = np.r_[True, seg > 1e-6]
+    s_arc, pts = s_arc[keep], pts[keep]
+
+    fx = PchipInterpolator(s_arc, pts[:, 0])
+    fy = PchipInterpolator(s_arc, pts[:, 1])
+    ss = np.arange(0.0, s_arc[-1], 0.5)
+    pe = np.stack([fx(ss), fy(ss)], 1)
+    dx, dy = fx(ss, 1), fy(ss, 1)
+    ddx, ddy = fx(ss, 2), fy(ss, 2)
+    sp2 = np.maximum(dx ** 2 + dy ** 2, 1e-9)
+    kap = np.abs(dx * ddy - dy * ddx) / (sp2 ** 1.5)
+
+    plan_speed = float(np.median(np.linalg.norm(np.diff(wp, axis=0), axis=1)) / 0.5)
+
+    x, y, h = float(pose[0]), float(pose[1]), float(pose[2])
+    c, sn = math.cos(h), math.sin(h)
+    pos_w = np.stack([x + pe[:, 0] * c - pe[:, 1] * sn,
+                      y + pe[:, 0] * sn + pe[:, 1] * c], 1)
+    heading_e = np.unwrap(np.arctan2(dy, dx)) + h
+
+    v_curv = np.clip(np.sqrt(a_lat / np.maximum(kap, 1e-4)), v_floor, v_max)
+    v_des = float(np.clip(plan_speed, v_floor, v_max))
+    v = np.minimum(v_curv, v_des)
+
+    return dict(pos=pos_w.astype(np.float32),
+                heading=heading_e.astype(np.float32),
+                speed=v.astype(np.float32),
+                road_dist=np.full(len(pos_w), 200.0, np.float32),
+                curv_ahead=kap.astype(np.float32),
+                spd_ahead=v.astype(np.float32),
+                road_ahead=np.full(len(pos_w), 200.0, np.float32),
+                last_valid_idx=len(pos_w) - 1,
+                plan_speed=plan_speed,
+                path_len=float(s_arc[-1]))

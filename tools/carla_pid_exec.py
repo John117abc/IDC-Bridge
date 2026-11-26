@@ -92,16 +92,24 @@ class LongitudinalPID:
             return 0.0, 1.0
         tgt = max(LON_MIN_TARGET, float(target_speed))
         v_now, v_tgt = 3.6 * float(speed), 3.6 * tgt      # km/h
-        if v_tgt > 1e-3 and v_now / v_tgt > LON_BRAKE_RATIO:
-            return 0.0, 1.0
+        kp = float(os.environ.get('VEC_LON_KP', '0.8'))
+        kd = float(os.environ.get('VEC_LON_KD', '0.25'))
+        ki = float(os.environ.get('VEC_LON_KI', '0.05'))
+        ratio = float(os.environ.get('VEC_LON_RATIO', '1.10'))
         err = v_tgt - v_now
         d_err = 0.0 if self.prev_err is None else (err - self.prev_err) / max(dt, 1e-3)
         self.prev_err = err
-        u = LON_KP * err + LON_KD * d_err + LON_KI * np.clip(err * dt, -5, 5)
-        # 油门标定：err=10 km/h 时约 0.5 油门（原来除以 100 太弱，车只能爬行）
+        u = kp * err + kd * d_err + ki * np.clip(err * dt, -5, 5)
         gain = float(os.environ.get('VEC_LON_SCALE', '20.0'))
         throttle = float(np.clip(u / gain, 0.0, 1.0))
-        brake = float(np.clip(-u / gain, 0.0, 1.0)) if u < -2.0 else 0.0
+        # 比例刹车：越过目标 ratio 倍后平滑加压，不再满刹
+        brake = 0.0
+        if v_tgt > 1e-3:
+            over = v_now / v_tgt - ratio
+            if over > 0:
+                brake = float(np.clip(over * 3.0, 0.0, 1.0))
+        if u < -2.0:
+            brake = max(brake, float(np.clip(-u / gain, 0.0, 1.0)))
         return throttle, brake
 
 
@@ -113,4 +121,10 @@ def shift_path(pts, off):
     d = np.gradient(P, axis=0)
     n = np.stack([-d[:, 1], d[:, 0]], 1)
     n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-6)
-    return P + n * float(off)
+    o = np.asarray(off, np.float64).reshape(-1)
+    if o.size == 1:
+        o = np.full(len(P), float(o[0]))
+    elif o.size != len(P):
+        o = np.interp(np.linspace(0, 1, len(P)),
+                      np.linspace(0, 1, o.size), o)
+    return P + n * o.reshape(-1, 1)

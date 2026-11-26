@@ -38,6 +38,11 @@ def load_all(paths):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--occ-aux", action="store_true",
+                    help="占据栅格 aux 重建监督")
+    ap.add_argument("--lam-occ", type=float, default=0.1)
+    ap.add_argument("--aux-pos-weight", type=float, default=20.0,
+                    help="占据为正类的 BCE pos_weight（稀疏补偿）")
     ap.add_argument('--data', default='/mnt/2T_HDD/plant2_vector/vector_ds_occ')
     ap.add_argument('--out', default='/mnt/2T_HDD/plant2_vector/ckpt_occ')
     ap.add_argument('--epochs', type=int, default=40)
@@ -80,7 +85,7 @@ def main():
 
     use_occ = not args.no_occ
     model = Planner(K=args.k, use_occ=use_occ,
-                    occ_pos=bool(args.occ_pos)).to(dev)
+                    occ_pos=bool(args.occ_pos), occ_aux=bool(args.occ_aux)).to(dev)
     model.emit_logits = True
     # 从旧 checkpoint 热启动（去掉 occ 相关层以外都能对上的部分）
     old = os.environ.get('VEC_INIT_CKPT',
@@ -148,6 +153,23 @@ def main():
                 loss_wta = err.gather(1, win[:, None])[:, 0].mean()
                 loss_ce = F.cross_entropy(logits, win)
                 loss = loss_wta + args.lam_ce * loss_ce
+                if getattr(args, 'occ_aux', False) and hasattr(model, 'last_aux'):
+                    _occ_b = b[5].float()
+                    # (B,3,64,64) → 任意通道 → maxpool2 → (B,32,32)
+                    _m = (F.max_pool2d(_occ_b, 2).sum(1) > 0).float()   # (B,32,32)
+                    # 切成 8x8 个 patch，每个 patch 4x4
+                    _tgt = _m.view(-1, 8, 4, 8, 4).permute(0, 1, 3, 2, 4).reshape(-1, 64, 16)
+                    _aux = model.last_aux
+                    if _aux.shape == _tgt.shape:
+                        _pw = torch.tensor(
+                            float(getattr(args, 'aux_pos_weight', 20.0)),
+                            device=_aux.device)
+                        _laux = F.binary_cross_entropy_with_logits(
+                            _aux, _tgt, pos_weight=_pw)
+                        loss = loss + args.lam_occ * _laux
+                        if cnt % 20 == 0:
+                            print('    aux %.4f' % float(_laux), flush=True)
+
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 opt.step()

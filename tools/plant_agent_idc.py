@@ -20,6 +20,7 @@ import frames as F              # noqa: E402
 import idc_carla as IC          # noqa: E402
 import idc_state_carla as S     # noqa: E402
 import carla_pid_exec as PE     # noqa: E402
+import pure_pursuit as PP       # noqa: E402
 
 # CARLA 的 VehicleControl.steer 与我们 canonical(左正) 方向相反，实测需要取负
 STEER_SIGN = float(os.environ.get('VEC_IDC_STEER_SIGN', '-1'))
@@ -57,6 +58,8 @@ class IDCController:
         self.record_path = record_path
         self.rec = []
         self.last_state = None
+        self._sv3 = (os.environ.get('VEC_STATE_V3', '0') == '1'
+                     or bool(getattr(self.pol, 'v3', False)))
         self.every = max(1, int(infer_every))
         self.cnt = 0
         self.ref_idx = 0
@@ -147,6 +150,42 @@ class IDCController:
         VEC_REF_FROM=route 时：路径形状取自 route（长且平缓），
         规划器只贡献**横向偏移**——避免"短规划 → 曲率虚高 → 限速过低"。
         """
+        # ---- plan2：外推 + 样条（开关，默认 legacy）----
+        if os.environ.get('VEC_REF_MODE', 'legacy') == 'plan2':
+            try:
+                pp = S.build_path_ext(
+                    np.asarray(plan_ego, np.float64), pose_carla,
+                    target_len=float(os.environ.get('VEC_PLAN2_LEN', '28')),
+                    v_floor=float(os.environ.get('VEC_PLAN2_VFLOOR', '3.0')),
+                    v_max=float(os.environ.get('VEC_IDC_VMAX', '14')),
+                    a_lat=float(os.environ.get('VEC_IDC_ALAT', '2.0')))
+                pos = np.asarray(pp['pos'], np.float64)
+                hd = np.unwrap(np.asarray(pp['heading'], np.float64))
+                spd = np.asarray(pp['speed'], np.float32)
+                road = np.asarray(pp['road_dist'], np.float32)
+                pos_c = np.stack([pos[:, 0], -pos[:, 1]], 1)
+                hd_c = (-hd).astype(np.float32)
+                if self.tree is not None:
+                    try:
+                        _d, _ = self.tree.query(pos, k=1)
+                        road = np.minimum(np.asarray(_d, np.float32), 200.0)
+                    except Exception:
+                        pass
+                if getattr(self, '_plan2_n', 0) % 20 == 1:
+                    print('[PLAN2] len=%.1f kmax=%.3f v=[%.1f,%.1f] plan_v=%.2f'
+                          % (pp['path_len'], float(np.max(pp['curv_ahead'])),
+                             float(spd.min()), float(spd.max()),
+                             pp['plan_speed']), flush=True)
+                self._plan2_n = getattr(self, '_plan2_n', 0) + 1
+                return dict(pos=pos_c.astype(np.float32), heading=hd_c,
+                            speed=spd, road_dist=road,
+                            curv_ahead=pp['curv_ahead'],
+                            spd_ahead=pp['spd_ahead'],
+                            road_ahead=pp['road_ahead'],
+                            last_valid_idx=len(pos_c) - 1)
+            except Exception as _e:              # noqa: BLE001
+                print('[PLAN2] 失败 %s → 回退 legacy' % _e, flush=True)
+
         if (os.environ.get('VEC_REF_FROM', 'plan') == 'route'
                 and route_ego is not None):
             rw = self._route_world(route_ego, pose_carla)
@@ -202,9 +241,20 @@ class IDCController:
                     kap[i] = dth / ds
                 a_lat = float(os.environ.get('VEC_IDC_ALAT', '2.0'))
                 vmax = float(os.environ.get('VEC_IDC_VMAX', '20.0'))
-                vmin = float(os.environ.get('VEC_IDC_VMIN', '2.0'))
+                vmin = float(os.environ.get('VEC_IDC_VMIN', '0.0'))
                 spd = np.clip(np.sqrt(a_lat / np.maximum(kap, 1e-4)),
                               vmin, vmax).astype(np.float32)
+                try:
+                    if not hasattr(self, '_diag_n'):
+                        self._diag_n = 0
+                    self._diag_n += 1
+                    if self._diag_n % 10 == 1:
+                        _in_y = float(np.max(np.abs(np.asarray(plan_ego)[:, 1])))
+                        _out_y = float(np.max(np.abs(pos[:, 1])))
+                        print(f'[PATHDIAG] n={self._diag_n} plan_y={_in_y:+.2f} '
+                              f'path_y={_out_y:+.2f}', flush=True)
+                except Exception:
+                    pass
                 return dict(pos=pos_c.astype(np.float32), heading=hd_c,
                             speed=spd, road_dist=road,
                             curv_ahead=spd, spd_ahead=spd, road_ahead=road,
@@ -245,7 +295,7 @@ class IDCController:
             kap[i] = dth / ds
         a_lat = float(os.environ.get('VEC_IDC_ALAT', '2.0'))
         vmax = float(os.environ.get('VEC_IDC_VMAX', '20.0'))
-        vmin = float(os.environ.get('VEC_IDC_VMIN', '2.0'))
+        vmin = float(os.environ.get('VEC_IDC_VMIN', '0.0'))
         spd = np.clip(np.sqrt(a_lat / np.maximum(kap, 1e-4)), vmin, vmax).astype(np.float32)
         if self.tree is not None:
             try:
@@ -261,18 +311,64 @@ class IDCController:
                     road_ahead=np.asarray(p['road_ahead'], np.float32),
                     last_valid_idx=len(pos_c) - 1)
 
-    def _safety(self, t, speed):
-        """最小安全层：走廊内若有车/行人且 TTC 过小 → 返回 True（需要刹车）。"""
-        if os.environ.get('VEC_SAFETY', '1') != '1':
-            return False
+    def _vru_canon(self, t, horizon=40.0):
+        """行人/自行车（canonical：y 取反）。"""
+        out = []
+        x, y = t.location.x, t.location.y
+        try:
+            for a in self.world.get_actors().filter('walker.pedestrian.*'):
+                at = a.get_transform()
+                dx, dy = at.location.x - x, at.location.y - y
+                if math.hypot(dx, dy) > horizon:
+                    continue
+                av = a.get_velocity()
+                out.append(dict(x=float(at.location.x),
+                                y=float(-at.location.y),
+                                vx=float(av.x), vy=float(-av.y)))
+        except Exception:
+            return out
+        return out
+
+    def _light_feat(self, t, horizon=50.0):
+        """最近的相关交通灯 → (红/黄/绿 one-hot + 距离)。"""
         x, y = t.location.x, t.location.y
         h = math.radians(t.rotation.yaw)
-        half_w = float(os.environ.get('VEC_SAFE_HALF_W', '3.0'))
-        horizon = float(os.environ.get('VEC_SAFE_HORIZON', '25.0'))
-        ttc_thr = float(os.environ.get('VEC_SAFE_TTC', '3.5'))
+        c, s = math.cos(h), math.sin(h)
+        best = None
+        try:
+            for a in self.world.get_actors().filter('traffic.traffic_light*'):
+                at = a.get_transform()
+                dx, dy = at.location.x - x, at.location.y - y
+                lx = dx * c + dy * s
+                ly = -dx * s + dy * c
+                if lx <= 0.0 or lx > horizon or abs(ly) > 6.0:
+                    continue
+                d = math.hypot(dx, dy)
+                if best is None or d < best[0]:
+                    best = (d, str(a.state))
+        except Exception:
+            return F.light_features(0.0, None)
+        if best is None:
+            return F.light_features(0.0, None)
+        return F.light_features(best[0], best[1])
+
+    def _safety_level(self, t, speed, half_w=3.0, horizon=25.0):
+        """分级安全等级 0..1（0=不干预，1=全力刹）。
+
+        车辆：按 TTC 线性升；
+        行人：按距离分级（8 m 开始，3 m 全力）；
+        静态障碍（锥桶/围挡）：6 m 开始，2.5 m 全力。
+        """
+        if os.environ.get('VEC_SAFETY', '1') != '1':
+            return 0.0
+        x, y = t.location.x, t.location.y
+        h = math.radians(t.rotation.yaw)
         c, s = math.cos(h), math.sin(h)
         v_ego = max(float(speed), 0.0)
-        worst = 9.9
+        level = 0.0
+
+        # --- 车辆：TTC ---
+        ttc_thr = float(os.environ.get('VEC_SAFE_TTC', '3.5'))
         for a in self.world.get_actors().filter('vehicle.*'):
             if a.id == self.veh.id:
                 continue
@@ -286,34 +382,39 @@ class IDCController:
             v_o = math.sqrt(av.x ** 2 + av.y ** 2 + av.z ** 2)
             closing = v_ego - v_o * 0.5
             ttc = lx / max(closing, 0.3)
-            worst = min(worst, ttc)
+            if ttc < ttc_thr:
+                level = max(level, float(np.clip((ttc_thr - ttc) / 2.0, 0.0, 1.0)))
+
+        # --- 行人：按距离分级 ---
+        ped_far = float(os.environ.get('VEC_SAFE_PED_FAR', '8.0'))
+        ped_near = float(os.environ.get('VEC_SAFE_PED_NEAR', '3.0'))
         for a in self.world.get_actors().filter('walker.pedestrian.*'):
             at = a.get_transform()
             dx, dy = at.location.x - x, at.location.y - y
             lx = dx * c + dy * s
             ly = -dx * s + dy * c
-            if lx <= 0.5 or lx > horizon or abs(ly) > half_w:
+            if lx <= 0.0 or lx > ped_far or abs(ly) > half_w:
                 continue
-            # 行人近距离刹车（默认关闭：人多的城镇会频繁停车 → 判卡死）
-            if (os.environ.get('VEC_SAFE_NEAR', '0') == '1'
-                    and lx < float(os.environ.get('VEC_SAFE_PED_DIST', '8.0'))
-                    and abs(ly) < 1.8):
-                return True
-            worst = min(worst, lx / max(v_ego, 0.3))
-        for a in self.world.get_actors().filter('vehicle.*'):
-            if a.id == self.veh.id:
-                continue
-            at = a.get_transform()
-            dx, dy = at.location.x - x, at.location.y - y
-            lx = dx * c + dy * s
-            ly = -dx * s + dy * c
-            if lx <= 0.5 or lx > 12.0 or abs(ly) > half_w * 0.7:
-                continue
-            av = a.get_velocity()
-            v_o = math.sqrt(av.x ** 2 + av.y ** 2 + av.z ** 2)
-            if (os.environ.get('VEC_SAFE_NEAR', '0') == '1' and v_o < 1.0):
-                return True
-        return worst < ttc_thr
+            lvl = float(np.clip((ped_far - lx) / max(ped_far - ped_near, 0.5), 0.0, 1.0))
+            level = max(level, lvl)
+
+        # --- 静态障碍（施工锥桶/围挡/标志）---
+        sp_far = float(os.environ.get('VEC_SAFE_STATIC_FAR', '7.0'))
+        sp_near = float(os.environ.get('VEC_SAFE_STATIC_NEAR', '2.5'))
+        try:
+            for a in self.world.get_actors().filter('static.prop.*'):
+                at = a.get_transform()
+                dx, dy = at.location.x - x, at.location.y - y
+                lx = dx * c + dy * s
+                ly = -dx * s + dy * c
+                if lx <= 0.0 or lx > sp_far or abs(ly) > 2.5:
+                    continue
+                lvl = float(np.clip((sp_far - lx) / max(sp_far - sp_near, 0.5), 0.0, 1.0))
+                level = max(level, lvl)
+        except Exception:
+            pass
+
+        return float(np.clip(level, 0.0, 1.0))
 
     def control(self, pose_carla, plan_ego, speed, route_ego=None):
         """返回 (steer, throttle, brake)。with_policy=False 时只构建状态（录制用）。"""
@@ -326,6 +427,31 @@ class IDCController:
             else:
                 self._stuck_s = 0.0
             if self._stuck_s > _lim:
+                # 卡死诊断：周围有什么 + route 横向偏移
+                try:
+                    t = self.veh.get_transform()
+                    _st, _vh = [], []
+                    for a in self.world.get_actors().filter('static.prop.*'):
+                        at = a.get_transform()
+                        d = float(np.hypot(at.location.x - t.location.x,
+                                           at.location.y - t.location.y))
+                        if d < 15.0:
+                            _st.append((round(d, 2), a.type_id.split('.')[-1]))
+                    for a in self.world.get_actors().filter('vehicle.*'):
+                        if a.id == self.veh.id:
+                            continue
+                        at = a.get_transform()
+                        d = float(np.hypot(at.location.x - t.location.x,
+                                           at.location.y - t.location.y))
+                        if d < 15.0:
+                            _vh.append((round(d, 2), a.type_id.split('.')[-1]))
+                    _st.sort(); _vh.sort()
+                    print(f'[STUCK-DIAG] 静态物={_st[:5]}', flush=True)
+                    print(f'[STUCK-DIAG] 车辆={_vh[:5]}', flush=True)
+                    print(f'[STUCK-DIAG] route 首点横向={float(route_ego[0, 1]):+.2f} m'
+                          if route_ego is not None else '[STUCK-DIAG] 无 route', flush=True)
+                except Exception as _e:               # noqa: BLE001
+                    print(f'[STUCK-DIAG] 诊断失败: {_e}', flush=True)
                 print(f'[IDC] STUCK 车速<0.2 已 {self._stuck_s:.1f}s → 立即终止',
                       flush=True)
                 raise RuntimeError('STUCK_EARLY_ABORT')
@@ -334,11 +460,28 @@ class IDCController:
             ego_c = self._pose_canon(t)
             nbrs = self._neighbors_canon(t.location)
             path = self._path_canon(plan_ego, pose_carla, route_ego)
+            _vru = (F.vru_summary(ego_c, self._vru_canon(t), v_ego=float(speed))
+                    if self._sv3 else None)
+            _light = self._light_feat(t) if self._sv3 else None
+            _edyn = None
+            _cmd = None
+            if self._sv3:
+                try:
+                    _wz = float(self.veh.get_angular_velocity().z)
+                except Exception:
+                    _wz = 0.0
+                _sp = float(self.prev_action[0]) if self.prev_action else 0.0
+                _edyn = F.ego_dyn_features(_sp, getattr(self, 'a_lat', 0.0), -_wz)
+                _i15 = int(min(self.ref_idx + 15, len(path['pos']) - 1))
+                _cmd = F.cmd_features(float(ego_c[2]),
+                                      float(path['heading'][_i15]))
             st, self.ref_idx = IC.make_state84(
                 ego_c, float(speed), nbrs, path, ref_idx=self.ref_idx,
                 veh_len=self.veh.bounding_box.extent.x * 2.0,
                 # 训练时这两项恒为 0，部署必须一致，否则输入 OOD
-                a_lat=0.0, steer_prev=0.0)
+                a_lat=0.0, steer_prev=0.0,
+                v3=self._sv3, vru=_vru, light=_light,
+                ego_dyn=_edyn, cmd=_cmd, remain=0.0)
             self.last_state = st.copy()
             if self.pol is None:            # 录制模式：只出状态，动作由外部给
                 return self.last
@@ -350,6 +493,8 @@ class IDCController:
             if os.environ.get('VEC_EXEC', 'pid') == 'pid':
                 if self._lat is None:
                     self._lat, self._lon = PE.LateralPID(), PE.LongitudinalPID()
+                if getattr(self, '_pp', None) is None:
+                    self._pp = PP.PurePursuit()
                 t = self.veh.get_transform()
                 wpos = (t.location.x, t.location.y)
                 wh = math.radians(t.rotation.yaw)
@@ -358,14 +503,96 @@ class IDCController:
                 off_gain = float(os.environ.get('VEC_IDC_OFF_GAIN', '0.0'))
                 if getattr(self.pol, 'action_space', 'delta_acc') == 'off_acc':
                     # 动作空间 2D：网络直接输出 (横向偏移 m, 加速度 m/s²)
-                    off = float(np.clip(delta, -self.pol.off_max,
-                                        self.pol.off_max))
+                    _omax = float(os.environ.get('VEC_IDC_OFF_MAX',
+                                                 self.pol.off_max))
+                    off = float(np.clip(delta, -_omax, _omax))
                     acc = float(np.clip(acc, -3.0, 1.5))
                 else:
                     off = -off_gain * d_prev * math.tan(float(delta))
                 if route_w is not None:
-                    steer = self._lat.step(PE.shift_path(route_w, off),
-                                           float(speed), wpos, wh)
+                    _path = PE.shift_path(route_w, off)
+                    # ---- TK-OFF2：直接改将被纯追踪消费的 _path ----
+                    try:
+                        _th = int(getattr(self, 'takeover_hold', 0) or 0)
+                        if _th > 0 and os.environ.get('VEC_TAKEOVER', '0') == '1':
+                            _off = float(np.clip(getattr(self, 'takeover_off', 0.0),
+                                                 -4.0, 4.0))
+                            # ---- v0.7 三段式：借出(2~14m) → 保持(14~26m) → 并回(26~38m) ----
+                            _P = np.asarray(route_w, np.float64)
+                            _dd = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(_P, axis=0), axis=1))]
+                            _j0 = int(np.argmin(np.linalg.norm(_P - np.array(wpos), axis=1)))
+                            _ds = _dd - _dd[_j0]
+                            _bar = getattr(self, 'takeover_bar', None)
+                            _b0, _b1 = (float(_bar[0]), float(_bar[1])) if _bar else (8.0, 16.0)
+                            _r0s = max(0.0, _b0 - 8.0)     # 借出起点
+                            _r1s = max(_r0s + 1.0, _b0)    # 到达满偏移
+                            _hs = _b1 + 2.0                # 保持结束
+                            _he = _hs + 10.0               # 并回结束
+                            _o = np.zeros(len(_P))
+                            for _i, _s in enumerate(_ds):
+                                if _r0s <= _s < _r1s:
+                                    _u = (_s - _r0s) / (_r1s - _r0s)
+                                    _o[_i] = _off * (3 * _u ** 2 - 2 * _u ** 3)
+                                elif _r1s <= _s < _hs:
+                                    _o[_i] = _off
+                                elif _hs <= _s < _he:
+                                    _u = (_s - _hs) / (_he - _hs)
+                                    _o[_i] = _off * (1 - (3 * _u ** 2 - 2 * _u ** 3))
+                            _path = PE.shift_path(_P, _o)
+                            self.takeover_hold = _th - 1
+                            if _th % 10 == 0:
+                                print('[TK-PROF] off=%+.2f 剩余=%d 剖面max=%.2f' % (
+                                    _off, _th, float(np.max(np.abs(_o)))), flush=True)
+                    except Exception as _e:              # noqa: BLE001
+                        print('[TK-OFF2] 失败 %s' % _e, flush=True)
+                    # ---- TK-PROFILE：借出→保持→并回 ----
+                    try:
+                        if (int(getattr(self, 'takeover_hold', 0) or 0) > 0
+                                and int(getattr(self, 'takeover_profile', 0) or 0) == 1
+                                and os.environ.get('VEC_TAKEOVER', '0') == '1'):
+                            _dy = float(np.clip(getattr(self, 'takeover_off', 0.0), -4.0, 4.0))
+                            _P = np.asarray(route_w, np.float64)
+                            _d = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(_P, axis=0), axis=1))]
+                            _j0 = int(np.argmin(np.linalg.norm(_P - np.array(wpos), axis=1)))
+                            _ds = _d - _d[_j0]
+                            _o = np.zeros(len(_P))
+                            for _i, _s in enumerate(_ds):
+                                if 2.0 <= _s < 14.0:
+                                    _u = (_s - 2.0) / 12.0
+                                    _o[_i] = _dy * (3 * _u ** 2 - 2 * _u ** 3)
+                                elif 14.0 <= _s < 26.0:
+                                    _o[_i] = _dy
+                                elif 26.0 <= _s < 38.0:
+                                    _u = (_s - 26.0) / 12.0
+                                    _o[_i] = _dy * (1 - (3 * _u ** 2 - 2 * _u ** 3))
+                            _path = PE.shift_path(_P, _o)
+                            self.takeover_hold = int(getattr(self, 'takeover_hold', 0)) - 1
+                            if self.takeover_hold % 10 == 0:
+                                print('[TK-PROF] max_off=%.2f 剩余=%d' % (
+                                    float(np.max(np.abs(_o))), self.takeover_hold), flush=True)
+                    except Exception as _e:              # noqa: BLE001
+                        print('[TK-PROF] 失败 %s' % _e, flush=True)
+                    if os.environ.get('VEC_LAT_MODE', 'pp') == 'pp':
+                        steer = self._pp.step(_path, float(speed), wpos, wh,
+                                              dt=0.05 * self.every)
+                        try:
+                            if not hasattr(self, '_tkdbg_n'):
+                                self._tkdbg_n = 0
+                            self._tkdbg_n += 1
+                            if self._tkdbg_n % 4 == 1:
+                                _dp = np.asarray(_path, np.float64)
+                                _dr = np.asarray(route_w, np.float64)
+                                _j = int(np.argmin(
+                                    np.linalg.norm(_dr - np.array(wpos), axis=1)))
+                                _k = min(_j + 6, len(_dp) - 1, len(_dr) - 1)
+                                _toff = float(np.linalg.norm(_dp[_k] - _dr[_k]))
+                                print('[TK-DBG] n=%d off=%+.3f steer=%+.3f '
+                                      'tgt_dy=%.2f' % (self._tkdbg_n, off, steer,
+                                                       _toff), flush=True)
+                        except Exception as _e:              # noqa: BLE001
+                            print('[TK-DBG] 失败 %s' % _e, flush=True)
+                    else:
+                        steer = self._lat.step(_path, float(speed), wpos, wh)
                 else:
                     steer = 0.0
                 _i5 = int(min(self.ref_idx + 5, len(path['speed']) - 1))
@@ -374,22 +601,38 @@ class IDCController:
                 _j1 = int(min(_i5 + 8, len(path['speed']) - 1))
                 _v_raw = float(np.min(path['speed'][_i5:_j1 + 1]))
                 if getattr(self.pol, 'action_space', 'delta_acc') == 'off_acc':
-                    # 2D 动作空间：加速度意图积分成速度指令（v_cmd += a·dt）
-                    _dt = 0.05 * self.every
-                    _vc = float(getattr(self, '_v_cmd', None) or 2.0)
-                    _vc = float(np.clip(_vc + acc * _dt, 2.0, 20.0))
-                    self._v_cmd = _vc
-                    _v_raw = _vc
+                    # 2D 动作空间
+                    _vmin = float(os.environ.get('VEC_IDC_VMIN', '0.0'))
+                    if os.environ.get('VEC_IDC_LONG_REF', '1') == '1':
+                        # 参考速度 + acc 小幅修正（不积分，避免 acc≈0 时永远起步不了）
+                        _v_ref0 = float(_v_raw)
+                        _v_raw = float(np.clip(_v_ref0 + _vg * float(acc),
+                                               _vmin, 20.0))
+                    else:
+                        _dt = 0.05 * self.every
+                        _vc = float(getattr(self, '_v_cmd', None) or _vmin)
+                        _vc = float(np.clip(_vc + acc * _dt, _vmin, 20.0))
+                        self._v_cmd = _vc
+                        _v_raw = _vc
                 else:
-                    _v_raw = float(np.clip(_v_raw + _vg * float(acc), 2.0, 20.0))
+                    _v_raw = float(np.clip(_v_raw + _vg * float(acc), 0.0, 20.0))
                 _prev = getattr(self, '_v_tgt_prev', None)
-                v_tgt = _v_raw if _prev is None else 0.8 * _prev + 0.2 * _v_raw
+                _a = float(os.environ.get('VEC_VTGT_A', '0.9'))
+                v_tgt = _v_raw if _prev is None else _a * _prev + (1 - _a) * _v_raw
+                if _prev is not None:
+                    _dmax = float(os.environ.get('VEC_VTGT_DMAX', '0.8'))
+                    v_tgt = float(np.clip(v_tgt, _prev - _dmax, _prev + _dmax))
+                _cap = float(os.environ.get('VEC_V_CAP', '0') or 0)
+                if _cap > 0:
+                    v_tgt = min(v_tgt, _cap)
                 self._v_tgt_prev = v_tgt
                 thr, brk = self._lon.step(v_tgt, float(speed),
                                           dt=0.05 * self.every)
-                # 最小安全层：走廊内有车/行人且 TTC 过小 → 刹
-                if self._safety(t, float(speed)):
-                    thr, brk = 0.0, True
+                # 分级安全层：按等级压油门 + 加刹车
+                _lvl = self._safety_level(t, float(speed))
+                if _lvl > 0.02:
+                    thr = float(thr) * (1.0 - _lvl)
+                    brk = max(float(brk), _lvl)
                 self.prev_v = float(speed)
                 self.last = (steer, thr, 1.0 if brk else 0.0)
                 if self.cnt % 20 == 0:
@@ -431,12 +674,19 @@ class IDCController:
         if self.record_path and self.last_state is not None:
             self.rec.append((self.last_state.copy(),
                              np.array([steer, thr, brk], np.float32)))
+            if len(self.rec) >= 800:          # 增量落盘，避免被杀进程丢数据
+                self.flush()
 
     def flush(self):
         if self.record_path and self.rec:
             os.makedirs(os.path.dirname(self.record_path), exist_ok=True)
             S = np.stack([r[0] for r in self.rec])
             A = np.stack([r[1] for r in self.rec])
-            np.savez_compressed(self.record_path, state=S, action=A)
+            _i = getattr(self, '_flush_id', 0)
+            self._flush_id = _i + 1
+            _base = getattr(self, '_rec_base', self.record_path)
+            self._rec_base = _base
+            _p = _base.replace('.npz', f'_{_i}.npz')
+            np.savez_compressed(_p, state=S, action=A)
             print(f'[BC] 保存 {S.shape} -> {self.record_path}', flush=True)
             self.rec = []

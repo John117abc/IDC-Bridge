@@ -51,7 +51,7 @@ BIAS_LAT = np.array([-2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
 # ---------------- 模型 ----------------
 class Planner(nn.Module):
     def __init__(self, K=K_DEF, d=256, layers=4, heads=8, dropout=0.1,
-                 use_occ=False, occ_pos=False):
+                 use_occ=False, occ_pos=False, occ_aux=False):
         super().__init__()
         self.K = K
         self.ego_proj = nn.Linear(23, d)
@@ -64,6 +64,12 @@ class Planner(nn.Module):
             # 占据栅格 3×64×64 → 8×8 patch → 64 token
             self.occ_conv = nn.Conv2d(3, 32, kernel_size=8, stride=8)
             self.occ_proj = nn.Linear(32, d)
+        self.occ_aux = bool(occ_aux) and self.use_occ
+        if self.occ_aux:
+            # aux：从 occ token 重建 16x16 占据（强制编码器保留空间信息）
+            self.occ_aux_head = nn.Sequential(
+                nn.Linear(d, 128), nn.ReLU(inplace=True),
+                nn.Linear(128, 4 * 4))
         if self.occ_pos:
             # 每个 patch 的中心 (x,y)（自车系、米）→ 傅里叶特征 → d 维
             self.register_buffer('occ_xy', self._occ_patch_xy())
@@ -111,6 +117,9 @@ class Planner(nn.Module):
                     feats += [torch.sin(k * 3.1416 * xy), torch.cos(k * 3.1416 * xy)]
                 pos = self.occ_pos_mlp(torch.cat(feats, 1))[None]     # (1,64,d)
                 occ_tok = occ_tok + pos
+            if getattr(self, 'occ_aux', False):
+                # 每个 token 预测自己 8x8 patch 内的 4x4 占据
+                self.last_aux = self.occ_aux_head(occ_tok).view(B, 64, 16)
             tok = torch.cat([tok, occ_tok], 1)
 
         _tl = [torch.zeros(1, dtype=torch.long),
